@@ -1146,8 +1146,16 @@ fhist() {
 
     if [[ -n "$cmd" ]]; then
         if [[ -n "$BASH_VERSION" ]]; then
-            READLINE_LINE="$cmd"
-            READLINE_POINT=${#cmd}
+            if [[ -n "${READLINE_LINE+set}" ]]; then
+                READLINE_LINE="$cmd"
+                READLINE_POINT=${#cmd}
+            else
+                read -e -i "$cmd" -p "${_PROMPT_CHAR:-❯} " _run_cmd
+                if [[ -n "$_run_cmd" ]]; then
+                    history -s "$_run_cmd" 2>/dev/null
+                    eval "$_run_cmd"
+                fi
+            fi
         elif [[ -n "$ZSH_VERSION" ]]; then
             print -z "$cmd"
         else
@@ -1464,6 +1472,7 @@ _apply_overrides() {
     command -v frg.sh >/dev/null 2>&1 && alias frg='frg.sh'
     command -v flog.sh >/dev/null 2>&1 && alias flog='flog.sh'
     command -v fco.sh >/dev/null 2>&1 && alias fco='fco.sh'
+    [[ -n "$BASH_VERSION" && $- == *i* ]] && bind -x '"\eh": fhist' 2>/dev/null
 
     # Antigravity CLI auto-approve alias (universal)
     if command -v agy.exe >/dev/null 2>&1; then

@@ -710,15 +710,21 @@ end
 function Engine.execute_in_shell(cmd)
     if not cmd or #cmd == 0 then return end
     Term.restore()
-    print(C.b_cyan .. "Executing: " .. C.b_white .. cmd .. C.reset .. "\n")
+    Term.write_tui(C.b_cyan .. "Executing: " .. C.b_white .. cmd .. C.reset .. "\n\n")
     if IS_WINDOWS then
         os.execute(cmd)
     else
         local sh = os.getenv("SHELL") or "/bin/sh"
-        os.execute(sh .. ' -c "' .. cmd:gsub('"', '\\"') .. '"')
+        os.execute(sh .. ' -c "' .. cmd:gsub('"', '\\"') .. '" >/dev/tty 2>&1')
     end
-    print("\n" .. C.gray .. "[Press Enter to return to fhist or Ctrl+C to exit]" .. C.reset)
-    io.read()
+    Term.write_tui("\n" .. C.gray .. "[Press Enter to return to fhist or Ctrl+C to exit]" .. C.reset .. "\n")
+    local tty_in = io.open("/dev/tty", "r")
+    if tty_in then
+        tty_in:read("*l")
+        tty_in:close()
+    else
+        io.read()
+    end
     Term.init()
 end
 
@@ -1025,7 +1031,11 @@ local function run_tui(init_opts)
                 state.mode = "normal"
                 apply_filter_and_sort()
             elseif key == "ENTER" then
-                state.mode = "normal"
+                local cur = state.filtered[state.cursor]
+                if cur then
+                    state.selected_cmd = cur.cmd
+                end
+                break
             elseif key == "BACKSPACE" then
                 state.filter = state.filter:sub(1, math.max(0, #state.filter - 1))
                 apply_filter_and_sort()
