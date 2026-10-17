@@ -137,6 +137,8 @@ if IS_WINDOWS then
         BOOL SetConsoleOutputCP(unsigned int wCodePageID);
         BOOL SetConsoleCP(unsigned int wCodePageID);
         int _getch(void);
+        int _kbhit(void);
+        void Sleep(DWORD dwMilliseconds);
         DWORD GetFileAttributesW(LPCWSTR lpFileName);
     ]]
 else
@@ -160,6 +162,13 @@ else
             unsigned short ws_ypixel;
         };
         int ioctl(int fd, unsigned long request, ...);
+
+        struct pollfd {
+            int fd;
+            short events;
+            short revents;
+        };
+        int poll(struct pollfd *fds, unsigned long nfds, int timeout);
 
         typedef unsigned char cc_t;
         typedef unsigned int speed_t;
@@ -297,8 +306,18 @@ function Term.get_size()
     return 80, 24
 end
 
+Term.key_queue = {}
+
 function Term.read_key()
+    if #Term.key_queue > 0 then
+        return table.remove(Term.key_queue, 1)
+    end
+
     if IS_WINDOWS then
+        if ffi.C._kbhit() == 0 then
+            ffi.C.Sleep(50)
+            return "NONE"
+        end
         local ch = ffi.C._getch()
         if ch == 0 or ch == 224 then
             local ch2 = ffi.C._getch()
@@ -325,33 +344,93 @@ function Term.read_key()
         end
         return string.char(ch)
     else
-        local buf = ffi.new("char[32]")
-        local n = ffi.C.read(Term.tty_fd >= 0 and Term.tty_fd or 0, buf, 32)
-        if n <= 0 then return "NONE" end
-        local seq = ffi.string(buf, n)
-
-        if seq == "\27" then return "ESC"
-        elseif seq == "\n" or seq == "\r" then return "ENTER"
-        elseif seq == "\t" then return "TAB"
-        elseif seq == "\127" or seq == "\8" then return "BACKSPACE"
-        elseif seq == "\3" then return "CTRL_C"
-        elseif seq == "\4" then return "CTRL_D"
-        elseif seq == "\21" then return "CTRL_U"
-        elseif seq == " " then return "SPACE"
-        elseif seq == "\27[A" or seq == "\27OA" then return "UP"
-        elseif seq == "\27[B" or seq == "\27OB" then return "DOWN"
-        elseif seq == "\27[C" or seq == "\27OC" then return "RIGHT"
-        elseif seq == "\27[D" or seq == "\27OD" then return "LEFT"
-        elseif seq == "\27[H" or seq == "\27[1~" then return "HOME"
-        elseif seq == "\27[F" or seq == "\27[4~" then return "END"
-        elseif seq == "\27[5~" then return "PGUP"
-        elseif seq == "\27[6~" then return "PGDN"
-        elseif seq == "\27[3~" then return "DELETE"
-        elseif seq == "\27[Z" then return "BACKTAB"
+        local pfd = ffi.new("struct pollfd[1]")
+        pfd[0].fd = Term.tty_fd >= 0 and Term.tty_fd or 0
+        pfd[0].events = 1 -- POLLIN
+        local pr = ffi.C.poll(pfd, 1, 50)
+        if pr <= 0 then
+            return "NONE"
         end
 
-        if #seq == 1 then return seq end
-        return "UNKNOWN"
+        local buf = ffi.new("char[128]")
+        local n = ffi.C.read(Term.tty_fd >= 0 and Term.tty_fd or 0, buf, 128)
+        if n <= 0 then return "NONE" end
+
+        local i = 0
+        while i < n do
+            if buf[i] == 27 then -- ESC or escape sequence
+                if i + 1 >= n then
+                    table.insert(Term.key_queue, "ESC")
+                    i = i + 1
+                elseif buf[i + 1] == 91 or buf[i + 1] == 79 then -- '[' or 'O'
+                    if i + 2 < n then
+                        local c = buf[i + 2]
+                        local k = nil
+                        local adv = 3
+                        if c == 65 then k = "UP"
+                        elseif c == 66 then k = "DOWN"
+                        elseif c == 67 then k = "RIGHT"
+                        elseif c == 68 then k = "LEFT"
+                        elseif c == 72 then k = "HOME"
+                        elseif c == 70 then k = "END"
+                        elseif c == 90 then k = "BACKTAB"
+                        elseif c == 49 and i + 3 < n and buf[i + 3] == 126 then k = "HOME"; adv = 4
+                        elseif c == 52 and i + 3 < n and buf[i + 3] == 126 then k = "END"; adv = 4
+                        elseif c == 51 and i + 3 < n and buf[i + 3] == 126 then k = "DELETE"; adv = 4
+                        elseif c == 53 and i + 3 < n and buf[i + 3] == 126 then k = "PGUP"; adv = 4
+                        elseif c == 54 and i + 3 < n and buf[i + 3] == 126 then k = "PGDN"; adv = 4
+                        end
+                        if k then
+                            table.insert(Term.key_queue, k)
+                            i = i + adv
+                        else
+                            table.insert(Term.key_queue, "ESC")
+                            i = i + 1
+                        end
+                    else
+                        table.insert(Term.key_queue, "ESC")
+                        i = i + 1
+                    end
+                else
+                    table.insert(Term.key_queue, "ESC")
+                    i = i + 1
+                end
+            else
+                local b = buf[i]
+                local k = nil
+                if b == 13 then
+                    k = "ENTER"
+                    if i + 1 < n and buf[i + 1] == 10 then
+                        i = i + 1
+                    end
+                elseif b == 10 then
+                    k = "ENTER"
+                elseif b == 127 or b == 8 then
+                    k = "BACKSPACE"
+                elseif b == 9 then
+                    k = "TAB"
+                elseif b == 3 then
+                    k = "CTRL_C"
+                elseif b == 4 then
+                    k = "CTRL_D"
+                elseif b == 21 then
+                    k = "CTRL_U"
+                elseif b == 32 then
+                    k = "SPACE"
+                elseif b >= 32 and b <= 126 then
+                    k = string.char(b)
+                end
+                if k then
+                    table.insert(Term.key_queue, k)
+                end
+                i = i + 1
+            end
+        end
+
+        if #Term.key_queue > 0 then
+            return table.remove(Term.key_queue, 1)
+        end
+        return "NONE"
     end
 end
 
@@ -380,6 +459,152 @@ local function truncate(s, max_w)
     if #s <= max_w then return s end
     if max_w <= 1 then return s:sub(1, max_w) end
     return s:sub(1, max_w - 1) .. "…"
+end
+
+local function visible_width(s)
+    if not s or #s == 0 then return 0 end
+    local plain = s:gsub("\27%[[%d;]*[a-zA-Z]", ""):gsub("\27%[[%?%d]*[a-zA-Z]", "")
+    local len = 0
+    for _ in plain:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+        len = len + 1
+    end
+    return len
+end
+
+local function pad_to_width(s, w)
+    local vw = visible_width(s)
+    if vw < w then
+        return s .. string.rep(" ", w - vw)
+    end
+    return s
+end
+
+local function truncate_path(path, max_w)
+    local vw = visible_width(path)
+    if vw <= max_w then return path end
+    local target = max_w - 1
+    local tail = ""
+    local cur_w = 0
+    for i = #path, 1, -1 do
+        local b = path:byte(i)
+        if b < 0x80 or b >= 0xC0 then
+            cur_w = cur_w + 1
+            if cur_w > target then break end
+        end
+        tail = path:sub(i, i) .. tail
+    end
+    return "…" .. tail
+end
+
+local SYNTAX_KEYWORDS = {
+    -- Lua
+    ["local"] = true, ["function"] = true, ["return"] = true, ["if"] = true,
+    ["then"] = true, ["else"] = true, ["elseif"] = true, ["end"] = true,
+    ["for"] = true, ["while"] = true, ["do"] = true, ["repeat"] = true,
+    ["until"] = true, ["break"] = true, ["nil"] = true, ["not"] = true,
+    -- Python
+    ["def"] = true, ["class"] = true, ["import"] = true, ["from"] = true,
+    ["as"] = true, ["try"] = true, ["except"] = true, ["finally"] = true,
+    ["with"] = true, ["in"] = true, ["is"] = true, ["lambda"] = true,
+    ["yield"] = true, ["raise"] = true, ["pass"] = true, ["continue"] = true,
+    ["async"] = true, ["await"] = true, ["self"] = true, ["None"] = true,
+    ["True"] = true, ["False"] = true, ["elif"] = true,
+    -- JS / TS / C / C++ / Go / Rust
+    ["const"] = true, ["let"] = true, ["var"] = true, ["export"] = true,
+    ["default"] = true, ["struct"] = true, ["enum"] = true, ["typedef"] = true,
+    ["int"] = true, ["char"] = true, ["void"] = true, ["bool"] = true,
+    ["fn"] = true, ["pub"] = true, ["mut"] = true, ["impl"] = true,
+    ["use"] = true, ["mod"] = true, ["package"] = true, ["type"] = true,
+    -- Shell
+    ["fi"] = true, ["esac"] = true, ["case"] = true, ["echo"] = true,
+    ["exit"] = true,
+}
+
+local function highlight_syntax(line, ext)
+    if not line or #line == 0 then return "" end
+    ext = (ext or ""):lower()
+
+    -- Check for full-line comments
+    local trimmed = line:match("^%s*(.-)$") or ""
+    if trimmed:sub(1, 2) == "--" or trimmed:sub(1, 2) == "//" or (trimmed:sub(1, 1) == "#" and ext ~= "c" and ext ~= "cpp" and ext ~= "h") then
+        return C.gray .. C.italic .. line .. C.reset
+    end
+
+    local out = {}
+    local i = 1
+    local len = #line
+
+    while i <= len do
+        local c = line:sub(i, i)
+
+        -- Strings: double quotes, single quotes, backticks
+        if c == '"' or c == "'" or (c == '`' and (ext == "js" or ext == "ts" or ext == "go")) then
+            local quote = c
+            local s_start = i
+            i = i + 1
+            while i <= len do
+                local cur = line:sub(i, i)
+                if cur == '\\' then
+                    i = i + 2
+                elseif cur == quote then
+                    i = i + 1
+                    break
+                else
+                    i = i + 1
+                end
+            end
+            table.insert(out, C.b_green .. line:sub(s_start, i - 1) .. C.reset)
+
+        -- Line Comments
+        elseif (c == '-' and line:sub(i, i + 1) == "--") or (c == '/' and line:sub(i, i + 1) == "//") or (c == '#' and ext ~= "c" and ext ~= "cpp" and ext ~= "h") then
+            table.insert(out, C.gray .. C.italic .. line:sub(i) .. C.reset)
+            break
+
+        -- Python decorator @decorator
+        elseif c == '@' and (ext == "py" or ext == "pyw") then
+            local dec_start = i
+            i = i + 1
+            while i <= len and line:sub(i, i):match("[%w_]") do
+                i = i + 1
+            end
+            table.insert(out, C.b_yellow .. line:sub(dec_start, i - 1) .. C.reset)
+
+        -- Identifiers / Keywords
+        elseif c:match("[%a_]") then
+            local id_start = i
+            while i <= len and line:sub(i, i):match("[%w_]") do
+                i = i + 1
+            end
+            local word = line:sub(id_start, i - 1)
+            if SYNTAX_KEYWORDS[word] then
+                if word == "self" then
+                    table.insert(out, C.b_cyan .. word .. C.reset)
+                else
+                    table.insert(out, C.bold .. C.b_magenta .. word .. C.reset)
+                end
+            else
+                table.insert(out, word)
+            end
+
+        -- Numbers
+        elseif c:match("%d") then
+            local num_start = i
+            while i <= len and line:sub(i, i):match("[%x%.xX_]") do
+                i = i + 1
+            end
+            table.insert(out, C.b_yellow .. line:sub(num_start, i - 1) .. C.reset)
+
+        -- Operators / Punctuation
+        elseif c:match("[%+%-/%*%%=<>!~%^&|]") then
+            table.insert(out, C.b_cyan .. c .. C.reset)
+            i = i + 1
+        else
+            table.insert(out, c)
+            i = i + 1
+        end
+    end
+
+    return table.concat(out)
 end
 
 local function format_size(bytes)
@@ -1032,7 +1257,7 @@ local function run_tui(init_opts)
         end
 
         -- Header divider
-        local raw_hdr = pad_right(string.format("  %-3s  %-8s  %s", "SEL", "SIZE", "FILE PATH"), left_w)
+        local raw_hdr = pad_to_width(string.format("  %-3s  %-8s  %s", "SEL", "SIZE", "FILE PATH"), left_w)
         local list_hdr = C.b_blue .. C.bold .. raw_hdr .. C.reset
         local right_title = cur_item and truncate(" 📄 PREVIEW: " .. cur_item.path, math.max(10, right_w - 2)) or " 📄 FILE PREVIEW"
         local right_hdr = (cols >= 90) and (C.b_white .. C.bold .. right_title .. C.reset) or ""
@@ -1072,7 +1297,8 @@ local function run_tui(init_opts)
                     local avail_w = math.max(4, right_w - 9)
                     local clean_line = line_txt:gsub("\t", "    ")
                     local disp_line = truncate(clean_line, avail_w)
-                    table.insert(r_lines, C.gray .. line_num .. C.reset .. C.white .. disp_line .. C.reset)
+                    local hl_line = highlight_syntax(disp_line, cur_item.ext)
+                    table.insert(r_lines, C.gray .. line_num .. C.reset .. hl_line .. C.reset)
                 end
             end
         end
@@ -1081,7 +1307,7 @@ local function run_tui(init_opts)
         for row = 1, body_h do
             local idx = state.scroll + row - 1
             local item = state.filtered[idx]
-            local l_str
+            local padded_l
 
             if item then
                 local is_cur = (idx == state.cursor)
@@ -1098,27 +1324,25 @@ local function run_tui(init_opts)
 
                 -- File name & relative path
                 local name_w = math.max(8, left_w - 18)
-                local raw_path = item.path
-                if #raw_path > name_w then
-                    raw_path = "…" .. raw_path:sub(#raw_path - name_w + 2)
-                end
-                local path_disp = pad_right(raw_path, name_w)
+                local raw_path = truncate_path(item.path, name_w)
+                local path_disp = pad_to_width(raw_path, name_w)
 
                 local ext_color = get_ext_color(item.ext)
                 local name_col = is_cur and (C.b_white .. C.bold) or ext_color
-                local item_disp = name_col .. path_disp .. C.reset
+                local item_disp = name_col .. path_disp
 
-                l_str = string.format("%s%s %s %s  %s", bg, ptr, chk, sz_pill, item_disp)
+                local l_str = string.format("%s%s %s %s  %s", bg, ptr, chk, sz_pill, item_disp)
+                padded_l = pad_to_width(l_str, left_w) .. C.reset
             elseif row == 1 and #state.filtered == 0 then
                 local no_match = "  (No files match current filter)"
-                l_str = C.gray .. pad_right(no_match, left_w) .. C.reset
+                padded_l = C.gray .. pad_to_width(no_match, left_w) .. C.reset
             else
-                l_str = string.rep(" ", left_w)
+                padded_l = string.rep(" ", left_w)
             end
 
             local r_str = r_lines[row] or ""
             local sep_char = (cols >= 90) and (C.gray .. "│" .. C.reset) or ""
-            add_line(l_str .. " " .. sep_char .. " " .. r_str)
+            add_line(padded_l .. " " .. sep_char .. " " .. r_str)
         end
 
         -- 5. Footer & Status Line
@@ -1160,110 +1384,119 @@ local function run_tui(init_opts)
         end
     end
 
+    local function launch_editor(split_key)
+        local targets = {}
+        for p in pairs(state.selected_set) do
+            table.insert(targets, p)
+        end
+        if #targets == 0 and state.filtered[state.cursor] then
+            table.insert(targets, state.filtered[state.cursor].path)
+        end
+
+        if #targets > 0 then
+            Term.restore()
+            local ed = Engine.get_editor_cmd()
+            local args = {}
+            local is_vim = ed:match("[n]?vim") or ed:match("/vi$") or ed == "vi" or ed:match("vi%.exe$")
+            if is_vim then
+                table.insert(args, '-c "syntax on"')
+            end
+            if #targets > 1 then
+                if split_key == "o" then
+                    table.insert(args, "-O") -- Vertical splits
+                else
+                    table.insert(args, "-p") -- Tabs
+                end
+            end
+            for _, p in ipairs(targets) do
+                table.insert(args, string.format('"%s"', p))
+            end
+            local cmd = ed .. " " .. table.concat(args, " ")
+            os.execute(cmd)
+            os.exit(0)
+        end
+    end
+
     -- Event loop
     while true do
         render()
         local key = Term.read_key()
-        state.status_msg = ""
+        if key ~= "NONE" then
+            state.status_msg = ""
 
-        if key == "CTRL_C" or key == "q" and state.mode ~= "filter" then
-            Term.restore()
-            os.exit(0)
-        end
-
-        -- Filter input mode
-        if state.mode == "filter" then
-            if key == "ESC" then
-                state.filter = state.prev_filter
-                state.mode = "normal"
-                apply_filter()
-            elseif key == "ENTER" then
-                state.mode = "normal"
-            elseif key == "BACKSPACE" then
-                state.filter = state.filter:sub(1, math.max(0, #state.filter - 1))
-                apply_filter()
-            elseif key == "CTRL_U" then
-                state.filter = ""
-                apply_filter()
-            elseif key == "UP" then
-                state.cursor = math.max(1, state.cursor - 1)
-            elseif key == "DOWN" then
-                state.cursor = math.min(math.max(1, #state.filtered), state.cursor + 1)
-            elseif #key == 1 then
-                state.filter = state.filter .. key
-                apply_filter()
+            if key == "CTRL_C" or (key == "q" and state.mode ~= "filter") then
+                Term.restore()
+                os.exit(0)
             end
 
-        -- Normal navigation mode
-        else
-            if key == "ESC" then
-                if #state.filter > 0 then
+            -- Filter input mode
+            if state.mode == "filter" then
+                if key == "ESC" then
+                    state.filter = state.prev_filter
+                    state.mode = "normal"
+                    apply_filter()
+                elseif key == "ENTER" then
+                    launch_editor("ENTER")
+                elseif key == "BACKSPACE" then
+                    state.filter = state.filter:sub(1, math.max(0, #state.filter - 1))
+                    apply_filter()
+                elseif key == "CTRL_U" then
                     state.filter = ""
                     apply_filter()
-                else
-                    Term.restore()
-                    os.exit(0)
-                end
-            elseif key == "/" then
-                state.prev_filter = state.filter
-                state.mode = "filter"
-            elseif key == "j" or key == "DOWN" then
-                state.cursor = math.min(math.max(1, #state.filtered), state.cursor + 1)
-            elseif key == "k" or key == "UP" then
-                state.cursor = math.max(1, state.cursor - 1)
-            elseif key == "PGDN" then
-                local _, rows = Term.get_size()
-                state.cursor = math.min(math.max(1, #state.filtered), state.cursor + math.max(1, rows - 7))
-            elseif key == "PGUP" then
-                local _, rows = Term.get_size()
-                state.cursor = math.max(1, state.cursor - math.max(1, rows - 7))
-            elseif key == "g" or key == "HOME" then
-                state.cursor = 1
-            elseif key == "G" or key == "END" then
-                state.cursor = math.max(1, #state.filtered)
-            elseif key == "h" or key == "LEFT" then
-                state.tab_idx = (state.tab_idx == 1) and #TABS or (state.tab_idx - 1)
-                apply_filter()
-            elseif key == "l" or key == "RIGHT" then
-                state.tab_idx = (state.tab_idx == #TABS) and 1 or (state.tab_idx + 1)
-                apply_filter()
-            elseif key == "TAB" or key == "SPACE" then
-                local item = state.filtered[state.cursor]
-                if item then
-                    if state.selected_set[item.path] then
-                        state.selected_set[item.path] = nil
-                    else
-                        state.selected_set[item.path] = true
-                    end
-                end
-                state.cursor = math.min(math.max(1, #state.filtered), state.cursor + 1)
-            elseif key == "ENTER" or key == "o" then
-                -- Launch editor
-                local targets = {}
-                for p in pairs(state.selected_set) do
-                    table.insert(targets, p)
-                end
-                if #targets == 0 and state.filtered[state.cursor] then
-                    table.insert(targets, state.filtered[state.cursor].path)
+                elseif key == "UP" then
+                    state.cursor = math.max(1, state.cursor - 1)
+                elseif key == "DOWN" then
+                    state.cursor = math.min(math.max(1, #state.filtered), state.cursor + 1)
+                elseif #key == 1 then
+                    state.filter = state.filter .. key
+                    apply_filter()
                 end
 
-                if #targets > 0 then
-                    Term.restore()
-                    local ed = Engine.get_editor_cmd()
-                    local args = {}
-                    if #targets > 1 then
-                        if key == "o" then
-                            table.insert(args, "-O") -- Vertical splits
+            -- Normal navigation mode
+            else
+                if key == "ESC" then
+                    if #state.filter > 0 then
+                        state.filter = ""
+                        apply_filter()
+                    else
+                        Term.restore()
+                        os.exit(0)
+                    end
+                elseif key == "/" then
+                    state.prev_filter = state.filter
+                    state.mode = "filter"
+                elseif key == "j" or key == "DOWN" then
+                    state.cursor = math.min(math.max(1, #state.filtered), state.cursor + 1)
+                elseif key == "k" or key == "UP" then
+                    state.cursor = math.max(1, state.cursor - 1)
+                elseif key == "PGDN" then
+                    local _, rows = Term.get_size()
+                    state.cursor = math.min(math.max(1, #state.filtered), state.cursor + math.max(1, rows - 7))
+                elseif key == "PGUP" then
+                    local _, rows = Term.get_size()
+                    state.cursor = math.max(1, state.cursor - math.max(1, rows - 7))
+                elseif key == "g" or key == "HOME" then
+                    state.cursor = 1
+                elseif key == "G" or key == "END" then
+                    state.cursor = math.max(1, #state.filtered)
+                elseif key == "h" or key == "LEFT" then
+                    state.tab_idx = (state.tab_idx == 1) and #TABS or (state.tab_idx - 1)
+                    apply_filter()
+                elseif key == "l" or key == "RIGHT" then
+                    state.tab_idx = (state.tab_idx == #TABS) and 1 or (state.tab_idx + 1)
+                    apply_filter()
+                elseif key == "TAB" or key == "SPACE" then
+                    local item = state.filtered[state.cursor]
+                    if item then
+                        if state.selected_set[item.path] then
+                            state.selected_set[item.path] = nil
                         else
-                            table.insert(args, "-p") -- Tabs
+                            state.selected_set[item.path] = true
                         end
                     end
-                    for _, p in ipairs(targets) do
-                        table.insert(args, string.format('"%s"', p))
-                    end
-                    local cmd = ed .. " " .. table.concat(args, " ")
-                    os.execute(cmd)
-                    os.exit(0)
+                    state.cursor = math.min(math.max(1, #state.filtered), state.cursor + 1)
+                elseif key == "ENTER" or key == "o" then
+                    launch_editor(key)
                 end
             end
         end
@@ -1353,6 +1586,22 @@ local function run_tests()
         end
     end
 
+    -- Test 8: Visual width and padding
+    assert_eq("visible_width strips ANSI", visible_width("\27[31mhello\27[0m"), 5)
+    assert_eq("visible_width counts UTF-8 correctly", visible_width("foo…bar"), 7)
+    assert_eq("pad_to_width pads accurately", visible_width(pad_to_width("abc", 10)), 10)
+    assert_eq("pad_to_width with ANSI", visible_width(pad_to_width("\27[32mhello\27[0m", 12)), 12)
+
+    -- Test 9: Path truncation
+    assert_eq("truncate_path short unchanged", truncate_path("test.py", 15), "test.py")
+    assert_eq("truncate_path long fits width", visible_width(truncate_path("long/path/to/some/script.py", 12)), 12)
+
+    -- Test 10: Syntax highlighting
+    local py_hl = highlight_syntax("def main(self):", "py")
+    assert_eq("highlight_syntax highlights python keyword", py_hl:find("def") ~= nil and py_hl:find("\27%[") ~= nil, true)
+    local py_comm = highlight_syntax("# A comment", "py")
+    assert_eq("highlight_syntax highlights python comment", py_comm:find("\27%[90m") ~= nil, true)
+
     print(string.format("\nSelf-test summary: %d passed, %d failed.", passed, failed))
     if failed > 0 then os.exit(1) end
 end
@@ -1439,9 +1688,9 @@ elseif opts.mode == "preview" then
     local lines, total, is_bin = Engine.get_file_preview(opts.preview_file, 50)
     print(C.b_cyan .. "File: " .. C.b_white .. opts.preview_file .. C.reset)
     print(C.gray .. "Total lines: " .. total .. C.reset)
-    print(C.gray .. string.rep("─", 60) .. C.reset)
+    local ext = get_extension(opts.preview_file)
     for _, l in ipairs(lines) do
-        print(l)
+        print(highlight_syntax(l, ext))
     end
 else
     run_tui(opts)
