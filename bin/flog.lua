@@ -750,7 +750,8 @@ local function run_tui(init_opts)
             end
             state.filtered = out
         end
-        state.cursor = math.min(math.max(1, state.cursor), math.max(1, #state.filtered))
+        state.cursor = 1
+        state.scroll = 1
         state.diff_scroll = 1
     end
 
@@ -841,10 +842,17 @@ local function run_tui(init_opts)
         add_line(C.bold .. C.b_blue .. l_hdr .. C.reset .. " " .. C.gray .. "│" .. C.reset .. " " .. C.bold .. C.b_magenta .. r_hdr .. C.reset)
 
         -- Adjust Left Scroll Window
-        if state.cursor < state.scroll then
-            state.scroll = state.cursor
-        elseif state.cursor >= state.scroll + body_h then
-            state.scroll = state.cursor - body_h + 1
+        if #state.filtered == 0 then
+            state.cursor = 1
+            state.scroll = 1
+        else
+            if state.cursor > #state.filtered then state.cursor = #state.filtered end
+            if state.cursor < 1 then state.cursor = 1 end
+            if state.cursor < state.scroll then
+                state.scroll = state.cursor
+            elseif state.cursor >= state.scroll + body_h then
+                state.scroll = state.cursor - body_h + 1
+            end
         end
 
         -- Prepare Right Preview Pane Lines
