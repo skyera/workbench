@@ -184,7 +184,20 @@ local Term = {
     hOut = nil,
     orig_termios = nil,
     tty_fd = -1,
+    tty_out = nil,
 }
+
+function Term.write_tui(s)
+    if not Term.tty_out then
+        if IS_WINDOWS then
+            Term.tty_out = io.stderr
+        else
+            Term.tty_out = io.open("/dev/tty", "w") or io.stderr
+        end
+    end
+    Term.tty_out:write(s)
+    Term.tty_out:flush()
+end
 
 function Term.init()
     if Term.initialized then return end
@@ -218,14 +231,12 @@ function Term.init()
         ffi.C.tcsetattr(Term.tty_fd, 0, raw)
     end
     Term.initialized = true
-    io.write("\27[?1049h\27[?25l") -- Alternate buffer, hide cursor
-    io.flush()
+    Term.write_tui("\27[?1049h\27[?25l") -- Alternate buffer, hide cursor
 end
 
 function Term.restore()
     if not Term.initialized then return end
-    io.write("\27[?25h\27[?1049l" .. C.reset) -- Show cursor, restore buffer
-    io.flush()
+    Term.write_tui("\27[?25h\27[?1049l" .. C.reset) -- Show cursor, restore buffer
     if IS_WINDOWS then
         if Term.orig_mode_in and Term.hIn then
             ffi.C.SetConsoleMode(Term.hIn, Term.orig_mode_in)
@@ -237,6 +248,10 @@ function Term.restore()
         if Term.orig_termios and Term.tty_fd >= 0 then
             ffi.C.tcsetattr(Term.tty_fd, 0, Term.orig_termios)
             if Term.tty_fd ~= 0 then ffi.C.close(Term.tty_fd) end
+        end
+        if Term.tty_out and Term.tty_out ~= io.stderr then
+            pcall(function() Term.tty_out:close() end)
+            Term.tty_out = nil
         end
     end
     Term.initialized = false
@@ -688,8 +703,7 @@ function Engine.copy_to_clipboard(text)
             return b64_chars:sub(c + 1, c + 1)
         end) .. ({ '', '==', '=' })[#data % 3 + 1])
     end
-    io.write("\27]52;c;" .. to_b64(text) .. "\7")
-    io.flush()
+    Term.write_tui("\27]52;c;" .. to_b64(text) .. "\7")
     return true
 end
 
@@ -820,7 +834,7 @@ local function run_tui(init_opts)
         if cols ~= prev_cols or rows ~= prev_rows then
             prev_lines = {}
             prev_cols, prev_rows = cols, rows
-            io.write("\27[2J")
+            Term.write_tui("\27[2J")
         end
 
         local left_w = math.floor(cols * 0.52)
@@ -991,8 +1005,7 @@ local function run_tui(init_opts)
         end
         diff_buf[#diff_buf + 1] = "\27[?2026l"
         if #diff_buf > 2 then
-            io.write(table.concat(diff_buf))
-            io.flush()
+            Term.write_tui(table.concat(diff_buf))
         end
     end
 
@@ -1088,7 +1101,8 @@ local function run_tui(init_opts)
 
     Term.restore()
     if state.selected_cmd then
-        io.write(state.selected_cmd .. "\n")
+        io.stdout:write(state.selected_cmd .. "\n")
+        io.stdout:flush()
     end
 end
 
