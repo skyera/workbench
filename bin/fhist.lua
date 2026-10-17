@@ -93,6 +93,7 @@ if IS_WINDOWS then
         BOOL SetConsoleMode(HANDLE hConsoleHandle, DWORD dwMode);
         BOOL GetConsoleScreenBufferInfo(HANDLE hConsoleOutput, CONSOLE_SCREEN_BUFFER_INFO* lpConsoleScreenBufferInfo);
         BOOL ReadConsoleInputW(HANDLE hConsoleInput, INPUT_RECORD* lpBuffer, DWORD nLength, DWORD* lpNumberOfEventsRead);
+        BOOL PeekConsoleInputW(HANDLE hConsoleInput, INPUT_RECORD* lpBuffer, DWORD nLength, DWORD* lpNumberOfEventsRead);
         void Sleep(DWORD dwMilliseconds);
     ]]
 else
@@ -197,9 +198,9 @@ function Term.init()
         Term.orig_mode_in = mIn[0]
         Term.orig_mode_out = mOut[0]
 
-        local raw_in = bit.band(Term.orig_mode_in, bit.bnot(0x0001 + 0x0002 + 0x0004))
-        raw_in = bit.bor(raw_in, 0x0200) -- ENABLE_VIRTUAL_TERMINAL_INPUT
-        local raw_out = bit.bor(Term.orig_mode_out, 0x0004 + 0x0008) -- ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        local raw_in = bit.band(Term.orig_mode_in, bit.bnot(0x0007))
+        raw_in = bit.bor(raw_in, 0x0008) -- ENABLE_WINDOW_INPUT
+        local raw_out = bit.bor(Term.orig_mode_out, 0x0004) -- ENABLE_VIRTUAL_TERMINAL_PROCESSING
         ffi.C.SetConsoleMode(Term.hIn, raw_in)
         ffi.C.SetConsoleMode(Term.hOut, raw_out)
     else
@@ -285,12 +286,37 @@ function Term.read_key()
                 elseif vk == 0x22 then return "PGDN"
                 elseif vk == 0x24 then return "HOME"
                 elseif vk == 0x23 then return "END"
-                elseif vk == 0x1B then return "ESC"
                 elseif vk == 0x0D then return "ENTER"
                 elseif vk == 0x08 then return "BACKSPACE"
                 elseif vk == 0x09 then return shift and "BACKTAB" or "TAB"
                 elseif vk == 0x2E then return "DELETE"
                 elseif vk == 0x74 then return "F5"
+                elseif vk == 0x1B or ch == 27 then
+                    local peek_ir = ffi.new("INPUT_RECORD[1]")
+                    local peek_cnt = ffi.new("DWORD[1]")
+                    if ffi.C.PeekConsoleInputW(Term.hIn, peek_ir, 1, peek_cnt) ~= 0 and peek_cnt[0] > 0 then
+                        if peek_ir[0].EventType == 1 and peek_ir[0].Event.KeyEvent.bKeyDown ~= 0 then
+                            local ch2 = peek_ir[0].Event.KeyEvent.uChar.UnicodeChar
+                            if ch2 == 91 or ch2 == 79 then -- '[' or 'O'
+                                ffi.C.ReadConsoleInputW(Term.hIn, peek_ir, 1, peek_cnt)
+                                if ffi.C.ReadConsoleInputW(Term.hIn, peek_ir, 1, peek_cnt) ~= 0 and peek_cnt[0] > 0 then
+                                    local ch3 = peek_ir[0].Event.KeyEvent.uChar.UnicodeChar
+                                    if ch3 == 65 then return "UP"
+                                    elseif ch3 == 66 then return "DOWN"
+                                    elseif ch3 == 67 then return "RIGHT"
+                                    elseif ch3 == 68 then return "LEFT"
+                                    elseif ch3 == 72 then return "HOME"
+                                    elseif ch3 == 70 then return "END"
+                                    elseif ch3 == 90 then return "BACKTAB"
+                                    elseif ch3 == 53 then return "PGUP"
+                                    elseif ch3 == 54 then return "PGDN"
+                                    elseif ch3 == 51 then return "DELETE"
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    return "ESC"
                 end
 
                 if ctrl then
