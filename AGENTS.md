@@ -23,6 +23,21 @@ When designing and implementing logic across utilities, TUIs, scripts, and comma
 *   **Provide Actionable Guidance**: When an action cannot proceed, tell the user how to resolve it (e.g., "Use 'D' to force delete unmerged branches", "Run 'git checkout <branch>' first").
 *   **Verify Error Paths**: Include error and edge-case scenarios in the verification plan to confirm the user sees the expected diagnostic message when things fail.
 
+## Cross-Platform & Terminal (TUI) Guidelines
+
+When building or modifying CLI utilities, TUIs, scripts, and subprocess wrappers:
+*   **Windows `cmd.exe` Command Quoting**:
+    *   Never use single quotes (`'...'`) for command arguments containing shell operators (`|`, `&`, `<`, `>`, `^`, `%`) when invoked via `popen` or shell execution on Windows. `cmd.exe` does not recognize single quotes and will treat `|` as a shell pipeline.
+    *   Always use escaped double quotes: e.g. `git log --format=\"%h|%an|%cr|%s\"`.
+*   **Dual Stream Console Initialization (`stdout` & `stderr`)**:
+    *   When configuring Windows virtual terminal processing (`ENABLE_VIRTUAL_TERMINAL_PROCESSING` / `0x0004`), explicitly apply it to **both** `stdout` (`STD_OUTPUT_HANDLE` / `-11`) and `stderr` (`STD_ERROR_HANDLE` / `-12`) if ANSI escape sequences can be output to either stream.
+*   **Console Input Mode Flags with `_getch()`**:
+    *   Do not enable `ENABLE_WINDOW_INPUT` (0x0008) when reading characters with standard C runtime `_getch()`. Window move/resize/focus events enter the input buffer and corrupt or delay character reads.
+*   **Erase to End-of-Line (`\27[K`) Hygiene**:
+    *   Always emit `\27[0m` (color reset) immediately before `\27[K`. Many terminal emulators (especially Windows Console) fill erased cells using the currently active background color, causing selection highlights to bleed across the screen.
+*   **Viewport & Buffer Shrink Cleanup**:
+    *   When an item is deleted or live filtering reduces row count, clamp the scroll viewport so the view never gets stuck on empty rows, and explicitly clear orphaned rows with `\27[%d;1H\27[K`.
+
 ## Verification & Validation Guidelines
 
 For every change, consider how to prove correctness before concluding:
