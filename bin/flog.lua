@@ -1,15 +1,19 @@
 #!/usr/bin/env luajit
--- flog.lua - High-Performance Interactive Git Commit & Diff Browser (LuaJIT + FFI)
--- Zero-dependency, flicker-free dual-pane TUI for browsing git commits, stats, and diffs.
+-- flog.lua - High-Performance Interactive Git Commit, Diff & Branch Browser (LuaJIT + FFI)
+-- Zero-dependency, flicker-free dual-pane TUI for browsing git commits, branches, stats, and diffs.
 --
 -- Features:
 --   * Cross-platform terminal raw mode via LuaJIT FFI (Windows Kernel32 & POSIX termios)
 --   * Flicker-free differential line rendering + DEC Synchronized Output (?2026h/?2026l)
---   * Dual-pane TUI: Commit history list on the left, live colored commit stat + diff on the right
+--   * Dual-pane TUI: Commit history or Branch list on the left, live colored diff/log on the right
+--   * Interactive Branch Search & Switcher (press 'b' or run 'flog -b'):
+--       - Fuzzy-search local & remote branches
+--       - Press Enter on a branch to inspect its commit history & diffs
+--       - Press 'c' on any branch or commit to checkout (supports Force '-f' and Submodule sync)
 --   * In-memory commit detail cache for zero-latency scrolling through visited commits
 --   * Interactive diff scrolling ([ / ] or J / K), branch scope toggle (a), diff view mode (d)
 --   * Fuzzy filtering (f or /), copy commit hash to clipboard (y), open commit in $EDITOR (Enter)
---   * Non-interactive CLI modes (--list, --show, --test, --help)
+--   * Non-interactive CLI modes (--list, --branches, --show, --test, --help)
 
 local ffi = require("ffi")
 local bit = require("bit")
@@ -323,7 +327,7 @@ function Term.read_key()
             if seq == "[A" or seq == "OA" then return "UP"
             elseif seq == "[B" or seq == "OB" then return "DOWN"
             elseif seq == "[C" or seq == "OC" then return "RIGHT"
-            elseif seq == "[D" or seq == "OD" then return "LEFT"
+            elseif seq == "[D" or seq == "LEFT" then return "LEFT"
             elseif seq == "[5~" then return "PGUP"
             elseif seq == "[6~" then return "PGDN"
             elseif seq == "[H" or seq == "[1~" then return "HOME"
@@ -391,10 +395,11 @@ local function shell_quote(arg)
 end
 
 --------------------------------------------------------------------------------
--- 5. Git Log & Diff Engine
+-- 5. Git Log, Branch & Diff Engine
 --------------------------------------------------------------------------------
 local Engine = {
     detail_cache = {},
+    branch_cache = {},
 }
 
 -- Parse a tab-separated git log line:
@@ -413,6 +418,47 @@ local function parse_git_log_line(raw)
         refs = refs,
         subject = trim(s),
     }
+end
+
+-- Parse a tab-separated git branch line from `git for-each-ref`:
+--   <HEAD>\t<refname:short>\t<refname>\t<objectname:short>\t<committerdate:short>\t<authorname>\t<subject>
+local function parse_git_branch_line(raw)
+    if not raw or #raw == 0 then return nil end
+    raw = raw:gsub("\r$", "")
+    local head_m, short_ref, full_ref, h, d, a, s =
+        raw:match("^([^\t]*)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]*)\t([^\t]*)\t(.*)$")
+    if not short_ref then return nil end
+    short_ref = trim(short_ref)
+    full_ref = trim(full_ref)
+    -- Skip symbolic remote HEAD pointers (e.g., origin/HEAD or origin)
+    if short_ref:match("/HEAD$") or short_ref == "origin" or full_ref:match("/HEAD$") then
+        return nil
+    end
+    local is_remote = (full_ref:find("^refs/remotes/") ~= nil)
+    local local_name = short_ref
+    if is_remote then
+        local_name = short_ref:gsub("^[^/]+/", "")
+    end
+    return {
+        is_head = (trim(head_m) == "*"),
+        is_remote = is_remote,
+        name = short_ref,
+        local_name = local_name,
+        full_ref = full_ref,
+        hash = trim(h),
+        date = trim(d),
+        author = trim(a),
+        subject = trim(s),
+    }
+end
+
+-- Check whether a target string is a valid Git revision/branch/tag
+function Engine.is_valid_ref(target)
+    if not target or #target == 0 then return false end
+    local null_redir = IS_WINDOWS and ">nul 2>nul" or ">/dev/null 2>&1"
+    local cmd = string.format("git rev-parse --verify --quiet %s %s", shell_quote(target), null_redir)
+    local ok = os.execute(cmd)
+    return (ok == 0 or ok == true)
 end
 
 -- Colorize a single diff / commit detail line for terminal display
@@ -439,7 +485,6 @@ local function colorize_diff_line(line, width)
     elseif line:sub(1, 1) == "-" then
         return C.b_red .. clipped .. C.reset
     elseif line:match("^ [^|]+|%s*%d+") then
-        -- git --stat line: " path/to/file | 12 ++++----"
         local lhs, plus, minus = clipped:match("^([^|]+|%s*%d+%s*)(%+*)(%-*.*)$")
         if lhs then
             return C.white .. lhs .. C.b_green .. plus .. C.b_red .. minus .. C.reset
@@ -455,16 +500,28 @@ function Engine.fetch_commits(opts)
     opts = opts or {}
     local limit = opts.limit or 300
     local all_flag = opts.all and "--all " or ""
-    local path_arg = (opts.path and #opts.path > 0) and (" -- " .. shell_quote(opts.path)) or ""
+    local rev_arg = ""
+    local path_arg = ""
 
-    -- Place each % placeholder without pairing on the same variable name;
-    -- using %x09 separates placeholders cleanly.
+    if opts.branch and #opts.branch > 0 then
+        rev_arg = " " .. shell_quote(opts.branch)
+    end
+    if opts.path and #opts.path > 0 then
+        if #rev_arg == 0 and Engine.is_valid_ref(opts.path) then
+            rev_arg = " " .. shell_quote(opts.path)
+        else
+            path_arg = " -- " .. shell_quote(opts.path)
+        end
+    end
+
     local fmt = "%h%x09%ad%x09%an%x09%d%x09%s"
     local cmd
     if IS_WINDOWS then
-        cmd = string.format('git log -n %d %s--date=short --pretty="format:%s"%s 2>nul', limit, all_flag, fmt, path_arg)
+        cmd = string.format('git log -n %d %s--date=short --pretty="format:%s"%s%s 2>nul',
+            limit, all_flag, fmt, rev_arg, path_arg)
     else
-        cmd = string.format("git log -n %d %s--date=short --pretty='format:%s'%s 2>/dev/null", limit, all_flag, fmt, path_arg)
+        cmd = string.format("git log -n %d %s--date=short --pretty='format:%s'%s%s 2>/dev/null",
+            limit, all_flag, fmt, rev_arg, path_arg)
     end
 
     local commits = {}
@@ -478,6 +535,28 @@ function Engine.fetch_commits(opts)
     end
     p:close()
     return commits
+end
+
+function Engine.fetch_branches()
+    local fmt = "%(HEAD)%09%(refname:short)%09%(refname)%09%(objectname:short)%09%(committerdate:short)%09%(authorname)%09%(subject)"
+    local cmd
+    if IS_WINDOWS then
+        cmd = string.format('git for-each-ref --sort=-committerdate --format="%s" refs/heads refs/remotes 2>nul', fmt)
+    else
+        cmd = string.format("git for-each-ref --sort=-committerdate --format='%s' refs/heads refs/remotes 2>/dev/null", fmt)
+    end
+
+    local branches = {}
+    local p = io.popen(cmd, "r")
+    if not p then return branches end
+    for line in p:lines() do
+        local b = parse_git_branch_line(line)
+        if b then
+            table.insert(branches, b)
+        end
+    end
+    p:close()
+    return branches
 end
 
 -- view_mode: "full" (stat + patch), "stat" (stat only), "files" (name-status only)
@@ -521,6 +600,76 @@ function Engine.get_commit_details(hash, view_mode)
 
     Engine.detail_cache[key] = lines
     return lines
+end
+
+function Engine.get_branch_preview(branch_name)
+    if not branch_name or #branch_name == 0 then return {} end
+    if Engine.branch_cache[branch_name] then
+        return Engine.branch_cache[branch_name]
+    end
+    local commits = Engine.fetch_commits({ branch = branch_name, limit = 25 })
+    local lines = {
+        string.format("commit %s (Branch: %s)", commits[1] and commits[1].hash or "", branch_name),
+        string.format("Author: %s", commits[1] and commits[1].author or ""),
+        string.format("Date:   %s", commits[1] and commits[1].date or ""),
+        "",
+        "Recent Commits on " .. branch_name .. " (press Enter to view full commit log & diffs):",
+        string.rep("─", 64),
+    }
+    for _, c in ipairs(commits) do
+        local ref_tag = (#c.refs > 0) and (" [" .. c.refs .. "]") or ""
+        table.insert(lines, string.format("  %s  %s  %-14s  %s%s",
+            c.hash, c.date, pad_right(c.author, 14), c.subject, ref_tag))
+    end
+    Engine.branch_cache[branch_name] = lines
+    return lines
+end
+
+function Engine.has_submodules()
+    local f = io.open(".gitmodules", "r")
+    if f then f:close(); return true end
+    return false
+end
+
+-- Checkout a branch or commit with optional force (-f) and submodule sync
+function Engine.checkout(target, is_remote, force_mode)
+    if not target or #target == 0 then return false, "Empty checkout target" end
+    local f_flag = force_mode and "-f " or ""
+    local null_redir = IS_WINDOWS and ">nul 2>nul" or ">/dev/null 2>&1"
+
+    -- 1. If force mode and submodules exist, reset/clean submodules before switching
+    if force_mode and Engine.has_submodules() then
+        os.execute(string.format('git submodule foreach --recursive "git reset --hard && git clean -fd" %s', null_redir))
+    end
+
+    -- 2. Build checkout command (resolve remote tracking branch cleanly)
+    local cmd
+    if is_remote then
+        local local_branch = target:gsub("^[^/]+/", "")
+        if Engine.is_valid_ref("refs/heads/" .. local_branch) then
+            cmd = string.format("git checkout %s%s %s", f_flag, shell_quote(local_branch), null_redir)
+        else
+            cmd = string.format("git checkout %s--track %s %s", f_flag, shell_quote(target), null_redir)
+        end
+    else
+        cmd = string.format("git checkout %s%s %s", f_flag, shell_quote(target), null_redir)
+    end
+
+    local ok = os.execute(cmd)
+    if not (ok == 0 or ok == true) then
+        return false, string.format("Checkout failed for '%s' (press F to enable Force -f mode)", target)
+    end
+
+    -- 3. Synchronize & update recursive submodules if .gitmodules exists on target branch
+    local submod_note = ""
+    if Engine.has_submodules() then
+        local sub_f = force_mode and "-f " or ""
+        os.execute(string.format("git submodule sync --recursive %s", null_redir))
+        os.execute(string.format("git submodule update --init --recursive %s%s", sub_f, null_redir))
+        submod_note = " + submodules synced"
+    end
+
+    return true, string.format("Checked out '%s'%s%s", target, force_mode and " (-f)" or "", submod_note)
 end
 
 function Engine.copy_to_clipboard(text)
@@ -583,9 +732,12 @@ local VIEW_LABELS = { full = "Stat+Diff", stat = "Stat Only", files = "Files Onl
 local function run_tui(init_opts)
     Term.init()
     local state = {
+        pane_mode = init_opts.branches and "branches" or "commits", -- "commits" | "branches"
+        branch = init_opts.branch or "",
         path = init_opts.path or "",
         limit = init_opts.limit or 300,
         all = init_opts.all or false,
+        force_checkout = (init_opts.force ~= false), -- Default ON (-f + submodule sync)
         view_idx = 1,
         filter = init_opts.filter or "",
         prev_filter = "",
@@ -594,20 +746,27 @@ local function run_tui(init_opts)
         scroll = 1,
         diff_scroll = 1,
         all_commits = {},
+        all_branches = {},
         filtered = {},
         status_msg = "",
         pending_g = false,
     }
 
     local function apply_filter()
+        local source = (state.pane_mode == "branches") and state.all_branches or state.all_commits
         if #state.filter == 0 then
-            state.filtered = state.all_commits
+            state.filtered = source
         else
             local out = {}
-            for _, c in ipairs(state.all_commits) do
-                local hay = c.hash .. " " .. c.date .. " " .. c.author .. " " .. c.refs .. " " .. c.subject
+            for _, item in ipairs(source) do
+                local hay
+                if state.pane_mode == "branches" then
+                    hay = item.name .. " " .. item.hash .. " " .. item.date .. " " .. item.author .. " " .. item.subject
+                else
+                    hay = item.hash .. " " .. item.date .. " " .. item.author .. " " .. item.refs .. " " .. item.subject
+                end
                 if fuzzy_score(state.filter, hay) then
-                    table.insert(out, c)
+                    table.insert(out, item)
                 end
             end
             state.filtered = out
@@ -616,17 +775,20 @@ local function run_tui(init_opts)
         state.diff_scroll = 1
     end
 
-    local function reload_commits()
+    local function reload_data()
         Engine.detail_cache = {}
+        Engine.branch_cache = {}
         state.all_commits = Engine.fetch_commits({
             limit = state.limit,
             all = state.all,
+            branch = state.branch,
             path = state.path,
         })
+        state.all_branches = Engine.fetch_branches()
         apply_filter()
     end
 
-    reload_commits()
+    reload_data()
 
     local prev_lines = {}
     local prev_cols, prev_rows = 0, 0
@@ -653,36 +815,48 @@ local function run_tui(init_opts)
 
         -- 1. Header Bar
         local view_mode = VIEW_MODES[state.view_idx]
-        local scope_badge = state.all and (C.b_green .. "All Branches" .. C.reset .. C.bg_header) or (C.b_cyan .. "Current Branch" .. C.reset .. C.bg_header)
-        local path_badge = (#state.path > 0) and (" │ Path: " .. C.b_yellow .. state.path .. C.reset .. C.bg_header) or ""
-        local hdr_left = string.format(" %s%s⚡ flog%s%s │ %d/%d commits │ Scope: %s │ View: %s%s%s%s",
-            C.bg_header, C.b_cyan .. C.bold, C.reset, C.bg_header,
-            #state.filtered, #state.all_commits,
+        local mode_badge = (state.pane_mode == "branches")
+            and (C.b_yellow .. "[BRANCHES]" .. C.reset .. C.bg_header)
+            or (C.b_cyan .. "[COMMITS]" .. C.reset .. C.bg_header)
+        local scope_label = (#state.branch > 0) and state.branch or (state.all and "All Branches" or "HEAD")
+        local scope_badge = C.b_green .. scope_label .. C.reset .. C.bg_header
+        local force_badge = state.force_checkout and (C.b_green .. "ON(-f)" .. C.reset .. C.bg_header) or (C.gray .. "OFF" .. C.reset .. C.bg_header)
+        local total_cnt = (state.pane_mode == "branches") and #state.all_branches or #state.all_commits
+        local hdr_left = string.format(" %s%s⚡ flog %s │ %d/%d │ Ref: %s │ Force: %s │ View: %s%s%s",
+            C.bg_header, C.b_cyan .. C.bold, mode_badge,
+            #state.filtered, total_cnt,
             scope_badge,
-            C.b_magenta, VIEW_LABELS[view_mode], C.reset .. C.bg_header,
-            path_badge)
-        add_line(hdr_left .. string.rep(" ", math.max(0, cols - 65)) .. C.reset)
+            force_badge,
+            C.b_magenta, VIEW_LABELS[view_mode], C.reset .. C.bg_header)
+        add_line(hdr_left .. string.rep(" ", math.max(0, cols - 68)) .. C.reset)
 
         -- 2. Filter & Controls Bar
         local flt_box
         if state.mode == "filter" then
             flt_box = string.format("%sFilter (/): %s%s█%s", C.b_yellow .. C.bold, C.b_white, state.filter, C.reset)
         else
-            local flt_disp = (#state.filter > 0) and (C.b_yellow .. state.filter .. C.reset) or (C.gray .. "(press / to filter commits)" .. C.reset)
+            local hint = (state.pane_mode == "branches") and "(press / to search branches)" or "(press / to filter commits)"
+            local flt_disp = (#state.filter > 0) and (C.b_yellow .. state.filter .. C.reset) or (C.gray .. hint .. C.reset)
             flt_box = string.format("%sFilter (/):%s %s", C.bold, C.reset, flt_disp)
         end
-        local toggles = string.format("%s[a]%sAll:%s  %s[d]%sView:%s  %s[J/K]%sScroll Diff",
+        local toggles = string.format("%s[b]%s%s  %s[c]%sCheckout  %s[F]%sForce:%s  %s[a]%sAll:%s  %s[d]%sView",
+            C.b_cyan, C.gray, (state.pane_mode == "branches" and "Commits" or "Branches"),
+            C.b_green, C.gray,
+            C.b_cyan, C.gray, state.force_checkout and (C.b_green .. "ON" .. C.reset) or (C.gray .. "OFF" .. C.reset),
             C.b_cyan, C.gray, state.all and (C.b_green .. "ON" .. C.reset) or (C.gray .. "OFF" .. C.reset),
-            C.b_cyan, C.gray, C.b_magenta .. VIEW_LABELS[view_mode] .. C.reset,
             C.b_cyan, C.gray)
         add_line(string.format(" %s   │   %s", flt_box, toggles))
 
         -- 3. Column Headers
-        local l_hdr = pad_right(" HASH     DATE        COMMIT SUBJECT", left_w)
-        local cur_commit = state.filtered[state.cursor]
-        local r_title = " COMMIT DETAILS & DIFF PREVIEW"
-        if cur_commit then
-            r_title = string.format(" COMMIT %s — %s (%s)", cur_commit.hash, cur_commit.author, cur_commit.date)
+        local l_hdr
+        local r_title
+        local cur_item = state.filtered[state.cursor]
+        if state.pane_mode == "branches" then
+            l_hdr = pad_right(" TYPE   BRANCH NAME              HASH     DATE", left_w)
+            r_title = cur_item and string.format(" BRANCH %s — Recent Commits (%s)", cur_item.name, cur_item.hash) or " BRANCH PREVIEW"
+        else
+            l_hdr = pad_right(" HASH     DATE        COMMIT SUBJECT", left_w)
+            r_title = cur_item and string.format(" COMMIT %s — %s (%s)", cur_item.hash, cur_item.author, cur_item.date) or " COMMIT DETAILS & DIFF PREVIEW"
         end
         local r_hdr = pad_right(r_title, right_w)
         add_line(C.bold .. C.b_blue .. l_hdr .. C.reset .. " " .. C.gray .. "│" .. C.reset .. " " .. C.bold .. C.b_magenta .. r_hdr .. C.reset)
@@ -700,21 +874,28 @@ local function run_tui(init_opts)
             preview_lines = {
                 C.b_cyan .. C.bold .. "Keyboard Shortcuts:" .. C.reset,
                 "",
-                "  " .. C.b_yellow .. "j / k / ↑ / ↓" .. C.reset .. "    Move selection cursor through commits",
-                "  " .. C.b_yellow .. "g / G / Home/End" .. C.reset .. " Jump to top / bottom commit",
-                "  " .. C.b_yellow .. "PgUp / PgDn" .. C.reset .. "      Page up / down commit list",
+                "  " .. C.b_yellow .. "j / k / ↑ / ↓" .. C.reset .. "    Move selection cursor",
+                "  " .. C.b_yellow .. "b" .. C.reset .. "                Toggle Branches View <-> Commits View",
+                "  " .. C.b_yellow .. "/ or f" .. C.reset .. "           Fuzzy-search branches or commits",
+                "  " .. C.b_yellow .. "Enter (Branches)" .. C.reset .. " Inspect commits & diffs of selected branch",
+                "  " .. C.b_yellow .. "Enter (Commits)" .. C.reset .. "  Open selected commit diff in $EDITOR / nvim",
+                "  " .. C.b_yellow .. "c" .. C.reset .. "                Checkout selected branch or commit (+ submodule sync)",
+                "  " .. C.b_yellow .. "F" .. C.reset .. "                Toggle Force Checkout (-f + submodule reset)",
                 "  " .. C.b_yellow .. "J / K or ] / [" .. C.reset .. "   Scroll right-hand diff preview down / up",
                 "  " .. C.b_yellow .. "0" .. C.reset .. "                Reset diff preview scroll to top",
-                "  " .. C.b_yellow .. "/ or f" .. C.reset .. "           Fuzzy-filter commits by hash/author/subject/ref",
-                "  " .. C.b_yellow .. "Enter / o" .. C.reset .. "        Open selected commit diff in $EDITOR / nvim",
-                "  " .. C.b_yellow .. "y" .. C.reset .. "                Copy commit hash to system clipboard",
+                "  " .. C.b_yellow .. "y" .. C.reset .. "                Copy commit hash / branch name to clipboard",
                 "  " .. C.b_yellow .. "a" .. C.reset .. "                Toggle --all branches vs current branch",
                 "  " .. C.b_yellow .. "d" .. C.reset .. "                Cycle preview mode (Stat+Diff / Stat / Files)",
-                "  " .. C.b_yellow .. "r / F5" .. C.reset .. "           Reload git commit history",
+                "  " .. C.b_yellow .. "r / F5" .. C.reset .. "           Reload git history & branches",
                 "  " .. C.b_yellow .. "q / Esc" .. C.reset .. "          Quit flog",
             }
-        elseif cur_commit then
-            local raw_details = Engine.get_commit_details(cur_commit.hash, view_mode)
+        elseif cur_item then
+            local raw_details
+            if state.pane_mode == "branches" then
+                raw_details = Engine.get_branch_preview(cur_item.name)
+            else
+                raw_details = Engine.get_commit_details(cur_item.hash, view_mode)
+            end
             local max_scroll = math.max(1, #raw_details - body_h + 1)
             if state.diff_scroll > max_scroll then state.diff_scroll = max_scroll end
             if state.diff_scroll < 1 then state.diff_scroll = 1 end
@@ -725,36 +906,54 @@ local function run_tui(init_opts)
         else
             preview_lines = {
                 "",
-                "  " .. C.gray .. "No commits match current filter." .. C.reset,
+                "  " .. C.gray .. "No items match current filter." .. C.reset,
             }
         end
 
         -- 4. Body Rows
-        local subj_w = math.max(12, left_w - 22)
         for row = 1, body_h do
             local idx = state.scroll + row - 1
-            local c = state.filtered[idx]
+            local item = state.filtered[idx]
             local l_str
 
-            if c then
+            if item then
                 local is_cur = (idx == state.cursor)
                 local bg = is_cur and C.bg_select or ""
                 local ptr = is_cur and (C.b_cyan .. "▸" .. C.reset .. bg) or " "
 
-                local hash_str = pad_right(c.hash, 8)
-                local date_str = pad_right(c.date, 10)
-                local ref_prefix = (#c.refs > 0) and ("[" .. c.refs .. "] ") or ""
-                local full_subj = pad_right(ref_prefix .. c.subject, subj_w)
+                if state.pane_mode == "branches" then
+                    local kind = item.is_remote and "[REM]" or "[LOC]"
+                    local kind_col = item.is_remote and C.b_magenta or C.b_green
+                    local head_mark = item.is_head and "* " or "  "
+                    local name_w = math.max(12, left_w - 28)
+                    local bname = pad_right(head_mark .. item.name, name_w)
+                    local hash_str = pad_right(item.hash, 8)
+                    local date_str = pad_right(item.date, 10)
+                    local name_col = item.is_head and (C.b_green .. C.bold) or (is_cur and (C.b_white .. C.bold) or C.white)
 
-                local hash_col = is_cur and (C.b_yellow .. C.bold) or C.yellow
-                local date_col = C.gray
-                local subj_col = is_cur and (C.b_white .. C.bold) or C.white
+                    l_str = string.format("%s%s%s%s%s %s%s%s %s%s%s %s%s%s",
+                        bg, ptr,
+                        kind_col, kind, C.reset .. bg,
+                        name_col, bname, C.reset .. bg,
+                        C.yellow, hash_str, C.reset .. bg,
+                        C.gray, date_str, C.reset)
+                else
+                    local subj_w = math.max(12, left_w - 22)
+                    local hash_str = pad_right(item.hash, 8)
+                    local date_str = pad_right(item.date, 10)
+                    local ref_prefix = (#item.refs > 0) and ("[" .. item.refs .. "] ") or ""
+                    local full_subj = pad_right(ref_prefix .. item.subject, subj_w)
 
-                l_str = string.format("%s%s%s%s%s %s%s%s %s%s%s",
-                    bg, ptr,
-                    hash_col, hash_str, C.reset .. bg,
-                    date_col, date_str, C.reset .. bg,
-                    subj_col, full_subj, C.reset)
+                    local hash_col = is_cur and (C.b_yellow .. C.bold) or C.yellow
+                    local date_col = C.gray
+                    local subj_col = is_cur and (C.b_white .. C.bold) or C.white
+
+                    l_str = string.format("%s%s%s%s%s %s%s%s %s%s%s",
+                        bg, ptr,
+                        hash_col, hash_str, C.reset .. bg,
+                        date_col, date_str, C.reset .. bg,
+                        subj_col, full_subj, C.reset)
+                end
             else
                 l_str = string.rep(" ", left_w)
             end
@@ -768,9 +967,12 @@ local function run_tui(init_opts)
         local footer
         if #state.status_msg > 0 then
             footer = " " .. C.b_yellow .. state.status_msg .. C.reset
+        elseif state.pane_mode == "branches" then
+            footer = string.format(" %s↑/↓%s:Select  %sEnter%s:View Branch Commits  %sc%s:Checkout Branch  %sF%s:Force(-f)  %s/%s:Search  %sb%s:Commits  %sq%s:Quit",
+                C.b_cyan, C.gray, C.b_green, C.gray, C.b_yellow, C.gray, C.b_cyan, C.gray, C.b_yellow, C.gray, C.b_cyan, C.gray, C.b_red, C.gray)
         else
-            footer = string.format(" %s↑/↓%s:Select  %sEnter%s:Edit Diff  %sJ/K%s:Scroll Diff  %s/%s:Filter  %sy%s:Copy Hash  %sa%s:All  %sd%s:View  %s?%s:Help  %sq%s:Quit",
-                C.b_cyan, C.gray, C.b_green, C.gray, C.b_cyan, C.gray, C.b_yellow, C.gray, C.b_cyan, C.gray, C.b_cyan, C.gray, C.b_cyan, C.gray, C.b_cyan, C.gray, C.b_red, C.gray)
+            footer = string.format(" %s↑/↓%s:Select  %sb%s:Branches  %sc%s:Checkout  %sF%s:Force(-f)  %sEnter%s:Edit Diff  %sJ/K%s:Scroll Diff  %s/%s:Filter  %sq%s:Quit",
+                C.b_cyan, C.gray, C.b_cyan, C.gray, C.b_green, C.gray, C.b_cyan, C.gray, C.b_green, C.gray, C.b_cyan, C.gray, C.b_yellow, C.gray, C.b_red, C.gray)
         end
         add_line(footer .. C.reset)
 
@@ -867,24 +1069,47 @@ local function run_tui(init_opts)
             elseif key == "/" or key == "f" then
                 state.prev_filter = state.filter
                 state.mode = "filter"
+            elseif key == "b" then
+                state.pane_mode = (state.pane_mode == "branches") and "commits" or "branches"
+                state.filter = ""
+                state.cursor = 1
+                state.scroll = 1
+                apply_filter()
+            elseif key == "F" then
+                state.force_checkout = not state.force_checkout
+                state.status_msg = "Force Checkout (-f + submodule reset): " .. (state.force_checkout and "ON" or "OFF")
+            elseif key == "c" then
+                local cur = state.filtered[state.cursor]
+                if cur then
+                    local target = (state.pane_mode == "branches") and cur.name or cur.hash
+                    local is_rem = (state.pane_mode == "branches") and cur.is_remote or false
+                    local ok, msg = Engine.checkout(target, is_rem, state.force_checkout)
+                    if ok then
+                        state.branch = ""
+                        reload_data()
+                    end
+                    state.status_msg = msg
+                end
             elseif key == "a" then
                 state.all = not state.all
-                reload_commits()
+                state.branch = ""
+                reload_data()
                 state.status_msg = "Scope: " .. (state.all and "All Branches (--all)" or "Current Branch")
             elseif key == "d" then
                 state.view_idx = (state.view_idx % #VIEW_MODES) + 1
                 state.diff_scroll = 1
                 state.status_msg = "Diff view: " .. VIEW_LABELS[VIEW_MODES[state.view_idx]]
             elseif key == "r" or key == "F5" then
-                reload_commits()
-                state.status_msg = "Reloaded git commit history."
+                reload_data()
+                state.status_msg = "Reloaded git commit history & branches."
             elseif key == "y" then
                 local cur = state.filtered[state.cursor]
                 if cur then
-                    if Engine.copy_to_clipboard(cur.hash) then
-                        state.status_msg = "Copied commit hash to clipboard: " .. cur.hash
+                    local val = (state.pane_mode == "branches") and cur.name or cur.hash
+                    if Engine.copy_to_clipboard(val) then
+                        state.status_msg = "Copied to clipboard: " .. val
                     else
-                        state.status_msg = "Commit hash: " .. cur.hash
+                        state.status_msg = "Selected: " .. val
                     end
                 end
             elseif key == "?" then
@@ -892,10 +1117,20 @@ local function run_tui(init_opts)
             elseif key == "ENTER" or key == "o" then
                 local cur = state.filtered[state.cursor]
                 if cur then
-                    Term.shutdown()
-                    Engine.open_commit_in_editor(cur.hash)
-                    Term.init()
-                    prev_lines = {}
+                    if state.pane_mode == "branches" then
+                        state.branch = cur.name
+                        state.pane_mode = "commits"
+                        state.filter = ""
+                        state.cursor = 1
+                        state.scroll = 1
+                        reload_data()
+                        state.status_msg = "Viewing commits on branch: " .. cur.name
+                    else
+                        Term.shutdown()
+                        Engine.open_commit_in_editor(cur.hash)
+                        Term.init()
+                        prev_lines = {}
+                    end
                 end
             end
         end
@@ -908,6 +1143,20 @@ end
 -- 7. CLI Non-Interactive Modes & Self-Tests
 --------------------------------------------------------------------------------
 local function cmd_list(opts)
+    if opts.branches then
+        local branches = Engine.fetch_branches()
+        for _, b in ipairs(branches) do
+            local kind = b.is_remote and (C.b_magenta .. "[REMOTE]" .. C.reset) or (C.b_green .. "[LOCAL] " .. C.reset)
+            local mark = b.is_head and (C.b_green .. "* " .. C.reset) or "  "
+            print(string.format("%s %s%-28s %s%-8s%s %s%-10s%s %s",
+                kind, mark, pad_right(b.name, 28),
+                C.b_yellow, b.hash, C.reset,
+                C.gray, b.date, C.reset,
+                b.subject))
+        end
+        return
+    end
+
     local commits = Engine.fetch_commits(opts)
     for _, c in ipairs(commits) do
         local ref_str = (#c.refs > 0) and (C.b_cyan .. " (" .. c.refs .. ")" .. C.reset) or ""
@@ -957,11 +1206,31 @@ local function run_tests()
     assert_eq("parse_git_log_line refs", parsed and parsed.refs, "HEAD -> master, origin/master")
     assert_eq("parse_git_log_line subject", parsed and parsed.subject, "Add frg interactive TUI")
 
+    local b_sample = "*\tmaster\trefs/heads/master\tec78429\t2026-10-17\tskyera\tfeat(bin): add flog"
+    local b_parsed = parse_git_branch_line(b_sample)
+    assert_eq("parse_git_branch_line local name", b_parsed and b_parsed.name, "master")
+    assert_eq("parse_git_branch_line is_head", b_parsed and b_parsed.is_head, true)
+    assert_eq("parse_git_branch_line is_remote", b_parsed and b_parsed.is_remote, false)
+
+    local r_sample = " \torigin/track/master\trefs/remotes/origin/track/master\t86cbec9\t2026-03-10\tskyera\tSwitch to Alt-hjkl"
+    local r_parsed = parse_git_branch_line(r_sample)
+    assert_eq("parse_git_branch_line remote name", r_parsed and r_parsed.name, "origin/track/master")
+    assert_eq("parse_git_branch_line remote local_name", r_parsed and r_parsed.local_name, "track/master")
+    assert_eq("parse_git_branch_line remote is_remote", r_parsed and r_parsed.is_remote, true)
+
+    local head_sym = " \torigin/HEAD\trefs/remotes/origin/HEAD\tec78429\t2026-10-17\tskyera\tfeat(bin): add flog"
+    assert_eq("parse_git_branch_line filters origin/HEAD", parse_git_branch_line(head_sym), nil)
+
     local add_colored = colorize_diff_line("+local x = 42", 40)
     assert_eq("colorize_diff_line highlights additions", add_colored:find("\27%[92m") ~= nil, true)
 
     local del_colored = colorize_diff_line("-local x = 41", 40)
     assert_eq("colorize_diff_line highlights deletions", del_colored:find("\27%[91m") ~= nil, true)
+
+    assert_eq("Engine.is_valid_ref recognizes HEAD", Engine.is_valid_ref("HEAD"), true)
+
+    local branches = Engine.fetch_branches()
+    assert_eq("Engine.fetch_branches returns repo branches", #branches >= 1, true)
 
     local commits = Engine.fetch_commits({ limit = 5 })
     assert_eq("Engine.fetch_commits returns commits from current repo", #commits >= 1, true)
@@ -976,28 +1245,35 @@ end
 
 local function show_help()
     print([[
-Usage: flog [OPTIONS] [PATH]
+Usage: flog [OPTIONS] [BRANCH_OR_PATH]
 
-High-Performance Interactive Git Commit & Diff Browser TUI (LuaJIT + FFI).
+High-Performance Interactive Git Commit, Diff & Branch Browser TUI (LuaJIT + FFI).
 
 Options:
+  -b, --branches       Start in Interactive Branch Search & Switcher view
   -a, --all            Show commits across all branches and tags
+  -f, --force          Enable Force Checkout (-f + submodule reset) [default: ON]
+  --no-force           Disable Force Checkout
   -n, --limit <N>      Maximum number of commits to load (default: 300)
-  -l, --list           Print formatted commit history and exit
+  -l, --list           Print formatted commit (or branch) list and exit
   --show <HASH>        Print colorized commit summary and diff for <HASH>
   --test               Run automated self-test suite
   -h, --help           Show this help message
 
 TUI Keybindings:
-  j / k / Up / Down    Move selection cursor through commits
+  b                    Toggle between Branches View and Commits View
+  / or f               Fuzzy-search branches or filter commits
+  Enter (in Branches)  Inspect commit history & diffs of selected branch
+  Enter (in Commits)   Open selected commit diff in $EDITOR / nvim
+  c                    Checkout selected branch or commit (+ submodule sync)
+  F                    Toggle Force Checkout mode (-f + submodule reset)
+  j / k / Up / Down    Move selection cursor
   J / K or ] / [       Scroll right-hand diff preview pane down / up
   0                    Reset diff preview scroll to top
-  / or f               Fuzzy-filter commits by hash, author, ref, or message
-  Enter / o            Open selected commit diff in $EDITOR / nvim
-  y                    Copy selected commit hash to system clipboard
+  y                    Copy selected commit hash / branch name to clipboard
   a                    Toggle All Branches (--all) vs Current Branch
   d                    Cycle preview view (Stat+Diff -> Stat Only -> Files Only)
-  r / F5               Reload git commit history
+  r / F5               Reload git commit history & branches
   ?                    Show keyboard shortcuts help
   q / Esc              Quit]])
 end
@@ -1007,7 +1283,7 @@ end
 --------------------------------------------------------------------------------
 local args = { ... }
 local mode = "tui"
-local opts = { limit = 300, all = false, path = "", filter = "" }
+local opts = { limit = 300, all = false, branches = false, force = true, path = "", filter = "" }
 local show_hash = nil
 
 local i = 1
@@ -1021,8 +1297,14 @@ while i <= #args do
         os.exit(0)
     elseif a == "-l" or a == "--list" then
         mode = "list"
+    elseif a == "-b" or a == "--branches" then
+        opts.branches = true
     elseif a == "-a" or a == "--all" then
         opts.all = true
+    elseif a == "-f" or a == "--force" then
+        opts.force = true
+    elseif a == "--no-force" then
+        opts.force = false
     elseif a == "-n" or a == "--limit" then
         i = i + 1
         opts.limit = tonumber(args[i]) or 300
