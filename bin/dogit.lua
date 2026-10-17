@@ -879,7 +879,7 @@ local TUI = {
     preview_scroll = 0,
     filter_tab = "all", -- "all", "branches", "tags", "remotes"
     force = true,
-    submodule = true,
+    submodule = false,
     dirty = false,
     modified_count = 0,
     untracked_count = 0,
@@ -911,7 +911,7 @@ function TUI.init(initial_filter, initial_force, initial_submodule)
     if initial_submodule ~= nil then
         TUI.submodule = initial_submodule
     else
-        TUI.submodule = true
+        TUI.submodule = false
     end
     TUI.mode = "normal"
     TUI.saved_query = ""
@@ -1415,7 +1415,7 @@ function TUI.run()
     local needs_render = true
     local checkout_target = nil
     local checkout_force = false
-    local checkout_submodule = true
+    local checkout_submodule = false
 
     while running do
         if needs_render then
@@ -1888,9 +1888,9 @@ local function run_test_suite()
     assert_eq(Git.build_submodule_cmd(false), "git submodule update --init --recursive", "Non-force submodule update command")
     local orig_sub = TUI.submodule
     TUI.init(nil, true, nil)
-    assert_eq(TUI.submodule, true, "Submodule sync is enabled by default in TUI")
-    TUI.init(nil, true, false)
-    assert_eq(TUI.submodule, false, "Submodule sync can be disabled via initial parameter")
+    assert_eq(TUI.submodule, false, "Submodule sync is disabled by default (checkout only)")
+    TUI.init(nil, true, true)
+    assert_eq(TUI.submodule, true, "Submodule sync can be enabled via initial parameter")
     TUI.submodule = orig_sub
 
     -- Test 7: Vim Navigation & Tab Cycling Logic
@@ -2013,7 +2013,7 @@ local function main(args)
     args = args or {}
 
     local force = true
-    local submodule = true
+    local submodule = false
     local list_mode = false
     local initial_filter = nil
     local target = nil

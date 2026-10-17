@@ -625,24 +625,12 @@ function Engine.get_branch_preview(branch_name)
     return lines
 end
 
-function Engine.has_submodules()
-    local f = io.open(".gitmodules", "r")
-    if f then f:close(); return true end
-    return false
-end
-
--- Checkout a branch or commit with optional force (-f) and submodule sync
+-- Checkout a branch or commit with optional force (-f)
 function Engine.checkout(target, is_remote, force_mode)
     if not target or #target == 0 then return false, "Empty checkout target" end
     local f_flag = force_mode and "-f " or ""
     local null_redir = IS_WINDOWS and ">nul 2>nul" or ">/dev/null 2>&1"
 
-    -- 1. If force mode and submodules exist, reset/clean submodules before switching
-    if force_mode and Engine.has_submodules() then
-        os.execute(string.format('git submodule foreach --recursive "git reset --hard && git clean -fd" %s', null_redir))
-    end
-
-    -- 2. Build checkout command (resolve remote tracking branch cleanly)
     local cmd
     if is_remote then
         local local_branch = target:gsub("^[^/]+/", "")
@@ -660,16 +648,7 @@ function Engine.checkout(target, is_remote, force_mode)
         return false, string.format("Checkout failed for '%s' (press F to enable Force -f mode)", target)
     end
 
-    -- 3. Synchronize & update recursive submodules if .gitmodules exists on target branch
-    local submod_note = ""
-    if Engine.has_submodules() then
-        local sub_f = force_mode and "-f " or ""
-        os.execute(string.format("git submodule sync --recursive %s", null_redir))
-        os.execute(string.format("git submodule update --init --recursive %s%s", sub_f, null_redir))
-        submod_note = " + submodules synced"
-    end
-
-    return true, string.format("Checked out '%s'%s%s", target, force_mode and " (-f)" or "", submod_note)
+    return true, string.format("Checked out '%s'%s", target, force_mode and " (-f)" or "")
 end
 
 function Engine.copy_to_clipboard(text)
@@ -879,8 +858,8 @@ local function run_tui(init_opts)
                 "  " .. C.b_yellow .. "/ or f" .. C.reset .. "           Fuzzy-search branches or commits",
                 "  " .. C.b_yellow .. "Enter (Branches)" .. C.reset .. " Inspect commits & diffs of selected branch",
                 "  " .. C.b_yellow .. "Enter (Commits)" .. C.reset .. "  Open selected commit diff in $EDITOR / nvim",
-                "  " .. C.b_yellow .. "c" .. C.reset .. "                Checkout selected branch or commit (+ submodule sync)",
-                "  " .. C.b_yellow .. "F" .. C.reset .. "                Toggle Force Checkout (-f + submodule reset)",
+                "  " .. C.b_yellow .. "c" .. C.reset .. "                Checkout selected branch or commit",
+                "  " .. C.b_yellow .. "F" .. C.reset .. "                Toggle Force Checkout (-f)",
                 "  " .. C.b_yellow .. "J / K or ] / [" .. C.reset .. "   Scroll right-hand diff preview down / up",
                 "  " .. C.b_yellow .. "0" .. C.reset .. "                Reset diff preview scroll to top",
                 "  " .. C.b_yellow .. "y" .. C.reset .. "                Copy commit hash / branch name to clipboard",
@@ -1077,7 +1056,7 @@ local function run_tui(init_opts)
                 apply_filter()
             elseif key == "F" then
                 state.force_checkout = not state.force_checkout
-                state.status_msg = "Force Checkout (-f + submodule reset): " .. (state.force_checkout and "ON" or "OFF")
+                state.status_msg = "Force Checkout (-f): " .. (state.force_checkout and "ON" or "OFF")
             elseif key == "c" then
                 local cur = state.filtered[state.cursor]
                 if cur then
@@ -1252,7 +1231,7 @@ High-Performance Interactive Git Commit, Diff & Branch Browser TUI (LuaJIT + FFI
 Options:
   -b, --branches       Start in Interactive Branch Search & Switcher view
   -a, --all            Show commits across all branches and tags
-  -f, --force          Enable Force Checkout (-f + submodule reset) [default: ON]
+  -f, --force          Enable Force Checkout (-f) [default: ON]
   --no-force           Disable Force Checkout
   -n, --limit <N>      Maximum number of commits to load (default: 300)
   -l, --list           Print formatted commit (or branch) list and exit
@@ -1265,8 +1244,8 @@ TUI Keybindings:
   / or f               Fuzzy-search branches or filter commits
   Enter (in Branches)  Inspect commit history & diffs of selected branch
   Enter (in Commits)   Open selected commit diff in $EDITOR / nvim
-  c                    Checkout selected branch or commit (+ submodule sync)
-  F                    Toggle Force Checkout mode (-f + submodule reset)
+  c                    Checkout selected branch or commit
+  F                    Toggle Force Checkout mode (-f)
   j / k / Up / Down    Move selection cursor
   J / K or ] / [       Scroll right-hand diff preview pane down / up
   0                    Reset diff preview scroll to top
