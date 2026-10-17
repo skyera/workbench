@@ -1309,34 +1309,24 @@ git_tag() {
     echo "Tag '$tag' created and pushed."
 }
 
-fgbd() {
-    local branches
-    branches=$(git branch --format="%(if)%(HEAD)%(then)%(else)%(refname:short)%(end)" | grep -v '^$' | fzf --multi --header="[Git Delete Local Branch] TAB to multi-select, ENTER to delete")
-    if [[ -n "$branches" ]]; then
-        echo "$branches" | xargs git branch -d
+fbr() {
+    if command -v fbr.sh >/dev/null 2>&1; then
+        fbr.sh "$@"
+    elif command -v fbr.bat >/dev/null 2>&1; then
+        fbr.bat "$@"
+    elif command -v fbr >/dev/null 2>&1; then
+        command fbr "$@"
+    else
+        local branches
+        branches=$(git branch --format="%(if)%(HEAD)%(then)%(else)%(refname:short)%(end)" | grep -v '^$' | fzf --header="[Git Branch Checkout]")
+        [[ -n "$branches" ]] && git checkout "$branches"
     fi
 }
-alias fbrd='fgbd'
+alias fbrd='fbr --merged'
+alias fbrD='fbr'
+alias fgbd='fbr --merged'
+alias fgbD='fbr'
 
-fgbD() {
-    local branches
-    branches=$(git branch --format="%(if)%(HEAD)%(then)%(else)%(refname:short)%(end)" | grep -v '^$' | fzf --multi --header="[Git FORCE Delete Local Branch] TAB to multi-select, ENTER to force delete")
-    if [[ -n "$branches" ]]; then
-        echo "Branches to FORCE delete:"
-        echo "$branches"
-        local reply
-        if [[ -n "$BASH_VERSION" ]]; then
-            read -rp "Are you sure? [y/N] " -n 1 reply
-        elif [[ -n "$ZSH_VERSION" ]]; then
-            read "reply?Are you sure? [y/N] "
-        fi
-        echo
-        if [[ "$reply" =~ ^[Yy]$ ]]; then
-            echo "$branches" | xargs git branch -D
-        fi
-    fi
-}
-alias fbrD='fgbD'
 
 
 txp() {
