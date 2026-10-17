@@ -1444,6 +1444,7 @@ _apply_overrides() {
     command -v fdu.sh >/dev/null 2>&1 && alias fdu='fdu.sh'
     command -v frg.sh >/dev/null 2>&1 && alias frg='frg.sh'
     command -v flog.sh >/dev/null 2>&1 && alias flog='flog.sh'
+    command -v fco.sh >/dev/null 2>&1 && alias fco='fco.sh'
 
     # Antigravity CLI auto-approve alias (universal)
     if command -v agy.exe >/dev/null 2>&1; then

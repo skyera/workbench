@@ -1,6 +1,6 @@
 #!/usr/bin/env luajit
 --[[
-  dogit.lua - High-Performance Git Branch, Tag, Commit & Worktree Quick-Switcher TUI
+  fco.lua - High-Performance Git Branch, Tag, Commit & Worktree Quick-Switcher TUI
   Powered by LuaJIT & FFI. Single-file, zero external Lua dependencies.
   Runs natively on Windows (Win32 Console/Process FFI) and Linux/POSIX.
 
@@ -15,11 +15,11 @@
     - Category Tabs: Switch between [All], [Branches], [Tags], [Remotes], and [Commits] with h / l / Tab.
     - Branch Commits Drill-Down: Press 'c' to view and checkout historical commits on highlighted branch.
     - Dual Mode: Full interactive TUI or non-interactive CLI (--list, --batch, <target>).
-    - Automated Self-Test Suite: Run 'luajit bin/dogit.lua --test' for regression verification.
+    - Automated Self-Test Suite: Run 'luajit bin/fco.lua --test' for regression verification.
 
   Usage:
-    luajit bin/dogit.lua [OPTIONS] [TARGET]
-    dogit [OPTIONS] [TARGET]
+    luajit bin/fco.lua [OPTIONS] [TARGET]
+    fco [OPTIONS] [TARGET]
 
   Options:
     -f, --force          Force checkout (git checkout -f) [DEFAULT: ON]
@@ -1051,7 +1051,7 @@ function TUI.render()
     end
 
     -- 1. Header Box
-    local title_left = " DOGIT v1.0 [Branch & Tag Switcher] "
+    local title_left = " FCO v1.0 [Branch & Tag Switcher] "
     local repo_short = truncate_string(TUI.repo_root, 30)
     local title_right = string.format(" Repo: %s ", repo_short)
     local fill_len = cols - 2 - utf8_col_width(title_left) - utf8_col_width(title_right)
@@ -1393,7 +1393,7 @@ function TUI.render_modal(cols, rows, buf)
             "  f                  Toggle Force Mode (git checkout -f) [Default: ON]",
             "  s                  Toggle Submodule Auto-Sync (--init --recursive -f)",
             "  w                  Create Git Worktree for selected ref",
-            "  q / Ctrl+C         Quit DOGIT",
+            "  q / Ctrl+C         Quit FCO",
         }
         for i, l in ipairs(lines) do
             if i <= mh - 4 then
@@ -1435,7 +1435,7 @@ function TUI.run()
                         local item = TUI.filtered_items[TUI.selection]
                         if item then
                             Term.restore()
-                            print(C.b_cyan .. "[DOGIT] Creating git worktree at '" .. TUI.worktree_input .. "'..." .. C.reset)
+                            print(C.b_cyan .. "[FCO] Creating git worktree at '" .. TUI.worktree_input .. "'..." .. C.reset)
                             local ok, cmd, out = Git.execute_worktree(item, TUI.worktree_input)
                             if ok then
                                 print(C.b_green .. "[SUCCESS] Worktree created: " .. TUI.worktree_input .. C.reset)
@@ -1670,7 +1670,7 @@ function TUI.run()
 
     -- Perform checkout if selected
     if checkout_target then
-        print(C.b_cyan .. "[DOGIT] Running: " .. Git.build_checkout_cmd(checkout_target, checkout_force) .. C.reset)
+        print(C.b_cyan .. "[FCO] Running: " .. Git.build_checkout_cmd(checkout_target, checkout_force) .. C.reset)
         local ok, cmd, out = Git.execute_checkout(checkout_target, checkout_force)
         if ok then
             local desc = checkout_target.name
@@ -1682,7 +1682,7 @@ function TUI.run()
                 io.write(out)
             end
             if checkout_submodule then
-                print(C.b_cyan .. "[DOGIT] Synchronizing submodules: " .. Git.build_submodule_cmd(checkout_force) .. C.reset)
+                print(C.b_cyan .. "[FCO] Synchronizing submodules: " .. Git.build_submodule_cmd(checkout_force) .. C.reset)
                 local s_ok, s_cmd, s_out = Git.update_submodules(checkout_force)
                 if s_ok then
                     print(C.b_green .. "[SUCCESS] Submodules synchronized." .. C.reset)
@@ -1709,7 +1709,7 @@ local function run_cli_list(force, filter_type, submodule)
     local dirty, mod, untrk = Git.get_dirty_status()
     local current_head = Git.get_current_head()
 
-    print(string.format("%s=== DOGIT: Branches & Tags for %s ===%s", C.b_cyan, Git.get_repo_root(), C.reset))
+    print(string.format("%s=== FCO: Branches & Tags for %s ===%s", C.b_cyan, Git.get_repo_root(), C.reset))
     print(string.format("Current HEAD: %s%s%s | Working Tree: %s",
         C.b_green, current_head, C.reset,
         dirty and (C.b_yellow .. string.format("[DIRTY: %d modified]", mod) .. C.reset) or (C.b_green .. "[CLEAN]" .. C.reset)))
@@ -1785,7 +1785,7 @@ local function run_cli_checkout(target_name, force, submodule)
         os.exit(1)
     end
 
-    print(string.format("[DOGIT] Switching to %s '%s' (force=%s, submodule=%s)...", matched.type, matched.name, tostring(force), tostring(submodule)))
+    print(string.format("[FCO] Switching to %s '%s' (force=%s, submodule=%s)...", matched.type, matched.name, tostring(force), tostring(submodule)))
     local ok, cmd, out = Git.execute_checkout(matched, force)
     if ok then
         local desc = matched.name
@@ -1795,7 +1795,7 @@ local function run_cli_checkout(target_name, force, submodule)
         print(C.b_green .. "[SUCCESS] Checked out: " .. desc .. C.reset)
         if #out > 0 then io.write(out) end
         if submodule then
-            print(C.b_cyan .. "[DOGIT] Synchronizing submodules: " .. Git.build_submodule_cmd(force) .. C.reset)
+            print(C.b_cyan .. "[FCO] Synchronizing submodules: " .. Git.build_submodule_cmd(force) .. C.reset)
             local s_ok, s_cmd, s_out = Git.update_submodules(force)
             if s_ok then
                 print(C.b_green .. "[SUCCESS] Submodules synchronized." .. C.reset)
@@ -1818,7 +1818,7 @@ end
 -- Automated Self-Test Suite (--test)
 --------------------------------------------------------------------------------
 local function run_test_suite()
-    print("=== Running dogit.lua Automated Test Suite ===")
+    print("=== Running fco.lua Automated Test Suite ===")
     local passed = 0
     local failed = 0
 
@@ -2048,10 +2048,11 @@ local function main(args)
             target = args[i]
         elseif a == "-h" or a == "--help" then
             print([[
-dogit.lua - High-Performance Git Branch, Tag, Commit & Worktree Switcher (LuaJIT + FFI)
+fco.lua - High-Performance Git Branch, Tag, Commit & Worktree Switcher (LuaJIT + FFI)
 
 Usage:
-  luajit dogit.lua [OPTIONS] [TARGET]
+  luajit fco.lua [OPTIONS] [TARGET]
+  fco [OPTIONS] [TARGET]
 
 TARGET can be a branch name, tag name, or commit SHA (e.g. 7-40 hex chars).
 

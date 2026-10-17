@@ -1,4 +1,4 @@
 #!/bin/sh
-# dogit - Launch dogit.lua via LuaJIT
+# dogit - Legacy compatibility launcher forwarding to fco
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-exec luajit "$SCRIPT_DIR/dogit.lua" "$@"
+exec "$SCRIPT_DIR/fco" "$@"
