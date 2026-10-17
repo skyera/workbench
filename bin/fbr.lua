@@ -172,7 +172,7 @@ function Term.init()
         ffi.C.tcsetattr(Term.tty_fd, 0, raw)
     end
     Term.initialized = true
-    Term.write_tui("\27[?1049h\27[?25l") -- Alternate screen, hide cursor
+    Term.write_tui("\27[?1049h\27[2J\27[H\27[?25l") -- Alternate screen, clean buffer, hide cursor
 end
 
 function Term.restore()
@@ -675,9 +675,17 @@ local function run_tui(init_opts)
     apply_filter()
 
     local prev_lines = {}
+    local prev_cols = 0
+    local prev_rows = 0
 
     local function render()
         local cols, rows = Term.get_size()
+        if cols ~= prev_cols or rows ~= prev_rows then
+            prev_lines = {}
+            prev_cols = cols
+            prev_rows = rows
+            Term.write_tui("\27[2J\27[H")
+        end
         local frame_lines = {}
         local function add_line(s)
             frame_lines[#frame_lines + 1] = s
@@ -913,8 +921,14 @@ local function run_tui(init_opts)
         local diff_buf = { "\27[?2026h" }
         for r = 1, #frame_lines do
             if frame_lines[r] ~= prev_lines[r] then
-                diff_buf[#diff_buf + 1] = string.format("\27[%d;1H%s", r, frame_lines[r])
+                diff_buf[#diff_buf + 1] = string.format("\27[%d;1H%s\27[K", r, frame_lines[r])
                 prev_lines[r] = frame_lines[r]
+            end
+        end
+        if #prev_lines > #frame_lines then
+            for r = #frame_lines + 1, #prev_lines do
+                diff_buf[#diff_buf + 1] = string.format("\27[%d;1H\27[K", r)
+                prev_lines[r] = nil
             end
         end
         diff_buf[#diff_buf + 1] = "\27[?2026l"
@@ -1344,6 +1358,26 @@ local function run_tests()
 
     local test_empty = string.rep(" ", test_left_w)
     assert_eq("empty row width equals left_w", #test_empty, test_left_w)
+
+    -- Test 12: Differential rendering & shrink cleanup logic
+    local t_prev = { "row1_old", "row2_old", "row3_old" }
+    local t_frame = { "row1_old", "row2_new" } -- row 1 identical, row 2 changed, row 3 removed
+    local t_diff = {}
+    for r = 1, #t_frame do
+        if t_frame[r] ~= t_prev[r] then
+            t_diff[#t_diff + 1] = string.format("\27[%d;1H%s\27[K", r, t_frame[r])
+            t_prev[r] = t_frame[r]
+        end
+    end
+    if #t_prev > #t_frame then
+        for r = #t_frame + 1, #t_prev do
+            t_diff[#t_diff + 1] = string.format("\27[%d;1H\27[K", r)
+            t_prev[r] = nil
+        end
+    end
+    assert_eq("differential renderer only emits changed rows + shrink", #t_diff, 2)
+    assert_eq("diff row 2 updated with erase-to-end", t_diff[1], "\27[2;1Hrow2_new\27[K")
+    assert_eq("diff row 3 erased on shrink", t_diff[2], "\27[3;1H\27[K")
 
     print(string.format("\nSelf-test summary: %d passed, %d failed.", passed, failed))
     if failed > 0 then os.exit(1) end
