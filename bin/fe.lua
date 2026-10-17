@@ -1261,10 +1261,10 @@ local function run_tui(init_opts)
 
         local filter_disp
         if state.mode == "filter" then
-            filter_disp = C.b_yellow .. C.bold .. "Filter (/): " .. C.b_white .. state.filter .. "█" .. C.reset
+            filter_disp = C.b_yellow .. C.bold .. "Filter (/): " .. C.b_white .. state.filter .. "█" .. C.reset .. C.gray .. " [Enter:Lock  Tab:Select]" .. C.reset
         else
             if #state.filter > 0 then
-                filter_disp = C.bold .. "Filter: " .. C.b_white .. state.filter .. C.reset .. C.gray .. " (Esc to clear)" .. C.reset
+                filter_disp = C.bold .. "Filter: " .. C.b_white .. state.filter .. C.reset .. C.gray .. " (Esc to clear, / to edit)" .. C.reset
             else
                 filter_disp = C.bold .. "Filter (/): " .. C.gray .. "(press / to filter)" .. C.reset
             end
@@ -1396,6 +1396,10 @@ local function run_tui(init_opts)
         if #state.status_msg > 0 then
             local col = (state.status_type == "ok") and C.b_green or C.b_red
             status_disp = col .. C.bold .. " " .. state.status_msg .. C.reset
+        elseif state.mode == "filter" then
+            status_disp = string.format(" %s%sEnter%s:Lock filter  %sTab%s:Select & down  %s↑/↓%s:Move  %sEsc%s:Normal mode",
+                sel_indicator,
+                C.b_yellow, C.gray, C.b_green, C.gray, C.b_cyan, C.gray, C.b_red, C.reset)
         else
             status_disp = string.format(" %s%sEnter%s:Edit(tabs)  %so%s:Split  %sTab/Space%s:Select  %s/%s:Filter  %sh/l%s:Tabs  %sq%s:Quit",
                 sel_indicator,
@@ -1471,11 +1475,32 @@ local function run_tui(init_opts)
             -- Filter input mode
             if state.mode == "filter" then
                 if key == "ESC" then
-                    state.filter = state.prev_filter
                     state.mode = "normal"
-                    apply_filter()
                 elseif key == "ENTER" then
-                    launch_editor("ENTER")
+                    state.mode = "normal"
+                elseif key == "TAB" then
+                    local item = state.filtered[state.cursor]
+                    if item then
+                        if state.selected_set[item.path] then
+                            state.selected_set[item.path] = nil
+                        else
+                            state.selected_set[item.path] = true
+                        end
+                    end
+                    state.cursor = math.min(math.max(1, #state.filtered), state.cursor + 1)
+                elseif key == "BACKTAB" then
+                    local item = state.filtered[state.cursor]
+                    if item then
+                        if state.selected_set[item.path] then
+                            state.selected_set[item.path] = nil
+                        else
+                            state.selected_set[item.path] = true
+                        end
+                    end
+                    state.cursor = math.max(1, state.cursor - 1)
+                elseif key == "SPACE" then
+                    state.filter = state.filter .. " "
+                    apply_filter()
                 elseif key == "BACKSPACE" then
                     state.filter = state.filter:sub(1, math.max(0, #state.filter - 1))
                     apply_filter()
@@ -1674,13 +1699,13 @@ Options:
 Interactive Controls:
   j / k, Up / Down     Move cursor
   h / l, Left / Right  Switch context tabs ([All Files], [Git Changes], [Recent])
-  Tab / Space          Toggle multi-select checkbox [x]
-  Enter                Open selected file(s) in $EDITOR / nvim / vim (tabs: -p)
+  Tab / Space          Toggle multi-select checkbox [x] (also in filter mode)
+  Enter                In filter: lock filter; In normal: open in editor (tabs: -p)
   o                    Open selected file(s) in vertical splits (-O)
   /                    Filter / search files
   PgUp / PgDn          Page scroll
   g / G, Home / End    Jump to first / last file
-  q / Esc              Exit]])
+  q / Esc              Exit / Clear filter]])
 end
 
 --------------------------------------------------------------------------------
