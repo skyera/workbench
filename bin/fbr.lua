@@ -756,6 +756,11 @@ local function run_tui(init_opts)
         local right_w = cols - left_w - 3
 
         -- Adjust scroll viewport
+        if #state.filtered <= body_h then
+            state.scroll = 1
+        elseif state.scroll > #state.filtered - body_h + 1 then
+            state.scroll = math.max(1, #state.filtered - body_h + 1)
+        end
         if state.cursor < state.scroll then
             state.scroll = state.cursor
         elseif state.cursor >= state.scroll + body_h then
@@ -796,9 +801,9 @@ local function run_tui(init_opts)
 
             -- Merged status
             if cur_item.is_merged then
-                table.insert(r_lines, string.format("  %sMerged:%s   %s✔ Merged into HEAD (safe to delete)%s", C.b_green .. C.bold, C.reset, C.b_green, C.reset))
+                table.insert(r_lines, string.format("  %sMerged:%s   %s✔ Merged into HEAD (safe to delete with 'd')%s", C.b_green .. C.bold, C.reset, C.b_green, C.reset))
             elseif not cur_item.is_head and not cur_item.is_remote then
-                table.insert(r_lines, string.format("  %sMerged:%s   %sUnmerged commits present%s", C.yellow, C.reset, C.yellow, C.reset))
+                table.insert(r_lines, string.format("  %sMerged:%s   %s⚠ Unmerged commits (requires 'D' to delete)%s", C.b_yellow .. C.bold, C.reset, C.yellow, C.reset))
             end
 
             table.insert(r_lines, "")
@@ -852,9 +857,15 @@ local function run_tui(init_opts)
                 -- Status pill
                 local status_pill
                 if item.is_head then
-                    status_pill = C.b_green .. "[HEAD  ]" .. C.reset .. bg
+                    status_pill = C.b_cyan .. "[HEAD  ]" .. C.reset .. bg
                 elseif item.is_merged then
-                    status_pill = C.green .. "[Merged]" .. C.reset .. bg
+                    status_pill = C.b_green .. "[Merged]" .. C.reset .. bg
+                elseif not item.is_remote then
+                    if item.ahead and item.ahead > 0 then
+                        status_pill = C.b_yellow .. string.format("[+%-2d(D)]", math.min(99, item.ahead)) .. C.reset .. bg
+                    else
+                        status_pill = C.b_yellow .. "[Need D]" .. C.reset .. bg
+                    end
                 elseif item.ahead and item.ahead > 0 then
                     status_pill = C.b_yellow .. string.format("[+%2d   ]", item.ahead) .. C.reset .. bg
                 else
@@ -1106,7 +1117,12 @@ local function run_tui(init_opts)
                     state.status_type = "warn"
                 else
                     state.mode = "confirm_delete"
-                    state.input_prompt = string.format("Safe delete %d branch(es): %s [y/d/Enter: confirm, n/Esc: cancel]", #to_delete, table.concat(to_delete, ", "))
+                    local is_unmerged_single = (#to_delete == 1 and cur and not cur.is_merged and not cur.is_remote)
+                    if is_unmerged_single then
+                        state.input_prompt = string.format("Safe delete '%s' [Note: unmerged, 'D' required] (y/d/Enter: try safe, n/Esc: cancel)", to_delete[1])
+                    else
+                        state.input_prompt = string.format("Safe delete %d branch(es): %s [y/d/Enter: confirm, n/Esc: cancel]", #to_delete, table.concat(to_delete, ", "))
+                    end
                     state.confirm_callback = function(confirmed)
                         if not confirmed then return end
                         local success_cnt = 0
@@ -1127,7 +1143,8 @@ local function run_tui(init_opts)
                             state.status_msg = string.format("Deleted %d/%d branch(es). %s (use 'D' to force)", success_cnt, #to_delete, last_err)
                             state.status_type = "warn"
                         else
-                            state.status_msg = string.format("Failed to delete: %s (use 'D' to force)", last_err)
+                            local hint = (last_err:find("not fully merged") or last_err:find("unmerged")) and " (use 'D' to force delete)" or ""
+                            state.status_msg = string.format("Failed to delete: %s%s", last_err, hint)
                             state.status_type = "error"
                         end
                     end
@@ -1353,8 +1370,10 @@ local function run_tests()
     local test_name_w = math.max(8, test_left_w - 24)
     local test_rest_w = math.max(1, test_name_w - 2)
     local test_branch_disp = pad_right("test-branch", test_rest_w)
-    local test_body_plain = " " .. " " .. "[ ]" .. " " .. "[Local ]" .. " " .. "[Active]" .. " " .. "* " .. test_branch_disp
-    assert_eq("body row visible width equals left_w", #test_body_plain, test_left_w)
+    local test_body_plain = " " .. " " .. "[ ]" .. " " .. "[Local ]" .. " " .. "[Need D]" .. " " .. "* " .. test_branch_disp
+    assert_eq("body row with [Need D] visible width equals left_w", #test_body_plain, test_left_w)
+    assert_eq("Need D pill width is 8", #"[Need D]", 8)
+    assert_eq("Merged pill width is 8", #"[Merged]", 8)
 
     local test_empty = string.rep(" ", test_left_w)
     assert_eq("empty row width equals left_w", #test_empty, test_left_w)
