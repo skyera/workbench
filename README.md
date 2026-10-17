@@ -69,7 +69,7 @@ The [bin/](bin) directory includes utilities for:
 - Finding files and changing directories with fzf (`fzf_find`, `fcd`, `fvim`).
 - Connecting to hosts, copying files, and opening tunnels (`fssh`, `fscp`, `fssh_tunnel`).
 - Working with Git and source indexes (`fco`, `flog`, `dotag`).
-- Managing processes, clipboard access, and remote mounts (`fkill`, `osc52-yank`, `rsshfs`).
+- Managing shell history, processes, clipboard access, and remote mounts (`fhist`, `fkill`, `osc52-yank`, `rsshfs`).
 
 Many tools have platform-specific implementations in shell, batch, Lua, PowerShell, or Python. Check the selected script for its dependencies and options.
 

@@ -1,0 +1,4 @@
+#!/bin/sh
+# fhist - Launch fhist.lua via LuaJIT
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+exec luajit "$SCRIPT_DIR/fhist.lua" "$@"
