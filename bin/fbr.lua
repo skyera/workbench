@@ -173,12 +173,12 @@ function Term.init()
         ffi.C.tcsetattr(Term.tty_fd, 0, raw)
     end
     Term.initialized = true
-    Term.write_tui("\27[?1049h\27[2J\27[H\27[?25l") -- Alternate screen, clean buffer, hide cursor
+    Term.write_tui("\27[?1049h\27[?7l\27[2J\27[H\27[?25l") -- Alternate screen, disable autowrap, clean buffer, hide cursor
 end
 
 function Term.restore()
     if not Term.initialized then return end
-    Term.write_tui("\27[?25h\27[?1049l" .. C.reset)
+    Term.write_tui("\27[?25h\27[?7h\27[?1049l" .. C.reset) -- Show cursor, re-enable autowrap, restore screen
     if IS_WINDOWS then
         if Term.orig_mode_in and Term.hIn then
             ffi.C.SetConsoleMode(Term.hIn, Term.orig_mode_in)
@@ -296,6 +296,13 @@ local function pad_left(s, w)
     local len = #s
     if len >= w then return s:sub(1, w) end
     return string.rep(" ", w - len) .. s
+end
+
+local function truncate(s, max_w)
+    if not s then return "" end
+    if #s <= max_w then return s end
+    if max_w <= 1 then return s:sub(1, max_w) end
+    return s:sub(1, max_w - 1) .. "…"
 end
 
 local function fuzzy_score(pattern, str)
@@ -523,7 +530,7 @@ end
 
 function Engine.get_branch_log(branch_name, limit)
     limit = limit or 5
-    local raw = Engine.exec_git(string.format('log -n %d --format="%%%%h|%%%%an|%%%%cr|%%%%s" %s', limit, branch_name))
+    local raw = Engine.exec_git(string.format('log -n %d --format="%%h|%%an|%%cr|%%s" %s', limit, branch_name))
     local commits = {}
     for line in raw:gmatch("[^\r\n]+") do
         local h, author, date, subj = line:match("^([^|]+)|([^|]+)|([^|]+)|(.*)$")
@@ -715,7 +722,7 @@ local function run_tui(init_opts)
             C.b_yellow, TAB_LABELS[TABS[state.tab_idx]], C.reset,
             C.b_white, state.repo_name, C.reset,
             C.b_green .. C.bold, state.head_branch or "detached", C.reset)
-        add_line(C.bg_header .. pad_right(head_str, cols) .. C.reset)
+        add_line(C.bg_header .. pad_right(head_str, math.max(1, cols - 1)) .. C.reset)
 
         -- 2. Subheader Tabs & Filter
         local tabs_str = ""
@@ -754,7 +761,7 @@ local function run_tui(init_opts)
         local body_h = math.max(4, rows - 5)
         local left_w = math.floor(cols * 0.52)
         if cols < 90 then left_w = cols - 2 end
-        local right_w = cols - left_w - 3
+        local right_w = math.max(0, cols - left_w - 4)
 
         -- Adjust scroll viewport
         if #state.filtered <= body_h then
@@ -779,32 +786,41 @@ local function run_tui(init_opts)
         local r_lines = {}
         if cols >= 90 and cur_item then
             table.insert(r_lines, "")
-            table.insert(r_lines, string.format("  %sBranch:%s   %s%s%s", C.b_yellow .. C.bold, C.reset, C.b_white .. C.bold, cur_item.name, C.reset))
+            local bname = truncate(cur_item.name, math.max(4, right_w - 12))
+            table.insert(r_lines, string.format("  %sBranch:%s   %s%s%s", C.b_yellow .. C.bold, C.reset, C.b_white .. C.bold, bname, C.reset))
+
+            local role_text
             if cur_item.is_head then
-                table.insert(r_lines, string.format("  %sRole:%s     %s★ Currently Checked Out (HEAD)%s", C.b_cyan .. C.bold, C.reset, C.b_green .. C.bold, C.reset))
+                role_text = "★ Checked Out (HEAD)"
             else
-                table.insert(r_lines, string.format("  %sRole:%s     %s", C.b_cyan .. C.bold, C.reset, cur_item.is_remote and (C.magenta .. "Remote Tracking Branch" .. C.reset) or "Local Branch"))
+                role_text = cur_item.is_remote and "Remote Tracking Branch" or "Local Branch"
             end
+            local role_disp = truncate(role_text, math.max(4, right_w - 12))
+            local role_col = cur_item.is_head and (C.b_green .. C.bold) or (cur_item.is_remote and C.magenta or C.white)
+            table.insert(r_lines, string.format("  %sRole:%s     %s%s%s", C.b_cyan .. C.bold, C.reset, role_col, role_disp, C.reset))
 
             -- Upstream tracking
             if cur_item.tracking then
                 local track_str = cur_item.tracking
                 if cur_item.ahead or cur_item.behind then
-                    track_str = track_str .. " ("
-                    if cur_item.ahead and cur_item.ahead > 0 then track_str = track_str .. C.b_green .. "↑" .. cur_item.ahead .. C.reset .. " " end
-                    if cur_item.behind and cur_item.behind > 0 then track_str = track_str .. C.b_red .. "↓" .. cur_item.behind .. C.reset end
-                    track_str = trim(track_str) .. ")"
+                    local counts = {}
+                    if cur_item.ahead and cur_item.ahead > 0 then table.insert(counts, "↑" .. cur_item.ahead) end
+                    if cur_item.behind and cur_item.behind > 0 then table.insert(counts, "↓" .. cur_item.behind) end
+                    track_str = track_str .. " (" .. table.concat(counts, " ") .. ")"
                 else
-                    track_str = track_str .. " " .. C.b_green .. "(up to date)" .. C.reset
+                    track_str = track_str .. " (synced)"
                 end
-                table.insert(r_lines, string.format("  %sTracking:%s %s", C.gray, C.reset, track_str))
+                local track_disp = truncate(track_str, math.max(4, right_w - 12))
+                table.insert(r_lines, string.format("  %sTracking:%s %s%s%s", C.gray, C.reset, C.white, track_disp, C.reset))
             end
 
             -- Merged status
             if cur_item.is_merged then
-                table.insert(r_lines, string.format("  %sMerged:%s   %s✔ Merged into HEAD (safe to delete with 'd')%s", C.b_green .. C.bold, C.reset, C.b_green, C.reset))
+                local m_str = truncate("✔ Merged into HEAD (safe: 'd')", math.max(4, right_w - 12))
+                table.insert(r_lines, string.format("  %sMerged:%s   %s%s%s", C.b_green .. C.bold, C.reset, C.b_green, m_str, C.reset))
             elseif not cur_item.is_head and not cur_item.is_remote then
-                table.insert(r_lines, string.format("  %sMerged:%s   %s⚠ Unmerged commits (requires 'D' to delete)%s", C.b_yellow .. C.bold, C.reset, C.yellow, C.reset))
+                local m_str = truncate("⚠ Unmerged (requires 'D')", math.max(4, right_w - 12))
+                table.insert(r_lines, string.format("  %sMerged:%s   %s%s%s", C.b_yellow .. C.bold, C.reset, C.yellow, m_str, C.reset))
             end
 
             table.insert(r_lines, "")
@@ -818,13 +834,18 @@ local function run_tui(init_opts)
                 table.insert(r_lines, "    " .. C.gray .. "(No commits or branch ref not found)" .. C.reset)
             else
                 for _, c in ipairs(logs) do
-                    local msg_w = math.max(10, right_w - 28)
-                    local msg_disp = pad_right(c.subject, msg_w)
-                    table.insert(r_lines, string.format("    %s•%s %s%s%s %s%s%s %s",
+                    local date_str = "(" .. (c.date or "") .. ")"
+                    local fixed_w = 14 + 1 + #date_str
+                    local subj_w = math.max(4, right_w - fixed_w)
+                    local subj_disp = truncate(c.subject or "", subj_w)
+                    if #subj_disp < subj_w then
+                        subj_disp = pad_right(subj_disp, subj_w)
+                    end
+                    table.insert(r_lines, string.format("    %s•%s %s%-7s%s %s%s%s %s%s%s",
                         C.b_blue, C.reset,
-                        C.yellow, c.hash, C.reset,
-                        C.white, msg_disp, C.reset,
-                        C.gray .. "(" .. c.date .. ")" .. C.reset))
+                        C.yellow, (c.hash or ""):sub(1, 7), C.reset,
+                        C.white, subj_disp, C.reset,
+                        C.gray, date_str, C.reset))
                 end
             end
         end
@@ -906,7 +927,7 @@ local function run_tui(init_opts)
         end
 
         -- 5. Footer & Dialog Prompt
-        local footer_sep = string.rep("─", cols)
+        local footer_sep = string.rep("─", math.max(1, cols - 1))
         add_line(C.gray .. footer_sep .. C.reset)
 
         local status_disp
@@ -1405,8 +1426,43 @@ local function run_tests()
     assert_eq("Engine.get_branch_log finds commits", #test_logs > 0, true)
     if #test_logs > 0 then
         assert_eq("commit hash is present", #test_logs[1].hash > 0, true)
+        assert_eq("commit hash is real hex not %h", test_logs[1].hash:match("^%x+$") ~= nil, true)
         assert_eq("commit author is present", #test_logs[1].author > 0, true)
         assert_eq("commit subject is present", #test_logs[1].subject > 0, true)
+    end
+
+    -- Test 14: String truncation helper
+    assert_eq("truncate short string unchanged", truncate("hello", 10), "hello")
+    assert_eq("truncate exact length unchanged", truncate("hello", 5), "hello")
+    assert_eq("truncate long string with ellipsis", truncate("hello world", 6), "hello…")
+
+    -- Test 15: Terminal width bounds and safety buffer
+    local function utf8_vis(s)
+        local plain = s:gsub("\27%[[%d;]*[a-zA-Z]", ""):gsub("\27%[[%?%d]*[a-zA-Z]", "")
+        local len = 0
+        for i = 1, #plain do
+            local b = plain:byte(i)
+            if b < 0x80 or b >= 0xC0 then len = len + 1 end
+        end
+        return len
+    end
+
+    for _, c_w in ipairs({ 80, 90, 100, 120 }) do
+        local l_w = math.floor(c_w * 0.52)
+        if c_w < 90 then l_w = c_w - 2 end
+        local r_w = math.max(0, c_w - l_w - 4)
+        if c_w >= 90 then
+            local test_item = {
+                name = "feature/super-long-branch-name-that-used-to-overflow-and-wipe-rows",
+                tracking = "origin/feature/super-long-branch-name-that-used-to-overflow-and-wipe-rows",
+                ahead = 10,
+                behind = 5,
+            }
+            local test_bname = truncate(test_item.name, math.max(4, r_w - 12))
+            local test_r_line = string.format("  Branch:   %s", test_bname)
+            local test_full = string.rep("x", l_w) .. " │ " .. test_r_line
+            assert_eq(string.format("cols %d right pane line strictly <= cols - 1", c_w), utf8_vis(test_full) <= c_w - 1, true)
+        end
     end
 
     print(string.format("\nSelf-test summary: %d passed, %d failed.", passed, failed))
