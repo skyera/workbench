@@ -1125,15 +1125,34 @@ fvim() {
 
 fhist() {
     local cmd
-    if [[ -n "$BASH_VERSION" ]]; then
-        cmd=$(history | fzf +s --tac | sed 's/^[ ]*[0-9]*[ ]*//')
-        if [[ -n "$cmd" ]]; then
-            READLINE_LINE="$cmd"
-            READLINE_POINT=${#cmd}
+    if [[ $# -gt 0 ]]; then
+        if command -v fhist.sh >/dev/null 2>&1; then
+            fhist.sh "$@"
+        elif command -v fhist.bat >/dev/null 2>&1; then
+            fhist.bat "$@"
         fi
+        return $?
+    fi
+
+    if command -v fhist.sh >/dev/null 2>&1; then
+        cmd=$(fhist.sh)
+    elif command -v fhist.bat >/dev/null 2>&1; then
+        cmd=$(fhist.bat)
+    elif [[ -n "$BASH_VERSION" ]]; then
+        cmd=$(history | fzf +s --tac | sed 's/^[ ]*[0-9]*[ ]*//')
     elif [[ -n "$ZSH_VERSION" ]]; then
         cmd=$(fc -l 1 | fzf +s --tac | sed 's/^[ ]*[0-9]*[ ]*//')
-        [[ -n "$cmd" ]] && print -z "$cmd"
+    fi
+
+    if [[ -n "$cmd" ]]; then
+        if [[ -n "$BASH_VERSION" ]]; then
+            READLINE_LINE="$cmd"
+            READLINE_POINT=${#cmd}
+        elif [[ -n "$ZSH_VERSION" ]]; then
+            print -z "$cmd"
+        else
+            echo "$cmd"
+        fi
     fi
 }
 
@@ -1445,7 +1464,6 @@ _apply_overrides() {
     command -v frg.sh >/dev/null 2>&1 && alias frg='frg.sh'
     command -v flog.sh >/dev/null 2>&1 && alias flog='flog.sh'
     command -v fco.sh >/dev/null 2>&1 && alias fco='fco.sh'
-    command -v fhist.sh >/dev/null 2>&1 && alias fhist='fhist.sh'
 
     # Antigravity CLI auto-approve alias (universal)
     if command -v agy.exe >/dev/null 2>&1; then
