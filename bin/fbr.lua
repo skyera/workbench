@@ -513,16 +513,12 @@ function Engine.delete_branch(branch, force)
     if branch.is_head then
         return false, "Cannot delete currently checked out branch: " .. branch.name
     end
+    if branch.is_remote or (branch.name and branch.name:find("^[^/]+/[^/]+")) then
+        return false, "Remote branches are protected and cannot be deleted (local only): " .. branch.name
+    end
 
     local flag = force and "-D" or "-d"
-    local cmd
-    if branch.is_remote then
-        local remote, rbranch = branch.name:match("^([^/]+)/(.*)$")
-        if not remote or not rbranch then return false, "Invalid remote branch name" end
-        cmd = string.format("git push %s --delete %s 2>&1", remote, rbranch)
-    else
-        cmd = string.format("git branch %s %s 2>&1", flag, branch.name)
-    end
+    local cmd = string.format("git branch %s %s 2>&1", flag, branch.name)
 
     local p = io.popen(cmd)
     local out = p and p:read("*a") or ""
@@ -978,7 +974,10 @@ local function run_tui(init_opts)
             elseif key == "TAB" or key == "SPACE" then
                 -- Toggle multi-selection on current item
                 local cur = state.filtered[state.cursor]
-                if cur and not cur.is_head then
+                if cur and cur.is_remote then
+                    state.status_msg = "Remote branches are read-only (local deletion only)."
+                    state.status_type = "warn"
+                elseif cur and not cur.is_head then
                     if state.selected_set[cur.name] then
                         state.selected_set[cur.name] = nil
                     else
@@ -1012,21 +1011,25 @@ local function run_tui(init_opts)
                     table.insert(to_delete, state.filtered[state.cursor].name)
                 end
 
+                local cur = state.filtered[state.cursor]
                 if #to_delete == 0 then
                     state.status_msg = "No branch selected to delete."
                     state.status_type = "warn"
                 elseif #to_delete == 1 and to_delete[1] == state.head_branch then
                     state.status_msg = "Cannot delete currently checked out branch (HEAD)."
                     state.status_type = "error"
+                elseif #to_delete == 1 and cur and cur.is_remote then
+                    state.status_msg = "Remote branches are protected and cannot be deleted (local only)."
+                    state.status_type = "warn"
                 else
                     state.mode = "confirm_delete"
-                    state.input_prompt = string.format("Safe delete %d branch(es): %s", #to_delete, table.concat(to_delete, ", "))
+                    state.input_prompt = string.format("Safe delete %d local branch(es): %s", #to_delete, table.concat(to_delete, ", "))
                     state.confirm_callback = function(confirmed)
                         if not confirmed then return end
                         local success_cnt = 0
                         local err_msg = ""
                         for _, bname in ipairs(to_delete) do
-                            local ok, res = Engine.delete_branch({ name = bname, is_head = (bname == state.head_branch) }, false)
+                            local ok, res = Engine.delete_branch({ name = bname, is_head = (bname == state.head_branch), is_remote = false }, false)
                             if ok then
                                 success_cnt = success_cnt + 1
                                 state.selected_set[bname] = nil
@@ -1035,7 +1038,7 @@ local function run_tui(init_opts)
                             end
                         end
                         if success_cnt == #to_delete then
-                            state.status_msg = string.format("Deleted %d branch(es).", success_cnt)
+                            state.status_msg = string.format("Deleted %d local branch(es).", success_cnt)
                             state.status_type = "ok"
                         else
                             state.status_msg = string.format("Deleted %d/%d branch(es). Note: Use 'D' to force delete unmerged branches.", success_cnt, #to_delete)
@@ -1054,26 +1057,30 @@ local function run_tui(init_opts)
                     table.insert(to_delete, state.filtered[state.cursor].name)
                 end
 
+                local cur = state.filtered[state.cursor]
                 if #to_delete == 0 then
                     state.status_msg = "No branch selected to force delete."
                     state.status_type = "warn"
                 elseif #to_delete == 1 and to_delete[1] == state.head_branch then
                     state.status_msg = "Cannot delete currently checked out branch (HEAD)."
                     state.status_type = "error"
+                elseif #to_delete == 1 and cur and cur.is_remote then
+                    state.status_msg = "Remote branches are protected and cannot be deleted (local only)."
+                    state.status_type = "warn"
                 else
                     state.mode = "confirm_delete"
-                    state.input_prompt = string.format("FORCE delete (-D) %d branch(es): %s", #to_delete, table.concat(to_delete, ", "))
+                    state.input_prompt = string.format("FORCE delete (-D) %d local branch(es): %s", #to_delete, table.concat(to_delete, ", "))
                     state.confirm_callback = function(confirmed)
                         if not confirmed then return end
                         local success_cnt = 0
                         for _, bname in ipairs(to_delete) do
-                            local ok, _ = Engine.delete_branch({ name = bname, is_head = (bname == state.head_branch) }, true)
+                            local ok, _ = Engine.delete_branch({ name = bname, is_head = (bname == state.head_branch), is_remote = false }, true)
                             if ok then
                                 success_cnt = success_cnt + 1
                                 state.selected_set[bname] = nil
                             end
                         end
-                        state.status_msg = string.format("Force-deleted %d branch(es).", success_cnt)
+                        state.status_msg = string.format("Force-deleted %d local branch(es).", success_cnt)
                         state.status_type = "ok"
                     end
                 end
@@ -1195,10 +1202,14 @@ local function run_tests()
     local ok_del, err_del = Engine.delete_branch({ name = "master", is_head = true }, false)
     assert_eq("delete_branch prevents deleting HEAD", ok_del, false)
 
-    -- Test 7: Git repo detection
+    -- Test 7: Safety check - cannot delete remote branch
+    local ok_remote, err_remote = Engine.delete_branch({ name = "origin/master", is_remote = true }, false)
+    assert_eq("delete_branch prevents deleting remote branch", ok_remote, false)
+
+    -- Test 8: Git repo detection
     assert_eq("Engine.is_inside_git_repo returns boolean", type(Engine.is_inside_git_repo()), "boolean")
 
-    -- Test 8: Live branches loading
+    -- Test 9: Live branches loading
     local branches, head = Engine.load_all_branches()
     assert_eq("Engine.load_all_branches returns list", type(branches), "table")
     print(string.format("  [INFO] Discovered %d total branches in current repository (HEAD: %s).", #branches, tostring(head)))
