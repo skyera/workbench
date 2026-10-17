@@ -529,12 +529,12 @@ end
 --------------------------------------------------------------------------------
 -- 6. Interactive TUI Engine
 --------------------------------------------------------------------------------
-local TABS = { "all", "local", "merged", "remote" }
+local TABS = { "local", "merged", "remote", "all" }
 local TAB_LABELS = {
-    all = "All",
     ["local"] = "Local",
     merged = "Merged",
     remote = "Remote",
+    all = "All",
 }
 
 local function run_tui(init_opts)
@@ -1123,29 +1123,49 @@ local function cmd_list(opts)
         C.bold, "HEAD", "TYPE", "STATUS", "BRANCH NAME", "TRACKING / SUBJECT", C.reset))
     print(string.rep("─", 80))
 
+    local show_all = (opts.start_tab == 4 or opts.show_all)
+    local show_remote = (opts.start_tab == 3 or opts.show_remote)
+    local count = 0
+
     for _, b in ipairs(branches) do
-        local head_mark = b.is_head and (C.b_green .. " *  " .. C.reset) or "    "
-        local type_str = b.is_remote and (C.magenta .. "Remote" .. C.reset) or (C.b_blue .. "Local " .. C.reset)
-        local status_str
-        if b.is_head then
-            status_str = C.b_green .. "HEAD" .. C.reset
-        elseif b.is_merged then
-            status_str = C.green .. "Merged" .. C.reset
-        elseif b.ahead and b.ahead > 0 then
-            status_str = C.b_yellow .. "+" .. b.ahead .. " ahd" .. C.reset
+        local pass = false
+        if show_all then
+            pass = true
+        elseif show_remote then
+            pass = b.is_remote
         else
-            status_str = C.gray .. "Active" .. C.reset
+            pass = not b.is_remote -- Local only by default
         end
 
-        local name_disp = b.name
-        if b.is_head then name_disp = C.b_white .. C.bold .. name_disp .. C.reset end
+        if pass then
+            count = count + 1
+            local head_mark = b.is_head and (C.b_green .. " *  " .. C.reset) or "    "
+            local type_str = b.is_remote and (C.magenta .. "Remote" .. C.reset) or (C.b_blue .. "Local " .. C.reset)
+            local status_str
+            if b.is_head then
+                status_str = C.b_green .. "HEAD" .. C.reset
+            elseif b.is_merged then
+                status_str = C.green .. "Merged" .. C.reset
+            elseif b.ahead and b.ahead > 0 then
+                status_str = C.b_yellow .. "+" .. b.ahead .. " ahd" .. C.reset
+            else
+                status_str = C.gray .. "Active" .. C.reset
+            end
 
-        local detail = b.tracking and ("[" .. b.tracking .. "] ") or ""
-        detail = detail .. (b.subject or "")
-        if #detail > 35 then detail = detail:sub(1, 32) .. "..." end
+            local name_disp = b.name
+            if b.is_head then name_disp = C.b_white .. C.bold .. name_disp .. C.reset end
 
-        print(string.format("%s %-8s %-10s %-30s %s",
-            head_mark, type_str, status_str, name_disp, C.gray .. detail .. C.reset))
+            local detail = b.tracking and ("[" .. b.tracking .. "] ") or ""
+            detail = detail .. (b.subject or "")
+            if #detail > 35 then detail = detail:sub(1, 32) .. "..." end
+
+            print(string.format("%s %-8s %-10s %-30s %s",
+                head_mark, type_str, status_str, name_disp, C.gray .. detail .. C.reset))
+        end
+    end
+
+    if not show_all and not show_remote then
+        print(string.format("\n%s(Local branches shown. Use 'fbr -l -a' to include remote branches)%s", C.gray, C.reset))
     end
 end
 
@@ -1227,9 +1247,10 @@ Usage:
   fbr [OPTIONS] [QUERY]
 
 Options:
+  -l, --list           Print formatted branch table and exit (local branches only by default)
   -m, --merged         Start pre-filtered on Merged branches (safe to delete)
-  -l, --list           Print formatted branch table and exit
-  -r, --remote         Start pre-filtered on Remote branches
+  -r, --remote         Start on Remote branches tab
+  -a, --all            Include both Local and Remote branches
   --test               Run automated test suite and exit
   -h, --help           Show this help message
 
@@ -1241,7 +1262,7 @@ TUI Keybindings:
   n                    Create a new branch from current HEAD
   r                    Refresh branch list from repository
   / or f               Enter live search / filter mode
-  h / l, Left / Right  Switch category tabs (All -> Local -> Merged -> Remote)
+  h / l, Left / Right  Switch category tabs (Local -> Merged -> Remote -> All)
   j / k, Up / Down     Move selection cursor down / up
   PgUp / PgDn          Page scroll
   g / G, Home / End    Jump to first / last branch
@@ -1254,8 +1275,10 @@ end
 local args = { ... }
 local opts = {
     mode = "tui",
-    start_tab = 1, -- 1: All, 2: Local, 3: Merged, 4: Remote
+    start_tab = 1, -- 1: Local, 2: Merged, 3: Remote, 4: All
     filter = "",
+    show_all = false,
+    show_remote = false,
 }
 
 local i = 1
@@ -1270,9 +1293,13 @@ while i <= #args do
     elseif a == "-l" or a == "--list" then
         opts.mode = "list"
     elseif a == "-m" or a == "--merged" then
-        opts.start_tab = 3 -- Merged
+        opts.start_tab = 2 -- Merged
     elseif a == "-r" or a == "--remote" then
-        opts.start_tab = 4 -- Remote
+        opts.start_tab = 3 -- Remote
+        opts.show_remote = true
+    elseif a == "-a" or a == "--all" then
+        opts.start_tab = 4 -- All
+        opts.show_all = true
     else
         opts.filter = a
     end
