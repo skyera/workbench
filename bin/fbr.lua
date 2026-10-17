@@ -145,6 +145,7 @@ function Term.init()
     if IS_WINDOWS then
         Term.hIn = ffi.C.GetStdHandle(-10)   -- STD_INPUT_HANDLE
         Term.hOut = ffi.C.GetStdHandle(-11)  -- STD_OUTPUT_HANDLE
+        local hErr = ffi.C.GetStdHandle(-12) -- STD_ERROR_HANDLE
         local mIn = ffi.new("DWORD[1]")
         local mOut = ffi.new("DWORD[1]")
         ffi.C.GetConsoleMode(Term.hIn, mIn)
@@ -153,10 +154,10 @@ function Term.init()
         Term.orig_mode_out = mOut[0]
 
         local raw_in = bit.band(Term.orig_mode_in, bit.bnot(0x0007))
-        raw_in = bit.bor(raw_in, 0x0008) -- ENABLE_WINDOW_INPUT
         local raw_out = bit.bor(Term.orig_mode_out, 0x0004) -- ENABLE_VIRTUAL_TERMINAL_PROCESSING
         ffi.C.SetConsoleMode(Term.hIn, raw_in)
         ffi.C.SetConsoleMode(Term.hOut, raw_out)
+        ffi.C.SetConsoleMode(hErr, raw_out)
     else
         Term.tty_fd = ffi.C.open("/dev/tty", 2)
         if Term.tty_fd < 0 then Term.tty_fd = 0 end
@@ -522,7 +523,7 @@ end
 
 function Engine.get_branch_log(branch_name, limit)
     limit = limit or 5
-    local raw = Engine.exec_git(string.format("log -n %d --format='%%h|%%an|%%cr|%%s' %s", limit, branch_name))
+    local raw = Engine.exec_git(string.format('log -n %d --format="%%%%h|%%%%an|%%%%cr|%%%%s" %s', limit, branch_name))
     local commits = {}
     for line in raw:gmatch("[^\r\n]+") do
         local h, author, date, subj = line:match("^([^|]+)|([^|]+)|([^|]+)|(.*)$")
@@ -932,13 +933,13 @@ local function run_tui(init_opts)
         local diff_buf = { "\27[?2026h" }
         for r = 1, #frame_lines do
             if frame_lines[r] ~= prev_lines[r] then
-                diff_buf[#diff_buf + 1] = string.format("\27[%d;1H%s\27[K", r, frame_lines[r])
+                diff_buf[#diff_buf + 1] = string.format("\27[%d;1H%s%s\27[K", r, frame_lines[r], C.reset)
                 prev_lines[r] = frame_lines[r]
             end
         end
         if #prev_lines > #frame_lines then
             for r = #frame_lines + 1, #prev_lines do
-                diff_buf[#diff_buf + 1] = string.format("\27[%d;1H\27[K", r)
+                diff_buf[#diff_buf + 1] = string.format("\27[%d;1H%s\27[K", r, C.reset)
                 prev_lines[r] = nil
             end
         end
@@ -1397,6 +1398,16 @@ local function run_tests()
     assert_eq("differential renderer only emits changed rows + shrink", #t_diff, 2)
     assert_eq("diff row 2 updated with erase-to-end", t_diff[1], "\27[2;1Hrow2_new\27[K")
     assert_eq("diff row 3 erased on shrink", t_diff[2], "\27[3;1H\27[K")
+
+    -- Test 13: Branch log parsing without shell pipe errors
+    local test_logs = Engine.get_branch_log("HEAD", 3)
+    assert_eq("Engine.get_branch_log returns table", type(test_logs), "table")
+    assert_eq("Engine.get_branch_log finds commits", #test_logs > 0, true)
+    if #test_logs > 0 then
+        assert_eq("commit hash is present", #test_logs[1].hash > 0, true)
+        assert_eq("commit author is present", #test_logs[1].author > 0, true)
+        assert_eq("commit subject is present", #test_logs[1].subject > 0, true)
+    end
 
     print(string.format("\nSelf-test summary: %d passed, %d failed.", passed, failed))
     if failed > 0 then os.exit(1) end
