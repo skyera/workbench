@@ -4,7 +4,7 @@ Based on the codebase review, here are the suggested enhancements categorized by
 
 ## 1. Deployment & Infrastructure
 - [ ] **Sync `deploy.sh` with Repository**: Update the script to include missing files like `.wezterm.lua`, `.gdbinit`, and `.config/yazi/yazi.toml`.
-- [ ] **Tool Installer Script**: Create `bin/install-tools.sh` to automate the installation of dependencies (`fd`, `rg`, `bat`, `delta`, `eza`, `zoxide`, `yazi`) across different Linux distributions.
+- [x] **Tool Installer Script**: Create `bin/install-tools.sh` to automate the installation of dependencies (`fd`, `rg`, `bat`, `delta`, `eza`, `zoxide`, `yazi`) across different Linux distributions via GitHub releases, source, or package managers.
 
 ## 2. Shell & CLI Enhancements (`mybashrc`)
 - [ ] **Enhanced Git Aliases**: Add more advanced aliases for `delta` (e.g., side-by-side diff toggles) and `forgit` integrations.
