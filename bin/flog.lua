@@ -740,7 +740,7 @@ local function run_tui(init_opts)
             for _, item in ipairs(source) do
                 local hay
                 if state.pane_mode == "branches" then
-                    hay = item.name .. " " .. item.hash .. " " .. item.date .. " " .. item.author .. " " .. item.subject
+                    hay = item.name .. " " .. item.hash
                 else
                     hay = item.hash .. " " .. item.date .. " " .. item.author .. " " .. item.refs .. " " .. item.subject
                 end
@@ -1017,7 +1017,10 @@ local function run_tui(init_opts)
             -- Normal Mode
             if key ~= "g" then state.pending_g = false end
 
-            if key == "q" or key == "ESC" then
+            if key == "ESC" and #state.filter > 0 then
+                state.filter = ""
+                apply_filter()
+            elseif key == "q" or key == "ESC" then
                 break
             elseif key == "j" or key == "DOWN" then
                 state.cursor = math.min(math.max(1, #state.filtered), state.cursor + 1)
@@ -1225,6 +1228,15 @@ local function run_tests()
         local details = Engine.get_commit_details(commits[1].hash, "stat")
         assert_eq("Engine.get_commit_details fetches commit summary", #details >= 3, true)
     end
+
+    local b_dummy1 = { name = "master", hash = "8b3112f" }
+    local b_dummy2 = { name = "origin/track/master", hash = "86cbec9" }
+    local hay1 = b_dummy1.name .. " " .. b_dummy1.hash
+    local hay2 = b_dummy2.name .. " " .. b_dummy2.hash
+    assert_eq("branch filter matches query on branch name", fuzzy_score("track", hay2) ~= nil, true)
+    assert_eq("branch filter excludes non-matching branch name", fuzzy_score("track", hay1), nil)
+    assert_eq("branch filter matches hash", fuzzy_score("86c", hay2) ~= nil, true)
+    assert_eq("branch filter excludes non-matching hash", fuzzy_score("86c", hay1), nil)
 
     print(string.format("\nSelf-test summary: %d passed, %d failed.", passed, failed))
     if failed > 0 then os.exit(1) end
