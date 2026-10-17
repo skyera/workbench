@@ -137,6 +137,7 @@ if IS_WINDOWS then
         BOOL SetConsoleOutputCP(unsigned int wCodePageID);
         BOOL SetConsoleCP(unsigned int wCodePageID);
         int _getch(void);
+        DWORD GetFileAttributesW(LPCWSTR lpFileName);
     ]]
 else
     ffi.cdef[[
@@ -497,8 +498,45 @@ function Engine.get_git_branch()
     return res
 end
 
+local function to_wide(str)
+    if not IS_WINDOWS then return str end
+    local len = ffi.C.MultiByteToWideChar(65001, 0, str, #str, nil, 0)
+    local buf = ffi.new("wchar_t[?]", len + 1)
+    ffi.C.MultiByteToWideChar(65001, 0, str, #str, buf, len)
+    buf[len] = 0
+    return buf
+end
+
+local function from_wide(wstr)
+    if not IS_WINDOWS then return wstr end
+    local len = ffi.C.WideCharToMultiByte(65001, 0, wstr, -1, nil, 0, nil, nil)
+    local buf = ffi.new("char[?]", len)
+    ffi.C.WideCharToMultiByte(65001, 0, wstr, -1, buf, len, nil, nil)
+    return ffi.string(buf, len - 1)
+end
+
+-- Cross-platform directory check
+function Engine.is_dir(path)
+    if not path or #path == 0 then return false end
+    if IS_WINDOWS then
+        local wpath = to_wide(path)
+        local attr = ffi.C.GetFileAttributesW(wpath)
+        return (attr ~= 0xFFFFFFFF and bit.band(attr, 0x10) ~= 0)
+    else
+        local d = ffi.C.opendir(path)
+        if d ~= nil then
+            ffi.C.closedir(d)
+            return true
+        end
+    end
+    return false
+end
+
 -- Fast file size & line count query
 function Engine.get_file_stat(filepath)
+    if not filepath or #filepath == 0 or Engine.is_dir(filepath) then
+        return { size = 0, lines = 0, is_binary = false, unreadable = false, is_dir = true }
+    end
     local f = io.open(filepath, "rb")
     if not f then
         return { size = 0, lines = 0, is_binary = false, unreadable = true }
@@ -513,9 +551,11 @@ function Engine.get_file_stat(filepath)
     local lines = 0
     if not is_binary and size < 1024 * 1024 * 5 then -- Don't count lines on >5MB files
         f:seek("set", 0)
-        for _ in f:lines() do
-            lines = lines + 1
-        end
+        pcall(function()
+            for _ in f:lines() do
+                lines = lines + 1
+            end
+        end)
     end
     f:close()
 
@@ -530,9 +570,20 @@ end
 -- Read preview lines from file
 function Engine.get_file_preview(filepath, max_lines)
     max_lines = max_lines or 60
+    if not filepath or #filepath == 0 then
+        return { "  (No file selected)" }, 0, false
+    end
+
+    if Engine.is_dir(filepath) then
+        return {
+            string.format("  [Directory / Submodule: %s]", filepath),
+            "  (Directory contents hidden from file preview)",
+        }, 0, false
+    end
+
     local f = io.open(filepath, "rb")
     if not f then
-        return { "(Cannot open file: file not found or permission denied)" }, 0, false
+        return { "  (Cannot open file: file not found or permission denied)" }, 0, false
     end
 
     local head = f:read(1024) or ""
@@ -549,13 +600,21 @@ function Engine.get_file_preview(filepath, max_lines)
     f:seek("set", 0)
     local lines = {}
     local count = 0
-    for line in f:lines() do
-        count = count + 1
-        if count <= max_lines then
-            table.insert(lines, (line:gsub("\r$", "")))
+    local read_ok, read_err = pcall(function()
+        for line in f:lines() do
+            count = count + 1
+            if count <= max_lines then
+                table.insert(lines, (line:gsub("\r$", "")))
+            end
         end
-    end
+    end)
     f:close()
+
+    if not read_ok then
+        return {
+            string.format("  (Error reading file: %s)", tostring(read_err):gsub("^.-:%s*", "")),
+        }, 0, false
+    end
 
     return lines, count, false
 end
@@ -575,23 +634,6 @@ local IGNORED_DIRS = {
     ["bin/obj"] = true,
     [".antigravitycli"] = true,
 }
-
-local function to_wide(str)
-    if not IS_WINDOWS then return str end
-    local len = ffi.C.MultiByteToWideChar(65001, 0, str, #str, nil, 0)
-    local buf = ffi.new("wchar_t[?]", len + 1)
-    ffi.C.MultiByteToWideChar(65001, 0, str, #str, buf, len)
-    buf[len] = 0
-    return buf
-end
-
-local function from_wide(wstr)
-    if not IS_WINDOWS then return wstr end
-    local len = ffi.C.WideCharToMultiByte(65001, 0, wstr, -1, nil, 0, nil, nil)
-    local buf = ffi.new("char[?]", len)
-    ffi.C.WideCharToMultiByte(65001, 0, wstr, -1, buf, len, nil, nil)
-    return ffi.string(buf, len - 1)
-end
 
 -- Fallback native scanner using FFI
 function Engine.scan_native(base_dir, max_files)
@@ -1273,6 +1315,15 @@ local function run_tests()
     assert_eq("get_file_preview returns table", type(prev_lines), "table")
     assert_eq("fbr.lua is not binary", is_bin, false)
     assert_eq("total lines > 0", total > 0, true)
+
+    -- Directory preview safety test (reproducing and preventing Linux EISDIR crash)
+    local dir_lines, dir_total, dir_bin = Engine.get_file_preview("bin", 10)
+    assert_eq("get_file_preview on directory returns table", type(dir_lines), "table")
+    assert_eq("get_file_preview on directory has directory message", dir_lines[1]:find("Directory") ~= nil, true)
+    assert_eq("get_file_preview on directory is not binary", dir_bin, false)
+
+    local non_lines, _, _ = Engine.get_file_preview("nonexistent_path_xyz", 10)
+    assert_eq("get_file_preview on nonexistent file handles gracefully", type(non_lines), "table")
 
     -- Test 6: Editor resolution
     local ed = Engine.get_editor_cmd()
