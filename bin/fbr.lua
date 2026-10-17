@@ -561,7 +561,7 @@ function Engine.delete_branch(branch, force)
     if branch.is_head then
         return false, "Cannot delete currently checked out branch: " .. branch.name
     end
-    if branch.is_remote or (branch.name and branch.name:find("^[^/]+/[^/]+")) then
+    if branch.is_remote then
         return false, "Remote branches are protected and cannot be deleted (local only): " .. branch.name
     end
 
@@ -570,8 +570,11 @@ function Engine.delete_branch(branch, force)
 
     local p = io.popen(cmd)
     local out = p and p:read("*a") or ""
-    local ok = p and p:close()
-    return (ok == true or ok == 0), trim(out)
+    if p then p:close() end
+    out = trim(out)
+
+    local success = out:find("Deleted branch") ~= nil
+    return success, out
 end
 
 --------------------------------------------------------------------------------
@@ -934,7 +937,7 @@ local function run_tui(init_opts)
 
         -- A. Confirm Delete Mode
         if state.mode == "confirm_delete" then
-            if key == "y" or key == "Y" then
+            if key == "y" or key == "Y" or key == "ENTER" or key == "d" or key == "D" then
                 if state.confirm_callback then
                     state.confirm_callback(true)
                 end
@@ -1089,26 +1092,29 @@ local function run_tui(init_opts)
                     state.status_type = "warn"
                 else
                     state.mode = "confirm_delete"
-                    state.input_prompt = string.format("Safe delete %d local branch(es): %s", #to_delete, table.concat(to_delete, ", "))
+                    state.input_prompt = string.format("Safe delete %d branch(es): %s [y/d/Enter: confirm, n/Esc: cancel]", #to_delete, table.concat(to_delete, ", "))
                     state.confirm_callback = function(confirmed)
                         if not confirmed then return end
                         local success_cnt = 0
-                        local err_msg = ""
+                        local last_err = ""
                         for _, bname in ipairs(to_delete) do
                             local ok, res = Engine.delete_branch({ name = bname, is_head = (bname == state.head_branch), is_remote = false }, false)
                             if ok then
                                 success_cnt = success_cnt + 1
                                 state.selected_set[bname] = nil
                             else
-                                err_msg = res
+                                last_err = res
                             end
                         end
                         if success_cnt == #to_delete then
                             state.status_msg = string.format("Deleted %d local branch(es).", success_cnt)
                             state.status_type = "ok"
-                        else
-                            state.status_msg = string.format("Deleted %d/%d branch(es). Note: Use 'D' to force delete unmerged branches.", success_cnt, #to_delete)
+                        elseif success_cnt > 0 then
+                            state.status_msg = string.format("Deleted %d/%d branch(es). %s (use 'D' to force)", success_cnt, #to_delete, last_err)
                             state.status_type = "warn"
+                        else
+                            state.status_msg = string.format("Failed to delete: %s (use 'D' to force)", last_err)
+                            state.status_type = "error"
                         end
                     end
                 end
@@ -1135,19 +1141,27 @@ local function run_tui(init_opts)
                     state.status_type = "warn"
                 else
                     state.mode = "confirm_delete"
-                    state.input_prompt = string.format("FORCE delete (-D) %d local branch(es): %s", #to_delete, table.concat(to_delete, ", "))
+                    state.input_prompt = string.format("FORCE delete (-D) %d branch(es): %s [y/D/Enter: confirm, n/Esc: cancel]", #to_delete, table.concat(to_delete, ", "))
                     state.confirm_callback = function(confirmed)
                         if not confirmed then return end
                         local success_cnt = 0
+                        local last_err = ""
                         for _, bname in ipairs(to_delete) do
-                            local ok, _ = Engine.delete_branch({ name = bname, is_head = (bname == state.head_branch), is_remote = false }, true)
+                            local ok, res = Engine.delete_branch({ name = bname, is_head = (bname == state.head_branch), is_remote = false }, true)
                             if ok then
                                 success_cnt = success_cnt + 1
                                 state.selected_set[bname] = nil
+                            else
+                                last_err = res
                             end
                         end
-                        state.status_msg = string.format("Force-deleted %d local branch(es).", success_cnt)
-                        state.status_type = "ok"
+                        if success_cnt == #to_delete then
+                            state.status_msg = string.format("Force-deleted %d local branch(es).", success_cnt)
+                            state.status_type = "ok"
+                        else
+                            state.status_msg = string.format("Force-deleted %d/%d branch(es). %s", success_cnt, #to_delete, last_err)
+                            state.status_type = "error"
+                        end
                     end
                 end
 
@@ -1291,6 +1305,11 @@ local function run_tests()
     -- Test 7: Safety check - cannot delete remote branch
     local ok_remote, err_remote = Engine.delete_branch({ name = "origin/master", is_remote = true }, false)
     assert_eq("delete_branch prevents deleting remote branch", ok_remote, false)
+
+    -- Test 7b: Deleting local branch with slashes
+    os.execute(IS_WINDOWS and "git branch test/del-slash-branch master >nul 2>nul" or "git branch test/del-slash-branch master >/dev/null 2>&1")
+    local ok_slash, msg_slash = Engine.delete_branch({ name = "test/del-slash-branch", is_remote = false, is_head = false }, false)
+    assert_eq("delete_branch allows deleting local branch with slash", ok_slash, true)
 
     -- Test 8: Git repo detection
     assert_eq("Engine.is_inside_git_repo returns boolean", type(Engine.is_inside_git_repo()), "boolean")
