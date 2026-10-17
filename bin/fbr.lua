@@ -752,11 +752,11 @@ local function run_tui(init_opts)
         end
 
         -- Header divider
-        local list_hdr = string.format("%s %-3s %-8s %-10s %s%s",
-            C.b_blue .. C.bold, "SEL", "TYPE", "STATUS", "BRANCH NAME", C.reset)
+        local raw_hdr = pad_right(string.format("  %-3s  %-8s %-8s   %s", "SEL", "TYPE", "STATUS", "BRANCH NAME"), left_w)
+        local list_hdr = C.b_blue .. C.bold .. raw_hdr .. C.reset
         local right_hdr = (cols >= 90) and (C.b_white .. C.bold .. " 📋 BRANCH INSPECTOR" .. C.reset) or ""
         local hdr_sep = (cols >= 90) and (C.gray .. "│" .. C.reset) or ""
-        add_line(pad_right(list_hdr, left_w) .. " " .. hdr_sep .. " " .. right_hdr)
+        add_line(list_hdr .. " " .. hdr_sep .. " " .. right_hdr)
 
         -- Pre-load inspector content for right pane
         local r_lines = {}
@@ -828,7 +828,7 @@ local function run_tui(init_opts)
                 local chk = is_checked and (C.b_green .. "[x]" .. C.reset .. bg) or (C.gray .. "[ ]" .. C.reset .. bg)
 
                 -- Head star / icon
-                local head_ico = item.is_head and (C.b_green .. "* " .. C.reset .. bg) or "  "
+                local head_part = item.is_head and (C.b_green .. "* " .. C.reset .. bg) or "  "
 
                 -- Type pill
                 local type_pill
@@ -850,8 +850,11 @@ local function run_tui(init_opts)
                     status_pill = C.gray .. "[Active]" .. C.reset .. bg
                 end
 
-                local name_w = math.max(12, left_w - 32)
-                local name_disp = pad_right(head_ico .. item.name, name_w)
+                local name_w = math.max(8, left_w - 24)
+                local rest_w = math.max(1, name_w - 2)
+                local raw_name = item.name
+                if #raw_name > rest_w then raw_name = raw_name:sub(1, rest_w) end
+                local rest_disp = pad_right(raw_name, rest_w)
                 local name_col
                 if is_cur then
                     name_col = C.b_white .. C.bold
@@ -862,12 +865,14 @@ local function run_tui(init_opts)
                 else
                     name_col = C.white
                 end
+                local name_disp = head_part .. name_col .. rest_disp .. C.reset
 
-                l_str = string.format("%s%s %s %s %s %s%s%s",
+                l_str = string.format("%s%s %s %s %s %s",
                     bg, ptr, chk, type_pill, status_pill,
-                    name_col, name_disp, C.reset)
+                    name_disp)
             elseif row == 1 and #state.filtered == 0 then
-                l_str = pad_right("  " .. C.gray .. "(No branches in this category or matching filter)" .. C.reset, left_w)
+                local no_match = "  (No branches in this category or matching filter)"
+                l_str = C.gray .. pad_right(no_match, left_w) .. C.reset
             else
                 l_str = string.rep(" ", left_w)
             end
@@ -1305,6 +1310,21 @@ local function run_tests()
     local all_b, head_a = Engine.load_all_branches(true)
     assert_eq("Engine.load_all_branches(true) returns list", type(all_b), "table")
     print(string.format("  [INFO] Discovered %d local branches, %d total branches (HEAD: %s).", #local_b, #all_b, tostring(head_l)))
+
+    -- Test 11: Divider alignment verification
+    local test_cols = 100
+    local test_left_w = math.floor(test_cols * 0.52)
+    local test_raw_hdr = pad_right(string.format("  %-3s  %-8s %-8s   %s", "SEL", "TYPE", "STATUS", "BRANCH NAME"), test_left_w)
+    assert_eq("header visible width equals left_w", #test_raw_hdr, test_left_w)
+
+    local test_name_w = math.max(8, test_left_w - 24)
+    local test_rest_w = math.max(1, test_name_w - 2)
+    local test_branch_disp = pad_right("test-branch", test_rest_w)
+    local test_body_plain = " " .. " " .. "[ ]" .. " " .. "[Local ]" .. " " .. "[Active]" .. " " .. "* " .. test_branch_disp
+    assert_eq("body row visible width equals left_w", #test_body_plain, test_left_w)
+
+    local test_empty = string.rep(" ", test_left_w)
+    assert_eq("empty row width equals left_w", #test_empty, test_left_w)
 
     print(string.format("\nSelf-test summary: %d passed, %d failed.", passed, failed))
     if failed > 0 then os.exit(1) end
