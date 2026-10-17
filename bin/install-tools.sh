@@ -23,6 +23,7 @@ C_RED="\033[31m"
 C_GRAY="\033[90m"
 
 # Default configuration
+ACTION="install"        # "install", "uninstall"
 INSTALL_MODE="release"  # "release", "source", "pm"
 DEST_DIR=""
 DRY_RUN=false
@@ -553,12 +554,107 @@ install_pm_tools() {
     esac
 }
 
+uninstall_pm_tools() {
+    local pm
+    pm=$(detect_package_manager)
+    log_step "Uninstalling tools using system package manager (${pm})..."
+
+    if $DRY_RUN; then
+        echo -e "  ${C_YELLOW}[Dry Run]${C_RESET} Would use package manager to uninstall: $pm"
+        return 0
+    fi
+
+    case "$pm" in
+        pacman)
+            local pkgs=(ripgrep fd bat eza git-delta fzf zoxide starship yazi luajit neovim sd bottom dust tealdeer entr)
+            echo "Running: sudo pacman -R ${pkgs[*]}"
+            sudo pacman -R "${pkgs[@]}" || true
+            ;;
+        apt)
+            echo "Running: sudo apt-get remove -y ripgrep fd-find bat fzf zoxide luajit neovim entr"
+            sudo apt-get remove -y ripgrep fd-find bat fzf zoxide luajit neovim entr || true
+            ;;
+        dnf)
+            echo "Running: sudo dnf remove -y ripgrep fd-find bat eza git-delta fzf zoxide starship luajit neovim"
+            sudo dnf remove -y ripgrep fd-find bat eza git-delta fzf zoxide starship luajit neovim || true
+            ;;
+        brew)
+            brew uninstall ripgrep fd bat eza git-delta fzf zoxide starship yazi luajit neovim sd bottom dust tealdeer entr || true
+            ;;
+        *)
+            log_error "Unsupported package manager for uninstallation."
+            return 1
+            ;;
+    esac
+}
+
+uninstall_tools() {
+    log_step "Uninstalling tools from ${DEST_DIR}..."
+    local removed_cnt=0
+
+    for tool in "${TARGET_LIST[@]}"; do
+        local target_bin="$DEST_DIR/$tool"
+        local found=false
+
+        if [[ -f "$target_bin" || -L "$target_bin" ]]; then
+            found=true
+            if $DRY_RUN; then
+                echo -e "  ${C_YELLOW}[Dry Run]${C_RESET} Would remove: $target_bin"
+                removed_cnt=$((removed_cnt + 1))
+            else
+                rm -f "$target_bin"
+                log_ok "Removed $target_bin"
+                removed_cnt=$((removed_cnt + 1))
+            fi
+        fi
+
+        # Special companions (e.g. fdfind/batcat symlinks, ~/.fzf)
+        if [[ "$tool" == "fd" && (-f "$DEST_DIR/fdfind" || -L "$DEST_DIR/fdfind") ]]; then
+            if $DRY_RUN; then
+                echo -e "  ${C_YELLOW}[Dry Run]${C_RESET} Would remove: $DEST_DIR/fdfind"
+            else
+                rm -f "$DEST_DIR/fdfind"
+                log_ok "Removed $DEST_DIR/fdfind"
+            fi
+        fi
+        if [[ "$tool" == "bat" && (-f "$DEST_DIR/batcat" || -L "$DEST_DIR/batcat") ]]; then
+            if $DRY_RUN; then
+                echo -e "  ${C_YELLOW}[Dry Run]${C_RESET} Would remove: $DEST_DIR/batcat"
+            else
+                rm -f "$DEST_DIR/batcat"
+                log_ok "Removed $DEST_DIR/batcat"
+            fi
+        fi
+        if [[ "$tool" == "fzf" && -d "$HOME/.fzf" ]]; then
+            if $DRY_RUN; then
+                echo -e "  ${C_YELLOW}[Dry Run]${C_RESET} Would remove: $HOME/.fzf"
+            else
+                rm -rf "$HOME/.fzf"
+                log_ok "Removed $HOME/.fzf"
+            fi
+        fi
+
+        if ! $found; then
+            if $VERBOSE; then
+                echo -e "  ${C_GRAY}[SKIP]   ${tool} not found in ${DEST_DIR}${C_RESET}"
+            fi
+        fi
+    done
+
+    echo ""
+    if $DRY_RUN; then
+        log_info "Dry run complete: ${removed_cnt} tools would be removed."
+    else
+        log_ok "Uninstallation complete: ${removed_cnt} tools removed."
+    fi
+}
+
 # -----------------------------------------------------------------------------
 # Main & CLI Parser
 # -----------------------------------------------------------------------------
 show_help() {
     cat << EOF
-Workbench CLI Toolchain Installer (bin/install-tools.sh)
+Workbench CLI Toolchain Installer & Uninstaller (bin/install-tools.sh)
 
 Usage:
   ./bin/install-tools.sh [OPTIONS]
@@ -567,10 +663,11 @@ Options:
   -r, --release         Install latest pre-built static binaries from GitHub Releases (Default)
   -s, --source          Build from source using Cargo & Make
   -p, --pm, --package   Install using system package manager (pacman, apt, dnf, brew)
-  -t, --tools <LIST>    Comma-separated list of tools to install (default: all)
+  -u, --uninstall       Uninstall tools from destination directory (or via package manager)
+  -t, --tools <LIST>    Comma-separated list of tools to process (default: all)
   -d, --dir <DIR>       Destination directory for binaries (default: ~/.local/bin or ~/bin)
   -l, --list            Inspect and list status of all tools without installing
-  -n, --dry-run         Print actions without downloading or installing
+  -n, --dry-run         Print actions without downloading, installing, or removing
   -v, --verbose         Verbose diagnostic logging
   -h, --help            Show this help message
 
@@ -583,6 +680,8 @@ Examples:
   ./bin/install-tools.sh --release
   ./bin/install-tools.sh --release --tools "rg,fd,bat,eza,delta,zoxide,yazi"
   ./bin/install-tools.sh --source --tools "yazi,eza"
+  ./bin/install-tools.sh --uninstall --tools "dust,sd,btm"
+  ./bin/install-tools.sh --uninstall --dry-run
   ./bin/install-tools.sh --dir ~/bin
 EOF
 }
@@ -597,6 +696,10 @@ while [[ $# -gt 0 ]]; do
         -l|--list)
             cmd_list
             exit 0
+            ;;
+        -u|--uninstall)
+            ACTION="uninstall"
+            shift
             ;;
         -r|--release)
             INSTALL_MODE="release"
@@ -638,13 +741,9 @@ detect_environment
 resolve_dest_dir
 
 log_info "Detected OS: ${TARGET_OS} (${TARGET_ARCH})"
+log_info "Action: ${ACTION}"
 log_info "Installation mode: ${INSTALL_MODE}"
 log_info "Destination directory: ${DEST_DIR}"
-
-if [[ "$INSTALL_MODE" == "pm" ]]; then
-    install_pm_tools
-    exit 0
-fi
 
 # Determine tool list
 TARGET_LIST=()
@@ -657,6 +756,20 @@ if [[ -n "$SELECTED_TOOLS" ]]; then
     done
 else
     TARGET_LIST=("${ALL_TOOLS[@]}")
+fi
+
+if [[ "$ACTION" == "uninstall" ]]; then
+    if [[ "$INSTALL_MODE" == "pm" ]]; then
+        uninstall_pm_tools
+    else
+        uninstall_tools
+    fi
+    exit 0
+fi
+
+if [[ "$INSTALL_MODE" == "pm" ]]; then
+    install_pm_tools
+    exit 0
 fi
 
 log_info "Tools to process: ${TARGET_LIST[*]}"
