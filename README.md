@@ -1,33 +1,89 @@
-# utils
+<p align="center">
+  <img src="assets/workbench.svg" alt="Workbench — a terminal resting on a workbench" width="760">
+</p>
+
+# workbench
+
+Cross-platform dotfiles, editor configs, and command-line tools.
+
+My personal development setup for Windows, Linux, and macOS: a place to keep the tools and settings I use every day, and bring them to another machine.
+
+## What's on the bench
+
+| Area | Configs and tools |
+| --- | --- |
+| Editors | [Neovim](.config/nvim), [Vim](myvimrc), and [clangd](.config/clangd) |
+| Shell & terminal | [Bash](mybashrc), [Starship](.config/starship.toml), [tmux](.tmux.conf), [WezTerm](.wezterm.lua), and [Alacritty](.config/alacritty) |
+| Git | [Aliases and defaults](.gitconfig), [tig](.tigrc), and [ignore rules](.config/git/ignore) |
+| Files & navigation | [lf](.config/lf), [Yazi](.config/yazi), [ranger](.config/ranger), and [Vifm](.vifm) |
+| Remote work | [SSH configuration](.config/ssh/config.base), plus SSH, SCP, and tunnel helpers in [bin/](bin) |
+| Debugging | [GDB](.gdbinit), [CGDB](.cgdb/cgdbrc), and Valgrind wrappers in [bin/](bin) |
+
+## Get started
+
+```sh
+git clone git@github.com:skyera/workbench.git
+cd workbench
 ```
- _   _ _   _ _
-| | | | |_(_) |___
-| | | | __| | / __|
-| |_| | |_| | \__ \
- \___/ \__|_|_|___/
+
+Choose a deployment method below. These are personal configurations: review the files and destination paths before deploying. The scripts copy configurations into your user directories and may install additional tools or plugins; they do not install every application listed above.
+
+### Linux & macOS
+
+Use Bash to deploy dotfiles and copy utilities to `~/bin`:
+
+```sh
+bash deploy.sh --help
+bash deploy.sh          # Neovim Lua configuration (default)
+bash deploy.sh --vim    # Vimscript configuration for Neovim
 ```
 
-Personal utility scripts, binary tools, and text editor configurations.
+Keep `~/bin` on your `PATH`. The script backs up changed individual files as `.bak`; directory copies do not provide a full backup.
 
-## Features
+### Windows
 
-- **Vim & Neovim Configurations**: Includes a robust classic `myvimrc` and a modern Neovim Lua configuration (`.config/nvim`).
-- **Binary Tools**: A collection of helpful shell scripts, batch files, and binaries located in the `bin/` directory (e.g., FZF wrappers, LF previewers).
-- **Deployment Script**: A `deploy.bat` script for Windows that automates the installation of configurations and binaries.
-
-## Deployment (Windows)
-
-Use the included `deploy.bat` script to easily deploy configurations and scripts to your local environment. It copies binaries to `C:\app\bin` and sets up the necessary environment variables.
-
-### Usage
+Run from Command Prompt to deploy configurations and copy utilities to `C:\app\bin`:
 
 ```cmd
-deploy.bat [OPTIONS]
+deploy.bat --help
+deploy.bat --lua
+deploy.bat --vim
 ```
 
-**Options:**
-- `/l`, `--lua` : Deploy the modern Neovim Lua configuration (Default).
-- `/v`, `--vim` : Deploy the classic `myvimrc` as `init.vim` for Neovim.
-- `/h`, `--help`: Show the help message.
+Lua is the default; `--vim` selects the Vimscript configuration for Neovim. The batch script also accepts `/h`, `/l`, and `/v`. Ensure that `C:\app\bin` is on your `PATH`. It overwrites destination files, so back up existing configurations first.
 
-**Note:** Ensure that `C:\app\bin` is added to your system's `PATH`.
+### Graphical deployment
+
+For a graphical view of source and destination files, run the deployer with Python 3 and Tkinter:
+
+```sh
+python deploy_gui.py
+```
+
+The GUI includes backup, diff, and restore controls. On systems where Python 3 is named `python3`, use `python3 deploy_gui.py`.
+
+## Everyday tools
+
+The [bin/](bin) directory includes utilities for:
+
+- Finding files and changing directories with fzf (`fzf_find`, `fcd`, `fvim`).
+- Connecting to hosts, copying files, and opening tunnels (`fssh`, `fscp`, `fssh_tunnel`).
+- Working with Git and source indexes (`dogit`, `dotag`).
+- Managing processes, clipboard access, and remote mounts (`fkill`, `osc52-yank`, `rsshfs`).
+
+Many tools have platform-specific implementations in shell, batch, Lua, PowerShell, or Python. Check the selected script for its dependencies and options.
+
+## Personal Git settings
+
+[.gitconfig](.gitconfig) includes `~/.gitconfig.local` for machine-specific overrides, such as your commit identity:
+
+```ini
+[user]
+    name = Your Name
+    email = you@example.com
+```
+
+## Further reading
+
+- [CLI power-user guide](cli_power_user_guide.md)
+- [Proposed improvements](PROPOSED_IMPROVEMENTS.md)

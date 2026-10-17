@@ -1,4 +1,4 @@
-# Proposed Improvements for Utils Repository
+# Proposed Improvements for Workbench
 
 Based on the codebase review, here are the suggested enhancements categorized by area.
 
