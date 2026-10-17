@@ -1,0 +1,4 @@
+#!/bin/sh
+# fe - Launch fe.lua via LuaJIT
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+exec luajit "$SCRIPT_DIR/fe.lua" "$@"

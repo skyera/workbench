@@ -1089,39 +1089,50 @@ fcd() {
     dir=$(eval "$list_cmd" | fzf --layout=reverse --preview 'eza --tree --level=2 --icons=always --color=always {} 2>/dev/null || ls -la {} | head -200') && cd "$dir"
 }
 
-fvim() {
-    local base_dir="${1:-.}"
-    local list_cmd
-    if command -v fd >/dev/null 2>&1; then
-        list_cmd="fd --type f --hidden --exclude .git . \"$base_dir\""
-    elif command -v fdfind >/dev/null 2>&1; then
-        list_cmd="fdfind --type f --hidden --exclude .git . \"$base_dir\""
+fe() {
+    if command -v fe.sh >/dev/null 2>&1; then
+        fe.sh "$@"
+    elif command -v fe.bat >/dev/null 2>&1; then
+        fe.bat "$@"
+    elif command -v fe >/dev/null 2>&1; then
+        command fe "$@"
+    elif command -v luajit >/dev/null 2>&1 && [[ -f "${WORKBENCH_ROOT:-$HOME/test/utils}/bin/fe.lua" ]]; then
+        luajit "${WORKBENCH_ROOT:-$HOME/test/utils}/bin/fe.lua" "$@"
     else
-        list_cmd="find \"$base_dir\" -type f -not -path '*/.*' 2>/dev/null"
-    fi
+        local base_dir="${1:-.}"
+        local list_cmd
+        if command -v fd >/dev/null 2>&1; then
+            list_cmd="fd --type f --hidden --exclude .git . \"$base_dir\""
+        elif command -v fdfind >/dev/null 2>&1; then
+            list_cmd="fdfind --type f --hidden --exclude .git . \"$base_dir\""
+        else
+            list_cmd="find \"$base_dir\" -type f -not -path '*/.*' 2>/dev/null"
+        fi
 
-    local results
-    results=$(eval "$list_cmd" | fzf --multi \
-        --prompt="Fuzzy Edit> " \
-        --header="[TAB to multi-select, ENTER to open]" \
-        --preview="bat -n --color=always --line-range :500 {} 2>/dev/null || head -500 {}" \
-        --preview-window=right:60%)
-    [[ -z "$results" ]] && return 0
+        local results
+        results=$(eval "$list_cmd" | fzf --multi \
+            --prompt="Fuzzy Edit> " \
+            --header="[TAB to multi-select, ENTER to open]" \
+            --preview="bat -n --color=always --line-range :500 {} 2>/dev/null || head -500 {}" \
+            --preview-window=right:60%)
+        [[ -z "$results" ]] && return 0
 
-    local files=()
-    if [[ -n "$BASH_VERSION" ]]; then
-        mapfile -t files <<< "$results"
-    elif [[ -n "$ZSH_VERSION" ]]; then
-        # shellcheck disable=SC2296
-        files=("${(@f)results}")
-    fi
+        local files=()
+        if [[ -n "$BASH_VERSION" ]]; then
+            mapfile -t files <<< "$results"
+        elif [[ -n "$ZSH_VERSION" ]]; then
+            # shellcheck disable=SC2296
+            files=("${(@f)results}")
+        fi
 
-    if [[ ${#files[@]} -gt 1 ]]; then
-        "${EDITOR:-vi}" -p "${files[@]}"
-    elif [[ ${#files[@]} -eq 1 ]]; then
-        "${EDITOR:-vi}" "${files[0]}"
+        if [[ ${#files[@]} -gt 1 ]]; then
+            "${EDITOR:-vi}" -p "${files[@]}"
+        elif [[ ${#files[@]} -eq 1 ]]; then
+            "${EDITOR:-vi}" "${files[0]}"
+        fi
     fi
 }
+alias fvim='fe'
 
 fhist() {
     local cmd

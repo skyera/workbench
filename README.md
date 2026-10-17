@@ -66,7 +66,7 @@ The GUI includes backup, diff, and restore controls. On systems where Python 3 i
 
 The [bin/](bin) directory includes utilities for:
 
-- Finding files and changing directories with fzf (`fzf_find`, `fcd`, `fvim`).
+- Finding files and changing directories with interactive TUIs (`fe`, `fcd`, `frg`, `fvim`).
 - Connecting to hosts, copying files, and opening tunnels (`fssh`, `fscp`, `fssh_tunnel`).
 - Working with Git and source indexes (`fco`, `flog`, `fbr`, `dotag`).
 - Managing shell history, processes, clipboard access, and remote mounts (`fhist`, `fkill`, `osc52-yank`, `rsshfs`).

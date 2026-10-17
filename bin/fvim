@@ -1,0 +1,4 @@
+#!/bin/sh
+# fvim - Backward-compatibility wrapper for fe
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+exec "$SCRIPT_DIR/fe" "$@"
