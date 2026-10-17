@@ -362,14 +362,20 @@ end
 function Term.get_size()
     local cols, rows = 100, 28
     if IS_WINDOWS then
-        local hCon = ffi.C.CreateFileA("CONOUT$", 0xC0000000, 3, nil, 3, 0, nil)
-        if hCon ~= nil and hCon ~= ffi.cast("HANDLE", -1) then
-            local csbi = ffi.new("CONSOLE_SCREEN_BUFFER_INFO")
-            if ffi.C.GetConsoleScreenBufferInfo(hCon, csbi) ~= 0 then
-                cols = csbi.srWindow.Right - csbi.srWindow.Left + 1
-                rows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1
+        local csbi = ffi.new("CONSOLE_SCREEN_BUFFER_INFO")
+        if Term.hOut ~= nil and Term.hOut ~= ffi.cast("HANDLE", -1)
+            and ffi.C.GetConsoleScreenBufferInfo(Term.hOut, csbi) ~= 0 then
+            cols = csbi.srWindow.Right - csbi.srWindow.Left + 1
+            rows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1
+        else
+            local hCon = ffi.C.CreateFileA("CONOUT$", 0xC0000000, 3, nil, 3, 0, nil)
+            if hCon ~= nil and hCon ~= ffi.cast("HANDLE", -1) then
+                if ffi.C.GetConsoleScreenBufferInfo(hCon, csbi) ~= 0 then
+                    cols = csbi.srWindow.Right - csbi.srWindow.Left + 1
+                    rows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1
+                end
+                ffi.C.CloseHandle(hCon)
             end
-            ffi.C.CloseHandle(hCon)
         end
     elseif IS_POSIX then
         local ws = ffi.new("struct winsize")
@@ -727,6 +733,7 @@ function FS.delete_entry(target_node)
             p.size = math.max(0, p.size - target_node.size)
             p.files = math.max(0, p.files - target_node.files)
             p.dirs = math.max(0, p.dirs - (target_node.is_dir and (1 + target_node.dirs) or 0))
+            p._top_sub = nil
             p = p.parent
         end
     end
@@ -791,14 +798,23 @@ local function run_tui(start_path)
 
     refresh_items()
 
+    local prev_lines = {}
+    local prev_cols, prev_rows = 0, 0
+
     local function render()
         local cols, rows = Term.get_size()
+        if cols ~= prev_cols or rows ~= prev_rows then
+            prev_lines = {}
+            prev_cols, prev_rows = cols, rows
+            io.write("\27[2J")
+        end
+
         local left_w = math.floor(cols * 0.56)
         if left_w < 42 then left_w = 42 end
         local right_w = cols - left_w - 3
         if right_w < 22 then right_w = 22 end
-        local body_h = rows - 5
-        if body_h < 8 then body_h = 8 end
+        local body_h = rows - 6
+        if body_h < 6 then body_h = 6 end
 
         if state.cursor < state.scroll then
             state.scroll = state.cursor
@@ -807,17 +823,17 @@ local function run_tui(start_path)
         end
         if state.scroll < 1 then state.scroll = 1 end
 
-        local buf = { "\27[H" }
+        local frame_lines = {}
 
-        -- 1. Header Bar
+        -- 1. Header Bar (3 rows)
         local total_str = format_bytes(state.cur_node.size)
         local path_disp = truncate_string(state.cur_node.path, math.max(20, cols - 48))
         local hdr = string.format("%s fdu %s %s%s%s  %s[Total: %s | %d files, %d dirs]%s",
             C.b_cyan, C.reset, C.b_yellow, path_disp, C.reset,
             C.b_green, total_str, state.cur_node.files, state.cur_node.dirs, C.reset)
-        table.insert(buf, BOX.tl .. string.rep(BOX.h, cols - 2) .. BOX.tr .. "\r\n")
-        table.insert(buf, BOX.v .. pad_string(hdr, cols - 2) .. BOX.v .. "\r\n")
-        table.insert(buf, BOX.vl .. string.rep(BOX.h, left_w) .. BOX.tt .. string.rep(BOX.h, right_w) .. BOX.vr .. "\r\n")
+        table.insert(frame_lines, BOX.tl .. string.rep(BOX.h, cols - 2) .. BOX.tr)
+        table.insert(frame_lines, BOX.v .. pad_string(hdr, cols - 2) .. BOX.v)
+        table.insert(frame_lines, BOX.vl .. string.rep(BOX.h, left_w) .. BOX.tt .. string.rep(BOX.h, right_w) .. BOX.vr)
 
         -- 2. Right Pane Inspector
         local r_lines = {}
@@ -854,7 +870,10 @@ local function run_tui(start_path)
             table.insert(r_lines, "")
 
             if sel.is_dir and sel.children and #sel.children > 0 then
-                local top_sub = filter_and_sort_children(sel, "", "size")
+                if not sel._top_sub then
+                    sel._top_sub = filter_and_sort_children(sel, "", "size")
+                end
+                local top_sub = sel._top_sub
                 table.insert(r_lines, string.format("%s Top Items Inside (%d)%s", C.b_cyan, #top_sub, C.reset))
                 table.insert(r_lines, C.gray .. " " .. string.rep(BOX.h, math.max(10, right_w - 2)) .. C.reset)
                 for i = 1, math.min(9, #top_sub) do
@@ -870,7 +889,7 @@ local function run_tui(start_path)
             table.insert(r_lines, C.gray .. " Directory is empty." .. C.reset)
         end
 
-        -- 3. Render Dual-Pane Body
+        -- 3. Render Dual-Pane Body (rows - 6 rows)
         local col_hdr = string.format(" %-10s %10s %6s  %s", "USAGE", "SIZE", "SHARE", "NAME")
         col_hdr = truncate_string(col_hdr, left_w)
         local parent_total = math.max(1, state.cur_node.size)
@@ -914,11 +933,11 @@ local function run_tui(start_path)
                 r_raw = truncate_string(r_raw, right_w)
             end
             local r_cell = pad_string(r_raw, right_w)
-            table.insert(buf, BOX.v .. l_cell .. BOX.v .. r_cell .. BOX.v .. "\r\n")
+            table.insert(frame_lines, BOX.v .. l_cell .. BOX.v .. r_cell .. BOX.v)
         end
 
-        -- 4. Footer Bar
-        table.insert(buf, BOX.vl .. string.rep(BOX.h, left_w) .. BOX.tb .. string.rep(BOX.h, right_w) .. BOX.vr .. "\r\n")
+        -- 4. Footer Bar (3 rows)
+        table.insert(frame_lines, BOX.vl .. string.rep(BOX.h, left_w) .. BOX.tb .. string.rep(BOX.h, right_w) .. BOX.vr)
         local footer
         if state.mode == "confirm_del" and sel then
             footer = C.bg_red .. C.b_white ..
@@ -935,11 +954,22 @@ local function run_tui(start_path)
                 " [j/k] Move  [Enter/l] Open  [Bksp/h] Up  [/] Filter  [s] Sort:%s  [d] Delete  [r] Rescan  [?] Help  [q] Quit",
                 sort_lbl) .. C.reset
         end
-        table.insert(buf, BOX.v .. pad_string(truncate_string(footer, cols - 2), cols - 2) .. BOX.v .. "\r\n")
-        table.insert(buf, BOX.bl .. string.rep(BOX.h, cols - 2) .. BOX.br)
+        table.insert(frame_lines, BOX.v .. pad_string(truncate_string(footer, cols - 2), cols - 2) .. BOX.v)
+        table.insert(frame_lines, BOX.bl .. string.rep(BOX.h, cols - 2) .. BOX.br)
 
-        io.write(table.concat(buf))
-        io.flush()
+        -- Emit only changed lines wrapped in DEC Synchronized Update
+        local out = { "\27[?2026h" }
+        for r = 1, #frame_lines do
+            if frame_lines[r] ~= prev_lines[r] then
+                table.insert(out, string.format("\27[%d;1H%s", r, frame_lines[r]))
+                prev_lines[r] = frame_lines[r]
+            end
+        end
+        if #out > 1 then
+            table.insert(out, "\27[?2026l")
+            io.write(table.concat(out))
+            io.flush()
+        end
     end
 
     Term.enable_raw()

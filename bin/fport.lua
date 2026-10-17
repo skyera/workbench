@@ -444,14 +444,20 @@ end
 function Term.get_size()
     local cols, rows = 100, 28
     if IS_WINDOWS then
-        local hCon = ffi.C.CreateFileA("CONOUT$", 0xC0000000, 3, nil, 3, 0, nil)
-        if hCon ~= nil and hCon ~= ffi.cast("HANDLE", -1) then
-            local csbi = ffi.new("CONSOLE_SCREEN_BUFFER_INFO")
-            if ffi.C.GetConsoleScreenBufferInfo(hCon, csbi) ~= 0 then
-                cols = csbi.srWindow.Right - csbi.srWindow.Left + 1
-                rows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1
+        local csbi = ffi.new("CONSOLE_SCREEN_BUFFER_INFO")
+        if Term.hOut ~= nil and Term.hOut ~= ffi.cast("HANDLE", -1)
+            and ffi.C.GetConsoleScreenBufferInfo(Term.hOut, csbi) ~= 0 then
+            cols = csbi.srWindow.Right - csbi.srWindow.Left + 1
+            rows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1
+        else
+            local hCon = ffi.C.CreateFileA("CONOUT$", 0xC0000000, 3, nil, 3, 0, nil)
+            if hCon ~= nil and hCon ~= ffi.cast("HANDLE", -1) then
+                if ffi.C.GetConsoleScreenBufferInfo(hCon, csbi) ~= 0 then
+                    cols = csbi.srWindow.Right - csbi.srWindow.Left + 1
+                    rows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1
+                end
+                ffi.C.CloseHandle(hCon)
             end
-            ffi.C.CloseHandle(hCon)
         end
     elseif IS_POSIX then
         local ws = ffi.new("struct winsize")
@@ -1068,14 +1074,23 @@ local function run_tui(initial_query, start_all)
 
     refilter()
 
+    local prev_lines = {}
+    local prev_cols, prev_rows = 0, 0
+
     local function render()
         local cols, rows = Term.get_size()
+        if cols ~= prev_cols or rows ~= prev_rows then
+            prev_lines = {}
+            prev_cols, prev_rows = cols, rows
+            io.write("\27[2J")
+        end
+
         local left_w = math.floor(cols * 0.52)
         if left_w < 38 then left_w = 38 end
         local right_w = cols - left_w - 3
         if right_w < 20 then right_w = 20 end
-        local body_h = rows - 5
-        if body_h < 8 then body_h = 8 end
+        local body_h = rows - 6
+        if body_h < 6 then body_h = 6 end
 
         if state.cursor < state.scroll then
             state.scroll = state.cursor
@@ -1084,9 +1099,9 @@ local function run_tui(initial_query, start_all)
         end
         if state.scroll < 1 then state.scroll = 1 end
 
-        local buf = { "\27[H" }
+        local frame_lines = {}
 
-        -- 1. Top Header Bar with Category Tabs
+        -- 1. Top Header Bar with Category Tabs (3 rows)
         local tab_str = ""
         for i, t in ipairs(TABS) do
             local cnt = state.counts[t.id] or 0
@@ -1098,8 +1113,8 @@ local function run_tui(initial_query, start_all)
             end
         end
         local title = C.b_cyan .. " fport " .. C.reset .. C.dim .. "Port & Socket Inspector  " .. C.reset .. tab_str
-        table.insert(buf, BOX.tl .. string.rep(BOX.h, cols - 2) .. BOX.tr .. "\r\n")
-        table.insert(buf, BOX.v .. pad_string(title, cols - 2) .. BOX.v .. "\r\n")
+        table.insert(frame_lines, BOX.tl .. string.rep(BOX.h, cols - 2) .. BOX.tr)
+        table.insert(frame_lines, BOX.v .. pad_string(title, cols - 2) .. BOX.v)
 
         -- 2. Search & Sort Bar
         local search_prefix = (state.mode == "search")
@@ -1109,7 +1124,7 @@ local function run_tui(initial_query, start_all)
             C.yellow, SORT_MODES[state.sort_idx]:upper(), #state.filtered, C.reset)
         local sort_w = utf8_col_width(sort_badge)
         local filter_line = pad_string(search_prefix, math.max(10, cols - 2 - sort_w)) .. sort_badge
-        table.insert(buf, BOX.vl .. string.rep(BOX.h, left_w) .. BOX.tt .. string.rep(BOX.h, right_w) .. BOX.vr .. "\r\n")
+        table.insert(frame_lines, BOX.vl .. string.rep(BOX.h, left_w) .. BOX.tt .. string.rep(BOX.h, right_w) .. BOX.vr)
 
         -- 3. Prepare Right-Pane Inspector Lines
         local r_lines = {}
@@ -1179,7 +1194,7 @@ local function run_tui(initial_query, start_all)
             table.insert(r_lines, C.gray .. " No socket selected." .. C.reset)
         end
 
-        -- 4. Render Dual-Pane Body
+        -- 4. Render Dual-Pane Body (rows - 6 rows)
         local col_hdr = string.format(" %-5s %-6s %-17s %-7s %s", "PROTO", "PORT", "LOCAL ADDR", "PID", "PROCESS")
         col_hdr = truncate_string(col_hdr, left_w)
 
@@ -1216,11 +1231,11 @@ local function run_tui(initial_query, start_all)
                 r_raw = truncate_string(r_raw, right_w)
             end
             local r_cell = pad_string(r_raw, right_w)
-            table.insert(buf, BOX.v .. l_cell .. BOX.v .. r_cell .. BOX.v .. "\r\n")
+            table.insert(frame_lines, BOX.v .. l_cell .. BOX.v .. r_cell .. BOX.v)
         end
 
-        -- 5. Footer / Filter & Keybindings Bar
-        table.insert(buf, BOX.vl .. string.rep(BOX.h, left_w) .. BOX.tb .. string.rep(BOX.h, right_w) .. BOX.vr .. "\r\n")
+        -- 5. Footer / Filter & Keybindings Bar (3 rows)
+        table.insert(frame_lines, BOX.vl .. string.rep(BOX.h, left_w) .. BOX.tb .. string.rep(BOX.h, right_w) .. BOX.vr)
         local footer
         if state.mode == "confirm_kill" and sel then
             footer = C.bg_red .. C.b_white ..
@@ -1233,11 +1248,22 @@ local function run_tui(initial_query, start_all)
             local hints = C.gray .. " [j/k] Move  [Tab/1-4] Tab  [/] Filter  [s] Sort  [r] Refresh  [x/Enter] Kill  [?] Help  [q] Quit" .. C.reset
             footer = (#state.query > 0 or state.mode == "search") and filter_line or hints
         end
-        table.insert(buf, BOX.v .. pad_string(truncate_string(footer, cols - 2), cols - 2) .. BOX.v .. "\r\n")
-        table.insert(buf, BOX.bl .. string.rep(BOX.h, cols - 2) .. BOX.br)
+        table.insert(frame_lines, BOX.v .. pad_string(truncate_string(footer, cols - 2), cols - 2) .. BOX.v)
+        table.insert(frame_lines, BOX.bl .. string.rep(BOX.h, cols - 2) .. BOX.br)
 
-        io.write(table.concat(buf))
-        io.flush()
+        -- Emit only changed lines wrapped in DEC Synchronized Update
+        local out = { "\27[?2026h" }
+        for r = 1, #frame_lines do
+            if frame_lines[r] ~= prev_lines[r] then
+                table.insert(out, string.format("\27[%d;1H%s", r, frame_lines[r]))
+                prev_lines[r] = frame_lines[r]
+            end
+        end
+        if #out > 1 then
+            table.insert(out, "\27[?2026l")
+            io.write(table.concat(out))
+            io.flush()
+        end
     end
 
     Term.enable_raw()
