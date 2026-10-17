@@ -1,6 +1,13 @@
 @echo off
 setlocal enabledelayedexpansion
 
+:: 0. Prefer LuaJIT TUI if available
+where luajit >nul 2>nul
+if !errorlevel! equ 0 (
+    luajit "%~dp0frg.lua" %*
+    exit /b !errorlevel!
+)
+
 :: 1. Determine editor (prefer %EDITOR%, then %VISUAL%, then nvim, then vim)
 set "TARGET_EDITOR=%EDITOR%"
 if "%TARGET_EDITOR%"=="" set "TARGET_EDITOR=%VISUAL%"
