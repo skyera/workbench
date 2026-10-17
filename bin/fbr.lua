@@ -419,11 +419,48 @@ function Engine.parse_branch_line(line, merged_set)
     }
 end
 
-function Engine.load_all_branches()
+function Engine.parse_ref_line(line, merged_set)
+    merged_set = merged_set or {}
+    line = line:gsub("\r$", "")
+    if #line == 0 then return nil end
+
+    local head_mark, name, sha, tracking, track_info, subject = line:match("^([^|]*)|([^|]+)|([^|]*)|([^|]*)|([^|]*)|(.*)$")
+    if not name then return nil end
+
+    local is_head = (head_mark == "*")
+    local ahead = nil
+    local behind = nil
+    local gone = false
+
+    if track_info and #track_info > 0 then
+        if track_info:find("gone") then
+            gone = true
+        end
+        local ah = track_info:match("ahead (%d+)")
+        if ah then ahead = tonumber(ah) end
+        local bh = track_info:match("behind (%d+)")
+        if bh then behind = tonumber(bh) end
+    end
+
+    return {
+        name = name,
+        is_head = is_head,
+        is_remote = false,
+        is_merged = (merged_set[name] == true),
+        sha = sha or "",
+        tracking = (#tracking > 0) and tracking or nil,
+        ahead = ahead,
+        behind = behind,
+        gone = gone,
+        subject = trim(subject or ""),
+    }
+end
+
+function Engine.load_local_branches()
     local branches = {}
     local merged_set = {}
 
-    -- 1. Get list of merged branches into HEAD
+    -- 1. Merged branches into HEAD (1 fast git call)
     local merged_raw = Engine.exec_git("branch --merged")
     for line in merged_raw:gmatch("[^\r\n]+") do
         line = trim(line:gsub("^%*%s*", ""))
@@ -432,11 +469,11 @@ function Engine.load_all_branches()
         end
     end
 
-    -- 2. Get local branches with details
-    local local_raw = Engine.exec_git("branch -vv --sort=-committerdate")
+    -- 2. Local branches via fast for-each-ref (1 fast git call)
+    local local_raw = Engine.exec_git('for-each-ref --format="%(HEAD)|%(refname:short)|%(objectname:short)|%(upstream:short)|%(upstream:track)|%(subject)" --sort=-committerdate refs/heads/')
     local head_branch = nil
     for line in local_raw:gmatch("[^\r\n]+") do
-        local b = Engine.parse_branch_line(line, merged_set)
+        local b = Engine.parse_ref_line(line, merged_set)
         if b then
             table.insert(branches, b)
             if b.is_head then
@@ -445,16 +482,17 @@ function Engine.load_all_branches()
         end
     end
 
-    -- 3. Get remote branches
-    local remote_raw = Engine.exec_git("branch -r --sort=-committerdate")
+    return branches, head_branch, merged_set
+end
+
+function Engine.load_remote_branches()
+    local remotes = {}
+    -- Single fast git call for all remote branches
+    local remote_raw = Engine.exec_git('for-each-ref --format="%(refname:short)|%(objectname:short)|%(subject)" --sort=-committerdate refs/remotes/')
     for line in remote_raw:gmatch("[^\r\n]+") do
-        local rname = trim(line)
-        -- Skip symbolic HEAD -> origin/master
-        if #rname > 0 and not rname:find("%->") then
-            -- Get sha and subject
-            local log_raw = Engine.exec_git("log -1 --format='%h%x09%s' " .. rname)
-            local sha, subj = log_raw:match("^(%x+)%s*(.*)$")
-            table.insert(branches, {
+        local rname, sha, subj = line:match("^([^|]+)|([^|]*)|(.*)$")
+        if rname and not rname:find("%->") and rname:find("/") then
+            table.insert(remotes, {
                 name = rname,
                 is_head = false,
                 is_remote = true,
@@ -468,8 +506,18 @@ function Engine.load_all_branches()
             })
         end
     end
+    return remotes
+end
 
-    return branches, head_branch
+function Engine.load_all_branches(include_remotes)
+    local local_b, head_branch, merged_set = Engine.load_local_branches()
+    local all_b = {}
+    for _, b in ipairs(local_b) do table.insert(all_b, b) end
+    if include_remotes then
+        local remotes = Engine.load_remote_branches()
+        for _, b in ipairs(remotes) do table.insert(all_b, b) end
+    end
+    return all_b, head_branch, merged_set
 end
 
 function Engine.get_branch_log(branch_name, limit)
@@ -560,14 +608,21 @@ local function run_tui(init_opts)
         status_msg = "",
         status_type = "ok", -- "ok", "error", "warn"
         selected_set = {},  -- Multi-selection map: { [branch_name] = true }
+        remotes_loaded = false,
         cached_logs = {},
         confirm_callback = nil,
         input_buf = "",
         input_prompt = "",
     }
 
-    local function refresh_data()
-        state.all_branches, state.head_branch = Engine.load_all_branches()
+    local function refresh_data(include_remotes)
+        if include_remotes == nil then
+            include_remotes = (state.tab_idx == 3 or state.tab_idx == 4)
+        end
+        state.all_branches, state.head_branch = Engine.load_all_branches(include_remotes)
+        if include_remotes then
+            state.remotes_loaded = true
+        end
         state.cached_logs = {}
     end
 
@@ -967,9 +1022,15 @@ local function run_tui(init_opts)
             elseif key == "h" or key == "LEFT" then
                 state.tab_idx = state.tab_idx - 1
                 if state.tab_idx < 1 then state.tab_idx = #TABS end
+                if (state.tab_idx == 3 or state.tab_idx == 4) and not state.remotes_loaded then
+                    refresh_data(true)
+                end
                 apply_filter()
             elseif key == "l" or key == "RIGHT" then
                 state.tab_idx = (state.tab_idx % #TABS) + 1
+                if (state.tab_idx == 3 or state.tab_idx == 4) and not state.remotes_loaded then
+                    refresh_data(true)
+                end
                 apply_filter()
             elseif key == "TAB" or key == "SPACE" then
                 -- Toggle multi-selection on current item
@@ -1229,10 +1290,21 @@ local function run_tests()
     -- Test 8: Git repo detection
     assert_eq("Engine.is_inside_git_repo returns boolean", type(Engine.is_inside_git_repo()), "boolean")
 
-    -- Test 9: Live branches loading
-    local branches, head = Engine.load_all_branches()
-    assert_eq("Engine.load_all_branches returns list", type(branches), "table")
-    print(string.format("  [INFO] Discovered %d total branches in current repository (HEAD: %s).", #branches, tostring(head)))
+    -- Test 9: Fast ref line parsing
+    local r1 = "*|master|35336cd|origin/master|[ahead 1, behind 2]|feat: commit"
+    local parsed_ref = Engine.parse_ref_line(r1, { master = true })
+    assert_eq("parse_ref_line name is master", parsed_ref.name, "master")
+    assert_eq("parse_ref_line is_head is true", parsed_ref.is_head, true)
+    assert_eq("parse_ref_line ahead is 1", parsed_ref.ahead, 1)
+    assert_eq("parse_ref_line behind is 2", parsed_ref.behind, 2)
+    assert_eq("parse_ref_line is_merged is true", parsed_ref.is_merged, true)
+
+    -- Test 10: Live branches loading (fast local and full with remotes)
+    local local_b, head_l = Engine.load_local_branches()
+    assert_eq("Engine.load_local_branches returns list", type(local_b), "table")
+    local all_b, head_a = Engine.load_all_branches(true)
+    assert_eq("Engine.load_all_branches(true) returns list", type(all_b), "table")
+    print(string.format("  [INFO] Discovered %d local branches, %d total branches (HEAD: %s).", #local_b, #all_b, tostring(head_l)))
 
     print(string.format("\nSelf-test summary: %d passed, %d failed.", passed, failed))
     if failed > 0 then os.exit(1) end
