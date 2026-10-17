@@ -701,26 +701,58 @@ function Engine.exec(cmd)
     return out or ""
 end
 
+local _git_info_cached = nil
+
+function Engine.get_git_info()
+    if _git_info_cached ~= nil then
+        return _git_info_cached
+    end
+
+    local raw = Engine.exec("git rev-parse --is-inside-work-tree --show-toplevel --abbrev-ref HEAD 2>/dev/null")
+    local lines = {}
+    for line in raw:gmatch("[^\r\n]+") do
+        table.insert(lines, trim(line))
+    end
+
+    if #lines >= 1 and lines[1] == "true" then
+        local top = lines[2] or ""
+        local repo = top:match("([^/\\]+)$") or (top ~= "" and top or "workspace")
+        local branch = lines[3] or "HEAD"
+        if branch == "HEAD" or #branch == 0 then
+            local short_sha = trim(Engine.exec("git rev-parse --short HEAD 2>/dev/null"))
+            branch = #short_sha > 0 and short_sha or "detached"
+        end
+        _git_info_cached = {
+            is_git = true,
+            repo_name = repo,
+            branch_name = branch,
+            toplevel = top,
+        }
+    else
+        local cwd = Engine.exec(IS_WINDOWS and "cd" or "pwd")
+        cwd = trim(cwd):gsub("\\", "/")
+        local folder = cwd:match("([^/]+)$") or "workspace"
+        _git_info_cached = {
+            is_git = false,
+            repo_name = folder,
+            branch_name = "",
+            toplevel = "",
+        }
+    end
+
+    return _git_info_cached
+end
+
 function Engine.is_inside_git_repo()
-    local res = Engine.exec("git rev-parse --is-inside-work-tree")
-    return trim(res) == "true"
+    return Engine.get_git_info().is_git
 end
 
 function Engine.get_repo_name()
-    local res = Engine.exec("git rev-parse --show-toplevel")
-    res = trim(res)
-    if #res == 0 then return "workspace" end
-    return res:match("([^/\\]+)$") or res
+    return Engine.get_git_info().repo_name
 end
 
 function Engine.get_git_branch()
-    local res = Engine.exec("git rev-parse --abbrev-ref HEAD")
-    res = trim(res)
-    if #res == 0 or res == "HEAD" then
-        local short_sha = trim(Engine.exec("git rev-parse --short HEAD"))
-        return #short_sha > 0 and short_sha or "detached"
-    end
-    return res
+    return Engine.get_git_info().branch_name
 end
 
 local function to_wide(str)
@@ -844,11 +876,25 @@ function Engine.get_file_preview(filepath, max_lines)
     return lines, count, false
 end
 
+function Engine.get_file_size(item)
+    if not item then return 0 end
+    if item.size == nil then
+        local f = io.open(item.path, "rb")
+        item.size = f and f:seek("end") or 0
+        if f then f:close() end
+    end
+    return item.size
+end
+
 -- Heavy directory names to prune during recursive directory traversal
 local IGNORED_DIRS = {
     [".git"] = true,
     ["node_modules"] = true,
     [".cache"] = true,
+    ["__pycache__"] = true,
+    [".venv"] = true,
+    ["venv"] = true,
+    [".cargo"] = true,
     ["target"] = true,
     ["build"] = true,
     ["dist"] = true,
@@ -915,13 +961,10 @@ function Engine.scan_native(base_dir, max_files)
                             scan_dir(rel_path, depth + 1)
                         end
                     else
-                        local f = io.open(rel_path, "rb")
-                        local sz = f and f:seek("end") or 0
-                        if f then f:close() end
                         table.insert(files, {
                             path = rel_path,
                             name = name,
-                            size = sz,
+                            size = nil, -- Resolved lazily
                             ext = get_extension(name),
                         })
                     end
@@ -948,14 +991,10 @@ function Engine.load_files(include_hidden)
             if #line > 0 and not seen[line] then
                 seen[line] = true
                 local name = line:match("([^/\\]+)$") or line
-                local f = io.open(line, "rb")
-                local sz = f and f:seek("end") or 0
-                if f then f:close() end
-
                 table.insert(files, {
                     path = line:gsub("\\", "/"),
                     name = name,
-                    size = sz,
+                    size = nil, -- Resolved lazily on-demand
                     ext = get_extension(name),
                     is_git = true,
                 })
@@ -968,9 +1007,9 @@ function Engine.load_files(include_hidden)
 
     -- 2. Try fd / fdfind
     local fd_cmd = nil
-    if #Engine.exec("fd --version") > 0 then
+    if #Engine.exec("fd --version 2>/dev/null") > 0 then
         fd_cmd = "fd --type f" .. (include_hidden and " --hidden" or "") .. " --exclude .git --exclude node_modules --exclude target"
-    elseif #Engine.exec("fdfind --version") > 0 then
+    elseif #Engine.exec("fdfind --version 2>/dev/null") > 0 then
         fd_cmd = "fdfind --type f" .. (include_hidden and " --hidden" or "") .. " --exclude .git --exclude node_modules --exclude target"
     end
 
@@ -981,14 +1020,10 @@ function Engine.load_files(include_hidden)
             if #line > 0 and not seen[line] then
                 seen[line] = true
                 local name = line:match("([^/\\]+)$") or line
-                local f = io.open(line, "rb")
-                local sz = f and f:seek("end") or 0
-                if f then f:close() end
-
                 table.insert(files, {
                     path = line:gsub("\\", "/"),
                     name = name,
-                    size = sz,
+                    size = nil, -- Resolved lazily on-demand
                     ext = get_extension(name),
                 })
             end
@@ -1009,7 +1044,7 @@ function Engine.load_git_files()
         return git_files
     end
 
-    local raw = Engine.exec("git status --porcelain=v1 -uall")
+    local raw = Engine.exec("git status --porcelain=v1 -unormal")
     for line in raw:gmatch("[^\r\n]+") do
         local status, fpath = line:match("^(..)%s+(.*)$")
         if status and fpath then
@@ -1020,9 +1055,6 @@ function Engine.load_git_files()
             end
             fpath = fpath:gsub('^"', ''):gsub('"$', '')
             local name = fpath:match("([^/\\]+)$") or fpath
-            local f = io.open(fpath, "rb")
-            local sz = f and f:seek("end") or 0
-            if f then f:close() end
 
             local stat_label = "[Modified]"
             if status:find("?") then stat_label = "[Untracked]"
@@ -1034,7 +1066,7 @@ function Engine.load_git_files()
             table.insert(git_files, {
                 path = fpath:gsub("\\", "/"),
                 name = name,
-                size = sz,
+                size = nil, -- Resolved lazily on-demand
                 ext = get_extension(name),
                 git_status = stat_label,
             })
@@ -1055,22 +1087,17 @@ function Engine.load_recent_files(all_files)
             if #line > 0 and not seen[line] then
                 seen[line] = true
                 local name = line:match("([^/\\]+)$") or line
-                local f = io.open(line, "rb")
-                if f then
-                    local sz = f:seek("end") or 0
-                    f:close()
-                    table.insert(recent, {
-                        path = line:gsub("\\", "/"),
-                        name = name,
-                        size = sz,
-                        ext = get_extension(name),
-                    })
-                end
+                table.insert(recent, {
+                    path = line:gsub("\\", "/"),
+                    name = name,
+                    size = nil, -- Resolved lazily on-demand
+                    ext = get_extension(name),
+                })
             end
         end
     end
 
-    if #recent == 0 then
+    if #recent == 0 and all_files then
         -- Fallback: first 30 files from all_files
         for i = 1, math.min(30, #all_files) do
             table.insert(recent, all_files[i])
@@ -1112,9 +1139,9 @@ local function run_tui(init_opts)
     Term.init()
 
     local state = {
-        files = {},
-        git_files = {},
-        recent_files = {},
+        files = nil,
+        git_files = nil,
+        recent_files = nil,
         filtered = {},
         repo_name = Engine.get_repo_name(),
         branch_name = Engine.get_git_branch(),
@@ -1130,29 +1157,42 @@ local function run_tui(init_opts)
         status_type = "ok",
     }
 
-    local function refresh_data()
-        state.files = Engine.load_files(init_opts.show_all)
-        state.git_files = Engine.load_git_files()
-        state.recent_files = Engine.load_recent_files(state.files)
-        state.cached_previews = {}
-    end
-
     local function get_current_tab_list()
         local tab = TABS[state.tab_idx]
         if tab == "git" then
+            if not state.git_files then
+                state.git_files = Engine.load_git_files()
+            end
             return state.git_files
         elseif tab == "recent" then
+            if not state.recent_files then
+                if not state.files then
+                    state.files = Engine.load_files(init_opts.show_all)
+                end
+                state.recent_files = Engine.load_recent_files(state.files)
+            end
             return state.recent_files
         else
+            if not state.files then
+                state.files = Engine.load_files(init_opts.show_all)
+            end
             return state.files
         end
     end
 
+    local function refresh_data()
+        state.files = nil
+        state.git_files = nil
+        state.recent_files = nil
+        state.cached_previews = {}
+        get_current_tab_list()
+    end
+
     local function apply_filter()
-        local list = {}
-        local src = get_current_tab_list()
+        local src = get_current_tab_list() or {}
 
         if #state.filter > 0 then
+            local list = {}
             for _, item in ipairs(src) do
                 local s1 = fuzzy_score(state.filter, item.name)
                 local s2 = fuzzy_score(state.filter, item.path)
@@ -1167,16 +1207,13 @@ local function run_tui(init_opts)
                 table.insert(state.filtered, it.item)
             end
         else
-            state.filtered = {}
-            for _, it in ipairs(src) do
-                table.insert(state.filtered, it)
-            end
+            state.filtered = src
         end
 
         state.cursor = math.max(1, math.min(state.cursor, #state.filtered))
     end
 
-    refresh_data()
+    get_current_tab_list()
     apply_filter()
 
     local prev_lines = {}
@@ -1210,8 +1247,10 @@ local function run_tui(init_opts)
         -- 2. Subheader Tabs & Filter
         local tabs_str = ""
         for i, t in ipairs(TABS) do
-            local cnt = (t == "git") and #state.git_files or ((t == "recent") and #state.recent_files or #state.files)
-            local label = string.format("%s (%d)", TAB_LABELS[t], cnt)
+            local cnt = (t == "git" and state.git_files and #state.git_files)
+                     or (t == "recent" and state.recent_files and #state.recent_files)
+                     or (t == "files" and state.files and #state.files)
+            local label = cnt and string.format("%s (%d)", TAB_LABELS[t], cnt) or TAB_LABELS[t]
 
             if i == state.tab_idx then
                 tabs_str = tabs_str .. C.inverse .. C.b_cyan .. "[" .. label .. "]" .. C.reset .. " "
@@ -1277,7 +1316,7 @@ local function run_tui(init_opts)
             end
 
             local prev_data = state.cached_previews[cur_item.path]
-            local meta_str = string.format("  Size: %s │ Lines: %d", format_size(cur_item.size), prev_data.total_lines)
+            local meta_str = string.format("  Size: %s │ Lines: %d", format_size(Engine.get_file_size(cur_item)), prev_data.total_lines)
             if cur_item.git_status then
                 meta_str = meta_str .. " │ Status: " .. cur_item.git_status
             end
@@ -1319,7 +1358,7 @@ local function run_tui(init_opts)
                 local chk = is_checked and (C.b_green .. "[x]" .. C.reset .. bg) or (C.gray .. "[ ]" .. C.reset .. bg)
 
                 -- Size pill
-                local sz_str = string.format("[%s]", format_size(item.size))
+                local sz_str = string.format("[%s]", format_size(Engine.get_file_size(item)))
                 local sz_pill = C.b_blue .. sz_str .. C.reset .. bg
 
                 -- File name & relative path
@@ -1601,6 +1640,15 @@ local function run_tests()
     assert_eq("highlight_syntax highlights python keyword", py_hl:find("def") ~= nil and py_hl:find("\27%[") ~= nil, true)
     local py_comm = highlight_syntax("# A comment", "py")
     assert_eq("highlight_syntax highlights python comment", py_comm:find("\27%[90m") ~= nil, true)
+
+    -- Test 11: Lazy file size and git info
+    local test_item = { path = "bin/fe.lua" }
+    local sz1 = Engine.get_file_size(test_item)
+    assert_eq("get_file_size returns positive integer", sz1 > 0, true)
+    assert_eq("get_file_size caches size on item table", test_item.size == sz1, true)
+    local git_inf = Engine.get_git_info()
+    assert_eq("get_git_info returns table with is_git", type(git_inf.is_git), "boolean")
+    assert_eq("get_git_info returns repo_name", type(git_inf.repo_name), "string")
 
     print(string.format("\nSelf-test summary: %d passed, %d failed.", passed, failed))
     if failed > 0 then os.exit(1) end
