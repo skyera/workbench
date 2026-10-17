@@ -337,9 +337,16 @@ function Term.read_key()
         elseif ch == 27 then return "ESC"
         elseif ch == 8 then return "BACKSPACE"
         elseif ch == 9 then return "TAB"
+        elseif ch == 2 then return "CTRL_B"
         elseif ch == 3 then return "CTRL_C"
         elseif ch == 4 then return "CTRL_D"
+        elseif ch == 5 then return "CTRL_E"
+        elseif ch == 6 then return "CTRL_F"
+        elseif ch == 14 then return "CTRL_N"
+        elseif ch == 16 then return "CTRL_P"
         elseif ch == 21 then return "CTRL_U"
+        elseif ch == 23 then return "CTRL_W"
+        elseif ch == 25 then return "CTRL_Y"
         elseif ch == 32 then return "SPACE"
         end
         return string.char(ch)
@@ -409,12 +416,26 @@ function Term.read_key()
                     k = "BACKSPACE"
                 elseif b == 9 then
                     k = "TAB"
+                elseif b == 2 then
+                    k = "CTRL_B"
                 elseif b == 3 then
                     k = "CTRL_C"
                 elseif b == 4 then
                     k = "CTRL_D"
+                elseif b == 5 then
+                    k = "CTRL_E"
+                elseif b == 6 then
+                    k = "CTRL_F"
+                elseif b == 14 then
+                    k = "CTRL_N"
+                elseif b == 16 then
+                    k = "CTRL_P"
                 elseif b == 21 then
                     k = "CTRL_U"
+                elseif b == 23 then
+                    k = "CTRL_W"
+                elseif b == 25 then
+                    k = "CTRL_Y"
                 elseif b == 32 then
                     k = "SPACE"
                 elseif b >= 32 and b <= 126 then
@@ -440,6 +461,14 @@ end
 local function trim(s)
     if not s then return "" end
     return s:match("^%s*(.-)%s*$") or ""
+end
+
+local function delete_word(s)
+    if not s or #s == 0 then return "" end
+    s = s:gsub("%s+$", "")
+    s = s:gsub("/+$", "")
+    s = s:gsub("[^%s/]+$", "")
+    return s
 end
 
 local function pad_right(s, w)
@@ -1150,11 +1179,15 @@ local function run_tui(init_opts)
         mode = "normal", -- "normal", "filter"
         tab_idx = init_opts.start_tab or 1,
         cursor = 1,
+        prev_cursor = 1,
         scroll = 1,
         selected_set = {}, -- { [filepath] = true }
         cached_previews = {},
         status_msg = "",
         status_type = "ok",
+        preview_scroll = 0,
+        pending_op = nil,
+        body_h = 10,
     }
 
     local function get_current_tab_list()
@@ -1278,10 +1311,16 @@ local function run_tui(init_opts)
 
         -- 3. Pane Geometry
         local body_h = math.max(4, rows - 5)
+        state.body_h = body_h
         local left_w = math.floor(cols * 0.48)
         if cols < 90 then left_w = cols - 2 end
         -- Enforce strict 1-column safety buffer before right terminal edge
         local right_w = math.max(0, cols - left_w - 4)
+
+        if state.cursor ~= state.prev_cursor then
+            state.preview_scroll = 0
+            state.prev_cursor = state.cursor
+        end
 
         -- Adjust scroll viewport
         if #state.filtered <= body_h then
@@ -1298,7 +1337,8 @@ local function run_tui(init_opts)
         -- Header divider
         local raw_hdr = pad_to_width(string.format("  %-3s  %-8s  %s", "SEL", "SIZE", "FILE PATH"), left_w)
         local list_hdr = C.b_blue .. C.bold .. raw_hdr .. C.reset
-        local right_title = cur_item and truncate(" 📄 PREVIEW: " .. cur_item.path, math.max(10, right_w - 2)) or " 📄 FILE PREVIEW"
+        local scroll_hint = (state.preview_scroll > 0) and string.format(" (+%d lines)", state.preview_scroll) or ""
+        local right_title = cur_item and truncate(" 📄 PREVIEW: " .. cur_item.path .. scroll_hint, math.max(10, right_w - 2)) or " 📄 FILE PREVIEW"
         local right_hdr = (cols >= 90) and (C.b_white .. C.bold .. right_title .. C.reset) or ""
         local hdr_sep = (cols >= 90) and (C.gray .. "│" .. C.reset) or ""
         add_line(list_hdr .. " " .. hdr_sep .. " " .. right_hdr)
@@ -1307,7 +1347,7 @@ local function run_tui(init_opts)
         local r_lines = {}
         if cols >= 90 and cur_item then
             if not state.cached_previews[cur_item.path] then
-                local lines, total_lines, is_binary = Engine.get_file_preview(cur_item.path, body_h + 10)
+                local lines, total_lines, is_binary = Engine.get_file_preview(cur_item.path, 300)
                 state.cached_previews[cur_item.path] = {
                     lines = lines,
                     total_lines = total_lines,
@@ -1331,13 +1371,18 @@ local function run_tui(init_opts)
                 table.insert(r_lines, "")
                 table.insert(r_lines, C.gray .. "  (Empty file)" .. C.reset)
             else
-                for l_idx, line_txt in ipairs(prev_data.lines) do
-                    local line_num = string.format("%4d │ ", l_idx)
-                    local avail_w = math.max(4, right_w - 9)
-                    local clean_line = line_txt:gsub("\t", "    ")
-                    local disp_line = truncate(clean_line, avail_w)
-                    local hl_line = highlight_syntax(disp_line, cur_item.ext)
-                    table.insert(r_lines, C.gray .. line_num .. C.reset .. hl_line .. C.reset)
+                local prev_offset = state.preview_scroll or 0
+                for row_idx = 1, math.max(1, body_h - 2) do
+                    local l_idx = prev_offset + row_idx
+                    local line_txt = prev_data.lines[l_idx]
+                    if line_txt then
+                        local line_num = string.format("%4d │ ", l_idx)
+                        local avail_w = math.max(4, right_w - 9)
+                        local clean_line = line_txt:gsub("\t", "    ")
+                        local disp_line = truncate(clean_line, avail_w)
+                        local hl_line = highlight_syntax(disp_line, cur_item.ext)
+                        table.insert(r_lines, C.gray .. line_num .. C.reset .. hl_line .. C.reset)
+                    end
                 end
             end
         end
@@ -1396,12 +1441,15 @@ local function run_tui(init_opts)
         if #state.status_msg > 0 then
             local col = (state.status_type == "ok") and C.b_green or C.b_red
             status_disp = col .. C.bold .. " " .. state.status_msg .. C.reset
+        elseif state.pending_op == "z" then
+            status_disp = string.format(" %s%sz-%s (press %sz%s:center  %st%s:top  %sb%s:bottom)",
+                sel_indicator, C.b_yellow, C.gray, C.b_cyan, C.gray, C.b_cyan, C.gray, C.b_cyan, C.reset)
         elseif state.mode == "filter" then
-            status_disp = string.format(" %s%sEnter%s:Lock filter  %sTab%s:Select & down  %s↑/↓%s:Move  %sEsc%s:Normal mode",
+            status_disp = string.format(" %s%sEnter%s:Lock filter  %sTab%s:Select & down  %s↑/↓/^N/^P%s:Move  %sEsc%s:Normal mode",
                 sel_indicator,
                 C.b_yellow, C.gray, C.b_green, C.gray, C.b_cyan, C.gray, C.b_red, C.reset)
         else
-            status_disp = string.format(" %s%sEnter%s:Edit(tabs)  %so%s:Split  %sTab/Space%s:Select  %s/%s:Filter  %sh/l%s:Tabs  %sq%s:Quit",
+            status_disp = string.format(" %s%sEnter%s:Edit(tabs)  %so%s:Split  %sTab/Space%s:Select  %sj/k/^d/^u%s:Move  %s/%s:Filter  %sq%s:Quit",
                 sel_indicator,
                 C.b_yellow, C.gray, C.b_cyan, C.gray, C.b_green, C.gray, C.b_yellow, C.gray, C.b_cyan, C.gray, C.b_red, C.reset)
         end
@@ -1507,10 +1555,13 @@ local function run_tui(init_opts)
                 elseif key == "CTRL_U" then
                     state.filter = ""
                     apply_filter()
-                elseif key == "UP" then
-                    state.cursor = math.max(1, state.cursor - 1)
-                elseif key == "DOWN" then
+                elseif key == "CTRL_W" then
+                    state.filter = delete_word(state.filter)
+                    apply_filter()
+                elseif key == "CTRL_N" or key == "DOWN" then
                     state.cursor = math.min(math.max(1, #state.filtered), state.cursor + 1)
+                elseif key == "CTRL_P" or key == "UP" then
+                    state.cursor = math.max(1, state.cursor - 1)
                 elseif #key == 1 then
                     state.filter = state.filter .. key
                     apply_filter()
@@ -1518,7 +1569,18 @@ local function run_tui(init_opts)
 
             -- Normal navigation mode
             else
-                if key == "ESC" then
+                if state.pending_op == "z" then
+                    if key == "z" then
+                        state.scroll = math.max(1, math.min(math.max(1, #state.filtered - state.body_h + 1), state.cursor - math.floor(state.body_h / 2)))
+                    elseif key == "t" then
+                        state.scroll = math.max(1, math.min(math.max(1, #state.filtered - state.body_h + 1), state.cursor))
+                    elseif key == "b" then
+                        state.scroll = math.max(1, math.min(math.max(1, #state.filtered - state.body_h + 1), state.cursor - state.body_h + 1))
+                    end
+                    state.pending_op = nil
+                elseif key == "z" then
+                    state.pending_op = "z"
+                elseif key == "ESC" then
                     if #state.filter > 0 then
                         state.filter = ""
                         apply_filter()
@@ -1529,16 +1591,36 @@ local function run_tui(init_opts)
                 elseif key == "/" then
                     state.prev_filter = state.filter
                     state.mode = "filter"
-                elseif key == "j" or key == "DOWN" then
+                elseif key == "j" or key == "DOWN" or key == "CTRL_N" then
                     state.cursor = math.min(math.max(1, #state.filtered), state.cursor + 1)
-                elseif key == "k" or key == "UP" then
+                elseif key == "k" or key == "UP" or key == "CTRL_P" then
                     state.cursor = math.max(1, state.cursor - 1)
-                elseif key == "PGDN" then
-                    local _, rows = Term.get_size()
-                    state.cursor = math.min(math.max(1, #state.filtered), state.cursor + math.max(1, rows - 7))
-                elseif key == "PGUP" then
-                    local _, rows = Term.get_size()
-                    state.cursor = math.max(1, state.cursor - math.max(1, rows - 7))
+                elseif key == "CTRL_D" then
+                    local half = math.max(1, math.floor(state.body_h / 2))
+                    state.cursor = math.min(math.max(1, #state.filtered), state.cursor + half)
+                elseif key == "CTRL_U" then
+                    local half = math.max(1, math.floor(state.body_h / 2))
+                    state.cursor = math.max(1, state.cursor - half)
+                elseif key == "CTRL_F" or key == "PGDN" then
+                    local page = math.max(1, state.body_h)
+                    state.cursor = math.min(math.max(1, #state.filtered), state.cursor + page)
+                elseif key == "CTRL_B" or key == "PGUP" then
+                    local page = math.max(1, state.body_h)
+                    state.cursor = math.max(1, state.cursor - page)
+                elseif key == "H" then
+                    state.cursor = math.max(1, math.min(#state.filtered, state.scroll))
+                elseif key == "M" then
+                    state.cursor = math.max(1, math.min(#state.filtered, state.scroll + math.floor((state.body_h - 1) / 2)))
+                elseif key == "L" then
+                    state.cursor = math.max(1, math.min(#state.filtered, state.scroll + state.body_h - 1))
+                elseif key == "CTRL_E" then
+                    local cur = state.filtered[state.cursor]
+                    local p_lines = (cur and state.cached_previews[cur.path] and state.cached_previews[cur.path].lines) or {}
+                    if state.preview_scroll + 1 < #p_lines then
+                        state.preview_scroll = state.preview_scroll + 1
+                    end
+                elseif key == "CTRL_Y" then
+                    state.preview_scroll = math.max(0, state.preview_scroll - 1)
                 elseif key == "g" or key == "HOME" then
                     state.cursor = 1
                 elseif key == "G" or key == "END" then
@@ -1674,6 +1756,12 @@ local function run_tests()
     local git_inf = Engine.get_git_info()
     assert_eq("get_git_info returns table with is_git", type(git_inf.is_git), "boolean")
     assert_eq("get_git_info returns repo_name", type(git_inf.repo_name), "string")
+    -- Test 12: Delete word helper
+    assert_eq("delete_word removes trailing file name", delete_word("bin/fe.lua"), "bin/")
+    assert_eq("delete_word removes trailing slash and directory", delete_word("bin/"), "")
+    assert_eq("delete_word removes trailing word with space", delete_word("foo bar"), "foo ")
+    assert_eq("delete_word with trailing spaces", delete_word("foo bar   "), "foo ")
+    assert_eq("delete_word empty string", delete_word(""), "")
 
     print(string.format("\nSelf-test summary: %d passed, %d failed.", passed, failed))
     if failed > 0 then os.exit(1) end
@@ -1697,15 +1785,19 @@ Options:
   -h, --help           Show this help message
 
 Interactive Controls:
-  j / k, Up / Down     Move cursor
-  h / l, Left / Right  Switch context tabs ([All Files], [Git Changes], [Recent])
-  Tab / Space          Toggle multi-select checkbox [x] (also in filter mode)
-  Enter                In filter: lock filter; In normal: open in editor (tabs: -p)
-  o                    Open selected file(s) in vertical splits (-O)
-  /                    Filter / search files
-  PgUp / PgDn          Page scroll
-  g / G, Home / End    Jump to first / last file
-  q / Esc              Exit / Clear filter]])
+  j / k, Up / Down, ^N / ^P   Move cursor down / up (also ^N / ^P in filter)
+  ^d / ^u                     Half-page scroll down / up
+  ^f / ^b, PgDn / PgUp        Full-page scroll down / up
+  H / M / L                   Jump to High (top), Middle, Low of visible screen
+  g / G, Home / End           Jump to first / last file (or gg)
+  zz / zt / zb                Center / Top / Bottom align cursor in view
+  ^e / ^y                     Scroll file preview pane down / up
+  h / l, Left / Right         Switch context tabs ([All Files], [Git Changes], [Recent])
+  Tab / Space                 Toggle multi-select checkbox [x] (also in filter mode)
+  Enter                       In filter: lock filter; In normal: open in editor (tabs: -p)
+  o                           Open selected file(s) in vertical splits (-O)
+  /                           Filter / search files (^W delete word, ^U clear)
+  q / Esc                     Exit / Clear filter]])
 end
 
 --------------------------------------------------------------------------------
