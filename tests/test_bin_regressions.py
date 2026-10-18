@@ -2,6 +2,7 @@
 
 Exercise the real Lua code with temporary Git repositories and transfer stubs.
 No SSH connections or changes to the caller's repository are made.
+Windows transfer fixtures require MinGW GCC/Clang or an MSVC developer shell.
 """
 
 import json
@@ -17,37 +18,80 @@ ROOT = Path(__file__).resolve().parents[1]
 LUAJIT = shutil.which("luajit")
 
 
-@unittest.skipUnless(LUAJIT and shutil.which("git") and os.name == "posix",
-                     "requires LuaJIT, Git, and POSIX executable stubs")
+@unittest.skipUnless(LUAJIT and shutil.which("git"), "requires LuaJIT and Git")
 class BinRegressions(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.windows_stub = None
+        if os.name != "nt":
+            return
+        compiler = next((shutil.which(name) for name in ("gcc", "cl", "clang")
+                         if shutil.which(name)), None)
+        if not compiler:
+            raise RuntimeError("Windows transfer tests require a C compiler. "
+                               "Install MinGW GCC/Clang or run from an MSVC developer shell.")
+        build = tempfile.TemporaryDirectory(prefix="transfer-stub-build-")
+        cls.addClassCleanup(build.cleanup)
+        cls.windows_stub = Path(build.name) / "transfer.exe"
+        source = ROOT / "tests/windows_transfer_stub.c"
+        if Path(compiler).stem.lower() == "cl":
+            command = [compiler, "/nologo", str(source), "/Fe:" + str(cls.windows_stub)]
+        else:
+            command = [compiler, "-municode", str(source), "-o", str(cls.windows_stub)]
+        result = subprocess.run(command, cwd=build.name, capture_output=True,
+                                text=True, encoding="utf-8", errors="replace", timeout=60)
+        if result.returncode:
+            raise RuntimeError("Cannot compile Windows transfer fixture:\n"
+                               + result.stdout + result.stderr)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="bin-regression-")
         self.addCleanup(self.temp.cleanup)
         self.cwd = Path(self.temp.name)
-        self.env = dict(os.environ, HOME=str(self.cwd), LC_ALL="C",
+        self.env = dict(os.environ, HOME=str(self.cwd), USERPROFILE=str(self.cwd), LC_ALL="C",
                         PATH=str(self.cwd) + os.pathsep + os.environ["PATH"])
+        self.env.pop("REVIEW_TRANSFER_FAIL", None)
         self.capture = self.cwd / "arguments.json"
         self.env["REVIEW_ARGV_FILE"] = str(self.capture)
         for name in ("rsync", "scp"):
+            if self.windows_stub:
+                shutil.copyfile(self.windows_stub, self.cwd / (name + ".exe"))
+                continue
             stub = self.cwd / name
             stub.write_text(
                 "#!/usr/bin/env python3\n"
                 "import json, os, sys\n"
                 "with open(os.environ['REVIEW_ARGV_FILE'], 'w') as f:\n"
                 "    json.dump(sys.argv[1:], f)\n"
+                "if os.environ.get('REVIEW_TRANSFER_FAIL'):\n"
+                "    print('permission denied', file=sys.stderr)\n"
+                "    sys.exit(17)\n"
             )
             stub.chmod(0o755)
 
     def lua(self, name, *args, driver=None):
         command = [LUAJIT, str(ROOT / "bin" / (name + ".lua")), *args]
         source = None
-        if driver is not None:
+        if driver is not None or name == "fscp":
             # Expose the existing local engine to a test driver without changing
             # the production entry point or launching the interactive UI.
             source = (ROOT / "bin" / (name + ".lua")).read_text(encoding="utf-8")
             entry = "main(...)" if name == "fscp" else "main(arg)"
-            source = source.rsplit(entry, 1)[0] + driver
-            command = [LUAJIT, "-"]
+            source = source.rsplit(entry, 1)[0]
+            if name == "fscp":
+                source += r'''
+-- Keep installed cwRsync files and saved host configuration outside the fixture.
+ensure_cwrsync_fstab = function() end
+local real_file_exists = file_exists
+file_exists = function(path)
+    if path:find("C:/ProgramData/chocolatey/", 1, true) == 1
+        or path:find("C:/tools/cwrsync/", 1, true) == 1
+        or path:find("C:/cygwin64/", 1, true) == 1 then return false end
+    return real_file_exists(path)
+end
+'''
+            source += driver if driver is not None else entry
+            command = [LUAJIT, "-", *args]
         return subprocess.run(command, input=source, cwd=self.cwd, env=self.env,
                               text=True, encoding="utf-8", capture_output=True, timeout=20)
 
@@ -100,8 +144,9 @@ class BinRegressions(unittest.TestCase):
         result = self.lua("fscp", "--rsync", "--pull", "-H", "review-host",
                           "-i", key, "-t", "/remote dir/report.txt")
         self.assertEqual(result.returncode, 0, result.stderr)
+        quote = '"' if os.name == "nt" else "'"
         self.assertEqual(json.loads(self.capture.read_text()),
-                         ["-avzP", "-e", "ssh -i '" + key + "'",
+                         ["-avzP", "-e", "ssh -i " + quote + key + quote,
                           "review-host:/remote dir/report.txt", "./"])
 
     def test_tui_rsync_upload_and_download_keep_shell_characters_literal(self):
@@ -169,8 +214,7 @@ assert(App.status_color == C.bright_green)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(self.capture.read_text()),
                          ["-r", "local dir/%PATH%!TEMP!& literal.txt", "review-host:/remote dir/"])
-        stub = self.cwd / "scp"
-        stub.write_text("#!/bin/sh\necho 'permission denied' >&2\nexit 17\n")
+        self.env["REVIEW_TRANSFER_FAIL"] = "1"
         failed = driver.replace("assert(App.status_color == C.bright_green)",
                                 'assert(App.status_color == C.bright_red)\n'
                                 'assert(App.status_msg:find("Transfer failed", 1, true))')
@@ -189,8 +233,9 @@ ok, _, out = Git.execute_worktree({type="local", name="master"}, "worktree")
 assert(not ok and out:find("not a git repository", 1, true), out)
 local succeeded, message = Git.run_command("exit 17")
 assert(not succeeded and message:find("failed", 1, true), message)
-succeeded, message = Git.run_command("printf '%05000d' 0")
-assert(succeeded and #message == 5000, "Long command output was truncated")
+succeeded, message = Git.run_command("echo " .. string.rep("x", 5000))
+assert(succeeded and message:match("^(x+)") == string.rep("x", 5000),
+    "Long command output was truncated")
 ''')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

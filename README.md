@@ -73,6 +73,20 @@ The [bin/](bin) directory includes utilities for:
 
 Many tools have platform-specific implementations in shell, batch, Lua, PowerShell, or Python. Check the selected script for its dependencies and options.
 
+## Running tests
+
+With Python 3, LuaJIT, and Git on `PATH`, run:
+
+```sh
+python -m unittest discover -s tests -v
+```
+
+On Windows, the transfer regression tests also need MinGW GCC/Clang on `PATH`
+or an MSVC developer shell. They compile a small native argument-capture fixture
+in a temporary directory. The tests use isolated Git repositories and transfer
+stubs; they do not connect to SSH servers. Windows junction tests run only on
+Windows.
+
 ## Personal Git settings
 
 [.gitconfig](.gitconfig) includes `~/.gitconfig.local` for machine-specific overrides, such as your commit identity:
