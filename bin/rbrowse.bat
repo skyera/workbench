@@ -1,5 +1,5 @@
 @echo off
-rem rbrowse.bat - Launch rbrowse.lua via LuaJIT on Windows
+rem rbrowse.bat - Backward-compatible shim for rfe.lua
 setlocal
 set "SCRIPT_DIR=%~dp0"
-luajit "%SCRIPT_DIR%rbrowse.lua" %*
+luajit "%SCRIPT_DIR%rfe.lua" %*

@@ -1,4 +1,4 @@
 #!/bin/sh
-# rbrowse.sh - Launch rbrowse.lua via LuaJIT
+# rbrowse.sh - Backward-compatible shim for rfe.lua
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-exec luajit "$SCRIPT_DIR/rbrowse.lua" "$@"
+exec luajit "$SCRIPT_DIR/rfe.lua" "$@"

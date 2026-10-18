@@ -141,7 +141,7 @@ ffi.cdef[[
   * Sub-millisecond FZF preview card generator (< 1 ms).
   * Interactive multi-select file picker with auto-fallback to native `scp`, `rsync`, or `pscp.exe`.
 
-### 4.5. `rbrowse.lua` (Interactive Remote Server Browser & Previewer)
+### 4.5. `rfe.lua` (Interactive Remote Server Browser & Previewer, alias `rbrowse`)
 * **Goal:** Real-time remote file tree browsing with live syntax-highlighted text and terminal image previewing.
 * **Capabilities:**
   * Dual-pane TUI running natively on Linux and Windows without external dependencies.

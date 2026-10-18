@@ -1,6 +1,6 @@
 #!/usr/bin/env luajit
 --[=[
-  rbrowse.lua - Ultra-fast Interactive Remote Server Browser & Previewer.
+  rfe.lua - Ultra-fast Interactive Remote Server Browser & Previewer.
   Powered by LuaJIT & FFI. Single-file, zero external Lua dependencies.
   Runs natively on Linux/POSIX and Windows (Win32 Console & Registry FFI).
 
@@ -17,11 +17,11 @@
     - CLI Preview Mode (--preview): For instant integration into fzf, lf, and ranger
 
   Usage:
-    luajit rbrowse.lua [OPTIONS] [USER@HOST[:REMOTE_PATH]]
-    luajit rbrowse.lua --demo
-    luajit rbrowse.lua --preview <HOST> <REMOTE_PATH> [WIDTH] [HEIGHT]
-    luajit rbrowse.lua --list <HOST> <REMOTE_PATH>
-    luajit rbrowse.lua --test
+    luajit rfe.lua [OPTIONS] [USER@HOST[:REMOTE_PATH]]
+    luajit rfe.lua --demo
+    luajit rfe.lua --preview <HOST> <REMOTE_PATH> [WIDTH] [HEIGHT]
+    luajit rfe.lua --list <HOST> <REMOTE_PATH>
+    luajit rfe.lua --test
 
   Options:
     -H, --host <HOST>       Remote SSH host (or saved PuTTY session)
@@ -1569,7 +1569,8 @@ local DemoContent = {
 export PATH="$HOME/bin:$PATH"
 export EDITOR="vim"
 alias ll='ls -la'
-alias rbrowse='rbrowse.sh'
+alias rfe='rfe.sh'
+alias rbrowse='rfe.sh'
 ]],
 
     ["/home/user/avatar.png"] = DEMO_PNG_BYTES,
@@ -1645,7 +1646,7 @@ Sep 13 12:00:01 prod-srv01 systemd[1]: Starting Daily apt download activities...
 Sep 13 12:00:05 prod-srv01 kernel: [ 4512.182012] TCP: request_sock_TCP: Possible SYN flooding on port 8080. Sending cookies.
 Sep 13 12:01:22 prod-srv01 sshd[4912]: Accepted publickey for user from 192.168.1.50 port 52314 ssh2
 Sep 13 12:01:23 prod-srv01 systemd[1]: Started Session 14 of User user.
-Sep 13 12:05:00 prod-srv01 rbrowse[5012]: Multiplexed SSH connection verified: socket active.
+Sep 13 12:05:00 prod-srv01 rfe[5012]: Multiplexed SSH connection verified: socket active.
 ]],
 }
 
@@ -1928,7 +1929,7 @@ function Crawler.get_ssh_cmd(host_cfg)
         parts[#parts+1] = "-o"
         parts[#parts+1] = "ControlMaster=auto"
         parts[#parts+1] = "-o"
-        parts[#parts+1] = "ControlPath=" .. socket_dir .. "/rbrowse-%r@%h:%p"
+        parts[#parts+1] = "ControlPath=" .. socket_dir .. "/rfe-%r@%h:%p"
         parts[#parts+1] = "-o"
         parts[#parts+1] = "ControlPersist=60s"
     end
@@ -2290,7 +2291,7 @@ function App.draw()
     else
         host_str = string.format("[%s@%s]", App.host_cfg.user or "root", App.host_cfg.hostname)
     end
-    local header_text = string.format(" %s%srbrowse v1.0%s │ %s%s%s │ Dir: %s%s%s │ Icons: %s%s%s ",
+    local header_text = string.format(" %s%srfe v1.0%s │ %s%s%s │ Dir: %s%s%s │ Icons: %s%s%s ",
         C.bold, C.bright_cyan, C.reset,
         C.bright_green, host_str, C.reset,
         C.bright_yellow, App.current_dir, C.reset,
@@ -2554,7 +2555,7 @@ function App.draw_help_modal()
     local mw = math.min(72, w - 4)
 
     local lines = {
-        C.bold .. C.bright_cyan .. "            rbrowse.lua - Keyboard Controls Guide           " .. C.reset,
+        C.bold .. C.bright_cyan .. "               rfe.lua - Keyboard Controls Guide            " .. C.reset,
         C.gray .. string.rep("─", mw - 4) .. C.reset,
         string.format("  %s%-18s%s %s", C.bold .. C.yellow, "j, Down / k, Up", C.reset, "Navigate files / scroll preview"),
         string.format("  %s%-18s%s %s", C.bold .. C.yellow, "g / Home, G / End", C.reset, "Jump to first / last item (or top/bottom)"),
@@ -2804,7 +2805,7 @@ end
 -- Automated Self-Test Suite (--test)
 --------------------------------------------------------------------------------
 local function run_tests()
-    print(C.bold .. C.bright_cyan .. "=== Running rbrowse.lua Automated Self-Tests ===" .. C.reset)
+    print(C.bold .. C.bright_cyan .. "=== Running rfe.lua Automated Self-Tests ===" .. C.reset)
 
     -- 1. Base64 Encode & Decode
     local test_str = "LuaJIT FFI Remote Browser 2026!"
@@ -3053,14 +3054,14 @@ end
 --------------------------------------------------------------------------------
 local function print_help()
     print([=[
-rbrowse.lua - Fast Interactive Remote Server Browser & Previewer (LuaJIT + FFI)
+rfe.lua - Fast Interactive Remote Server Browser & Previewer (LuaJIT + FFI)
 
 Usage:
-  luajit rbrowse.lua [OPTIONS] [USER@HOST[:REMOTE_PATH]]
-  luajit rbrowse.lua --demo
-  luajit rbrowse.lua --preview <HOST> <REMOTE_PATH> [WIDTH] [HEIGHT]
-  luajit rbrowse.lua --list <HOST> <REMOTE_PATH>
-  luajit rbrowse.lua --test
+  luajit rfe.lua [OPTIONS] [USER@HOST[:REMOTE_PATH]]
+  luajit rfe.lua --demo
+  luajit rfe.lua --preview <HOST> <REMOTE_PATH> [WIDTH] [HEIGHT]
+  luajit rfe.lua --list <HOST> <REMOTE_PATH>
+  luajit rfe.lua --test
 
 Options:
   -H, --host <HOST>       Remote SSH host

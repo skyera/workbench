@@ -31,10 +31,13 @@ class SelfTestRegressions(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("0 failed", result.stdout)
 
-    def test_rbrowse_forced_ffi_availability_and_engine_cycling(self):
+    def test_rfe_forced_ffi_availability_and_engine_cycling(self):
         # Test both platform branches without requiring a Windows host or
         # installing external image conversion utilities.
-        source = (ROOT / "bin/rbrowse.lua").read_text(encoding="utf-8").rsplit("main({ ... })", 1)[0]
+        target = ROOT / "bin/rfe.lua"
+        if not target.exists():
+            target = ROOT / "bin/rbrowse.lua"
+        source = target.read_text(encoding="utf-8").rsplit("main({ ... })", 1)[0]
         driver = r'''
 ImageRenderer.preferred_engine = "ffi"
 IS_WINDOWS = false

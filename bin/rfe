@@ -1,0 +1,4 @@
+#!/bin/sh
+# rfe - Launch rfe.lua via LuaJIT
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+exec luajit "$SCRIPT_DIR/rfe.lua" "$@"
