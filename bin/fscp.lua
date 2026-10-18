@@ -557,6 +557,12 @@ local function shell_escape(s)
     end
 end
 
+local function shell_command(args)
+    local escaped = {}
+    for i, value in ipairs(args) do escaped[i] = shell_escape(value) end
+    return table.concat(escaped, " ")
+end
+
 --------------------------------------------------------------------------------
 -- Local Filesystem Scanner (FFI Win32 / POSIX)
 --------------------------------------------------------------------------------
@@ -2566,8 +2572,8 @@ function App.execute_transfer(direction, items)
             end
 
             print("\nExecuting PSCP command:")
-            print(C.gray .. table.concat(p_cmd, " ") .. C.reset .. "\n")
-            local ret = os.execute(table.concat(p_cmd, " "))
+            print(C.gray .. shell_command(p_cmd) .. C.reset .. "\n")
+            local ret = os.execute(shell_command(p_cmd))
             print(string.format("\nTransfer process finished with exit code: %s", tostring(ret)))
         elseif use_rsync then
             ensure_cwrsync_fstab()
@@ -2575,7 +2581,7 @@ function App.execute_transfer(direction, items)
             local ssh_e = get_rsync_ssh_cmd(port, key)
             if ssh_e then
                 table.insert(r_cmd, "-e")
-                table.insert(r_cmd, string.format("%q", ssh_e))
+                table.insert(r_cmd, ssh_e)
             end
 
             if not is_upload then
@@ -2592,8 +2598,8 @@ function App.execute_transfer(direction, items)
             end
 
             print("\nExecuting Rsync command:")
-            print(C.gray .. table.concat(r_cmd, " ") .. C.reset .. "\n")
-            local ret = os.execute(table.concat(r_cmd, " "))
+            print(C.gray .. shell_command(r_cmd) .. C.reset .. "\n")
+            local ret = os.execute(shell_command(r_cmd))
             print(string.format("\nTransfer process finished with exit code: %s", tostring(ret)))
         else
             local port_opt = (port ~= "") and ("-P " .. port) or ""
