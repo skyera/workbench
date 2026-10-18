@@ -67,11 +67,43 @@ The GUI includes backup, diff, and restore controls. On systems where Python 3 i
 The [bin/](bin) directory includes utilities for:
 
 - Finding files and changing directories with interactive TUIs (`fe`, `fcd`, `frg`, `fvim`).
-- Connecting to hosts, copying files, and opening tunnels (`fssh`, `fscp`, `fssh_tunnel`).
+- Connecting to hosts, copying files, inspecting remote processes, and opening tunnels (`fssh`, `fscp`, `fremote`, `fssh_tunnel`).
 - Working with Git and source indexes (`fco`, `flog`, `fbr`, `dotag`).
 - Managing shell history, processes, clipboard access, and remote mounts (`fhist`, `fkill`, `osc52-yank`, `rsshfs`).
 
 Many tools have platform-specific implementations in shell, batch, Lua, PowerShell, or Python. Check the selected script for its dependencies and options.
+
+### Remote process inspector
+
+`fremote` runs on Windows and Linux clients and inspects Linux remote hosts over
+OpenSSH. It reuses SSH aliases, configuration, agents, keys, and jump hosts.
+The remote host needs Python 3 and a mounted `/proc`; the collector is streamed
+over SSH without installing remote files. Authentication uses keys or an agent
+(`BatchMode`); verify access with `ssh HOST` first, including host-key trust.
+
+```sh
+fremote centre
+fremote centre --sort ram --filter python
+fremote -J bastion centre
+fremote centre --list
+fremote --demo
+```
+
+With no host, a built-in picker uses `fssh` host discovery. Use `j`/`k` or arrows
+to move, `/` to filter by PID/user/name, `s` to sort, `t` for a process tree,
+and `[`/`]` to scroll the inspector. Tabs `1`–`4` show all processes, your
+processes, CPU order, or memory order. CPU usage is sampled between snapshots;
+100% means one occupied core, and the first sample shows `--`.
+
+Space marks processes. `d` requests SIGTERM and `K` requests SIGKILL; both need
+an explicit `y` confirmation and neither attempts elevation. Signalling requires
+remote Python 3.9+ and Linux pidfd support. The collector checks process start
+time after opening a pidfd to reject reused PIDs. Init and the monitoring session
+are protected. Disconnected snapshots remain visible, with process actions
+disabled. `r` refreshes a live session or reconnects a failed session; `q` exits.
+
+Deploy `fremote.lua`, `fremote_native.lua`, and `fremote_collector.py` together
+with the platform launcher. Existing deploy scripts copy these files from `bin`.
 
 ## Running tests
 
