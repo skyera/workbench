@@ -1942,6 +1942,76 @@ function Crawler.get_ssh_cmd(host_cfg)
     return table.concat(parts, " ")
 end
 
+local MONTH_NAMES = {
+    Jan = 1, Feb = 2, Mar = 3, Apr = 4, May = 5, Jun = 6,
+    Jul = 7, Aug = 8, Sep = 9, Oct = 10, Nov = 11, Dec = 12,
+}
+
+local function parse_ls_line(line)
+    if not line or line == "" then
+        return nil
+    end
+
+    if line:match("^total%s+%d+") or line:match("^ls:") or line:match("^PWD:") then
+        return nil
+    end
+
+    -- Match permissions column (including ACL '+', SELinux '.', and macOS '@')
+    local perms, rest = line:match("^([%-%a][%-%a%w%+%.%@]+)%s+(.*)$")
+    if not perms or not rest then
+        return nil
+    end
+
+    -- Look for timestamps from the right side to avoid breaking on spaces
+    -- in user or group names (e.g., Active Directory 'Domain Users').
+    local before_date, date, time, name = rest:match("^(.-)%s+(%d%d%d%d%-%d%d%-%d%d)%s+([%d:]+)%s+(.*)$")
+    local size = nil
+
+    if before_date then
+        size = before_date:match("(%d+)%s*$")
+    else
+        -- Fallback: standard POSIX 'Mon DD HH:MM' or 'Mon DD YYYY'
+        before_date, date, time, name = rest:match("^(.-)%s+([A-Z][a-z][a-z]%s+%d+)%s+([%d:]+)%s+(.*)$")
+        if before_date and MONTH_NAMES[date:sub(1, 3)] then
+            size = before_date:match("(%d+)%s*$")
+        else
+            -- Fallback: European 'DD Mon HH:MM' or 'DD Mon YYYY'
+            before_date, date, time, name = rest:match("^(.-)%s+(%d+%s+[A-Z][a-z][a-z])%s+([%d:]+)%s+(.*)$")
+            local mon = date and date:match("[A-Z][a-z][a-z]")
+            if before_date and mon and MONTH_NAMES[mon] then
+                size = before_date:match("(%d+)%s*$")
+            else
+                return nil
+            end
+        end
+    end
+
+    if not name or name == "." then
+        return nil
+    end
+
+    name = name:gsub("[\r\n]+$", "")
+    local link_target = name:match("^(.-)%s+%->%s+(.*)$")
+    local clean_name = link_target or name
+    local is_symlink = (perms:sub(1, 1) == "l")
+    local is_dir = (perms:sub(1, 1) == "d") or is_symlink
+    local is_exec = (perms:find("x") ~= nil)
+    local ext = (clean_name:match("%.([%w_%-]+)$") or ""):lower()
+    local is_img = (ext == "png" or ext == "jpg" or ext == "jpeg" or ext == "gif" or ext == "bmp" or ext == "webp")
+
+    return {
+        name = clean_name,
+        raw_name = name,
+        is_dir = is_dir,
+        is_symlink = is_symlink,
+        is_exec = is_exec,
+        is_image = is_img,
+        size = is_dir and 0 or tonumber(size or 0),
+        mtime = (date and time) and (date .. " " .. time) or "-",
+        perms = perms,
+    }
+end
+
 function Crawler.list_directory(host_cfg, remote_dir)
     remote_dir = normalize_remote_path(remote_dir)
     if not remote_dir or remote_dir == "" then remote_dir = "~" end
@@ -1995,39 +2065,35 @@ function Crawler.list_directory(host_cfg, remote_dir)
         if pwd_match and pwd_match ~= "" then
             resolved_dir = pwd_match
         else
-            local perms, links, owner, group, size, d1, d2, name = line:match("^(%S+)%s+(%d+)%s+(%S+)%s+(%S+)%s+(%d+)%s+(%d%d%d%d%-%d%d%-%d%d)%s+(%d%d:%d%d:%d%d)%s+(.+)$")
-            if not perms then
-                -- Fallback standard ls format
-                perms, links, owner, group, size, d1, d2, name = line:match("^(%S+)%s+(%d+)%s+(%S+)%s+(%S+)%s+(%d+)%s+(%a+%s+%d+)%s+(%d%d?:?%d%d?)%s+(.+)$")
-            end
-
-            if perms and name and name ~= "." then
-                name = name:gsub("[\r\n]+$", "")
-                local is_dir = (perms:sub(1, 1) == "d")
-                local is_symlink = (perms:sub(1, 1) == "l")
-                local is_exec = (perms:find("x") ~= nil)
-                local clean_name = name
-                if is_symlink then
-                    clean_name = name:match("^(.-)%s+%->") or name
-                end
-                local ext = (clean_name:match("%.([%w_%-]+)$") or ""):lower()
-                local is_img = (ext == "png" or ext == "jpg" or ext == "jpeg" or ext == "gif" or ext == "bmp" or ext == "webp")
-
-                table.insert(items, {
-                    name = clean_name,
-                    raw_name = name,
-                    is_dir = is_dir,
-                    is_symlink = is_symlink,
-                    is_exec = is_exec,
-                    is_image = is_img,
-                    size = tonumber(size) or 0,
-                    mtime = (d1 and d2) and (d1 .. " " .. d2) or "-",
-                    perms = perms,
-                })
+            local it = parse_ls_line(line)
+            if it then
+                table.insert(items, it)
             end
         end
     end
     pipe:close()
+
+    local final_dir = resolved_dir or remote_dir
+    -- Ensure parent dir entry '..' is always present unless at root
+    if final_dir ~= "/" then
+        local has_parent = false
+        for _, it in ipairs(items) do
+            if it.name == ".." then has_parent = true break end
+        end
+        if not has_parent then
+            table.insert(items, 1, {
+                name = "..",
+                raw_name = "..",
+                is_dir = true,
+                is_symlink = false,
+                is_exec = true,
+                is_image = false,
+                size = 0,
+                mtime = "-",
+                perms = "drwxr-xr-x",
+            })
+        end
+    end
 
     -- Sort: directories first, then alphabetically
     table.sort(items, function(a, b)
@@ -2125,8 +2191,12 @@ local App = {
 function App.update_filter()
     local res = {}
     local q = (App.filter_text ~= "") and App.filter_text:lower() or nil
+    local hidden_count = 0
     for _, it in ipairs(App.items) do
         local is_hidden = (it.name:sub(1, 1) == "." and it.name ~= "..")
+        if is_hidden then
+            hidden_count = hidden_count + 1
+        end
         if App.show_hidden or not is_hidden then
             if not q or it.name:lower():find(q, 1, true) then
                 table.insert(res, it)
@@ -2134,6 +2204,7 @@ function App.update_filter()
         end
     end
     App.filtered_items = res
+    App.hidden_count = hidden_count
     App.cursor = math.max(1, math.min(App.cursor, #App.filtered_items))
 end
 
@@ -2145,12 +2216,15 @@ function App.load_dir(dir_path)
         App.current_dir = dir_path
     end
     if not items or #items == 0 then
-        App.items = { { name = "..", is_dir = true, size = 4096, mtime = "-", perms = "drwxr-xr-x" } }
+        App.items = { { name = "..", raw_name = "..", is_dir = true, size = 0, mtime = "-", perms = "drwxr-xr-x" } }
         App.status_msg = err or ("Directory empty or inaccessible: " .. App.current_dir)
         App.status_color = C.bright_yellow
     else
         App.items = items
-        App.status_msg = string.format("Browsing: %s (%d items)", App.current_dir, #items)
+        App.update_filter()
+        local hidden_hint = (not App.show_hidden and (App.hidden_count or 0) > 0)
+            and string.format(" (%d hidden; press '.' to show)", App.hidden_count) or ""
+        App.status_msg = string.format("Browsing: %s (%d items%s)", App.current_dir, #App.filtered_items, hidden_hint)
         App.status_color = C.bright_cyan
     end
     App.cursor = 1
@@ -2365,8 +2439,9 @@ function App.draw()
     table.insert(buf, string.format("\27[%d;1H%s\27[K", content_h + 4, pad_string(stat_text, w)))
 
     -- 5. Footer Keybindings Guide
+    local hidden_state = App.show_hidden and "ON" or ((App.hidden_count or 0) > 0 and string.format("OFF (%d)", App.hidden_count) or "OFF")
     local footer = string.format(" [Enter/l] Open [h] Up [~] Home [j/k] Select [H] Server [.] Hidden:%s [I] Icons [e] Engine:%s [/] Filter [?] Help [q] Quit ",
-        App.show_hidden and "ON" or "OFF",
+        hidden_state,
         (ImageRenderer.preferred_engine or "auto"):upper()
     )
     table.insert(buf, string.format("\27[%d;1H%s%s%s%s\27[K",
@@ -2618,8 +2693,14 @@ function App.run()
                 elseif key == "." then
                     App.show_hidden = not App.show_hidden
                     App.update_filter()
-                    App.status_msg = App.show_hidden and "Showing hidden files/folders (ON)." or "Hidden files/folders are now hidden (OFF)."
-                    App.status_color = App.show_hidden and C.bright_yellow or C.gray
+                    local count = App.hidden_count or 0
+                    if App.show_hidden then
+                        App.status_msg = string.format("Showing hidden files and folders (%d revealed).", count)
+                        App.status_color = C.bright_yellow
+                    else
+                        App.status_msg = string.format("Hidden files/folders are now hidden (%d hidden).", count)
+                        App.status_color = C.gray
+                    end
                 elseif key == "I" then
                     local new_m = IconEngine.cycle()
                     App.status_msg = "Icon Mode toggled to: " .. new_m:upper()
@@ -2844,7 +2925,30 @@ local function run_tests()
     assert(gfx_out and #gfx_out > 0 and gfx_name ~= nil, "render_graphics must produce valid output")
     print(C.bright_green .. string.format("  [PASS] Real Pixel Graphics Protocols: WezTerm/iTerm2 OSC 1337 & Kitty (Active: %s)", gfx_name) .. C.reset)
 
-    print(C.bold .. C.bright_green .. "\nALL 16 TESTS PASSED SUCCESSFULLY!" .. C.reset)
+    -- 17. Remote Directory Listing Parser (Domain Users, Symlinks, European & POSIX Dates)
+    local test_lines = {
+        "drwxrwxr-x 2 alice Domain Users 4096 2026-10-18 09:30:00 shared_dept",
+        "drwxrwxr-x 2 DOMAIN\\alice DOMAIN\\Domain Admins 8192 2026-10-18 09:30:00 admin_dept",
+        "drwxr-xr-x 2 user Domain Users 4096 Oct 18  2024 archive_dept",
+        "drwxr-xr-x@ 4 user staff 128 Oct 18 09:30 macos_dept",
+        "lrwxrwxrwx 1 user group 14 2026-10-18 09:30:00 symlink_dir -> /mnt/target",
+        "-rw-r--r-- 1 alice Domain Users 123456 2026-10-18 09:30:00 report.pdf",
+    }
+    local parsed = {}
+    for _, l in ipairs(test_lines) do
+        local it = parse_ls_line(l)
+        if it then table.insert(parsed, it) end
+    end
+    assert(#parsed == 6, "Expected 6 parsed items from diverse ls formats, got " .. #parsed)
+    assert(parsed[1].name == "shared_dept" and parsed[1].is_dir == true, "Domain Users folder must parse as directory")
+    assert(parsed[2].name == "admin_dept" and parsed[2].is_dir == true, "Domain Admins folder must parse as directory")
+    assert(parsed[3].name == "archive_dept" and parsed[3].is_dir == true, "Older 2024 folder must parse as directory")
+    assert(parsed[4].name == "macos_dept" and parsed[4].is_dir == true, "macOS @ ACL folder must parse as directory")
+    assert(parsed[5].name == "symlink_dir" and parsed[5].is_dir == true and parsed[5].is_symlink == true, "Symlink directory must be marked is_dir")
+    assert(parsed[6].name == "report.pdf" and parsed[6].is_dir == false and parsed[6].size == 123456, "Regular file must parse size")
+    print(C.bright_green .. "  [PASS] Remote Listing Parser: Domain Users, Symlinks, POSIX & European dates" .. C.reset)
+
+    print(C.bold .. C.bright_green .. "\nALL 17 TESTS PASSED SUCCESSFULLY!" .. C.reset)
     return true
 end
 
