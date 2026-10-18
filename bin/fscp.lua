@@ -1647,8 +1647,8 @@ function App.refresh_right(force_network)
     else
         App.connected = true
         App.conn_error = nil
-        if force_network then
-            App.status_msg = "Connected to " .. get_ssh_target(App.host_cfg) .. "."
+        if force_network or (not App.modal and not App.host_cfg.is_demo) then
+            App.status_msg = "Connected to " .. get_ssh_target(App.host_cfg) .. ": " .. App.right.dir
             App.status_color = C.bright_green
         end
         App.right.items = items
@@ -3241,10 +3241,6 @@ function App.handle_input(key)
             App.status_color = C.bright_cyan
             App.draw()
             App.refresh_right(true)
-            if App.connected then
-                App.status_msg = "Remote directory refreshed."
-                App.status_color = C.green
-            end
         end
     elseif key == "~" then
         cur_pane.dir = get_home_dir()
