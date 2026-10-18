@@ -1571,11 +1571,28 @@ local function list_remote_directory(host_cfg, remote_dir)
             return {}, err_line or ("SSH connection failed (exit code " .. exit_code .. ")")
         end
 
+        local total_content_lines = 0
         for line in clean_output:gmatch("[^\r\n]+") do
+            local trimmed = trim(line)
+            if trimmed ~= "" and not trimmed:match("^total%s+%d+") and not trimmed:match("^ls:") then
+                total_content_lines = total_content_lines + 1
+            end
             local it = parse_ls_line(line)
             if it then
                 table.insert(items, it)
             end
+        end
+
+        if #items == 0 and total_content_lines > 0 then
+            local sample_err = nil
+            for line in clean_output:gmatch("[^\r\n]+") do
+                local t = trim(line)
+                if t ~= "" and not t:match("^total%s+%d+") and not t:match("^ls:") then
+                    sample_err = t
+                    break
+                end
+            end
+            return {}, "Cannot parse remote directory (unrecognized output: " .. (sample_err or "unknown") .. ")"
         end
     end
 
@@ -1698,7 +1715,18 @@ function App.refresh_right(force_network)
         App.connected = true
         App.conn_error = nil
         if force_network or (not App.modal and not App.host_cfg.is_demo) then
-            App.status_msg = "Connected to " .. get_ssh_target(App.host_cfg) .. ": " .. App.right.dir
+            local hidden_count = 0
+            for _, it in ipairs(items) do
+                if it.name:sub(1, 1) == "." and it.name ~= ".." then
+                    hidden_count = hidden_count + 1
+                end
+            end
+            local hidden_hint = ""
+            if not App.show_hidden and hidden_count > 0 then
+                hidden_hint = string.format(" (%d hidden item%s; press '.' to show)",
+                    hidden_count, hidden_count == 1 and "" or "s")
+            end
+            App.status_msg = "Connected to " .. get_ssh_target(App.host_cfg) .. ": " .. App.right.dir .. hidden_hint
             App.status_color = C.bright_green
         end
         App.right.items = items
@@ -1910,8 +1938,18 @@ function App.draw()
 
     -- 6. Keyboard Guide Footer Bar
     local foot_y = content_h + 5
+    local cur_pane = App.active_pane == "left" and App.left or App.right
+    local cur_hidden_count = 0
+    if not App.show_hidden and cur_pane.items then
+        for _, it in ipairs(cur_pane.items) do
+            if it.name:sub(1, 1) == "." and it.name ~= ".." then
+                cur_hidden_count = cur_hidden_count + 1
+            end
+        end
+    end
+    local hidden_label = App.show_hidden and "ON" or (cur_hidden_count > 0 and string.format("OFF (%d)", cur_hidden_count) or "OFF")
     local keyguide = string.format(" [Tab] Switch  [Space] Select  [H] Host/IP  [.] Hidden:%s  [u] Upload  [d] Download  [r] Refresh  [?] Help  [q] Quit ",
-        App.show_hidden and "ON" or "OFF"
+        hidden_label
     )
     table.insert(buf, string.format("\27[%d;1H%s%s%s%s\27[0m\27[K",
         foot_y,
@@ -3299,8 +3337,20 @@ function App.handle_input(key)
         if App.active_pane == "left" then App.refresh_left() else App.refresh_right(false) end
     elseif key == "." then
         App.show_hidden = not App.show_hidden
-        App.status_msg = App.show_hidden and "Showing hidden files and folders." or "Hidden files/folders are now hidden."
-        App.status_color = App.show_hidden and C.bright_yellow or C.gray
+        local count = 0
+        local cur_pane = App.active_pane == "left" and App.left or App.right
+        for _, it in ipairs(cur_pane.items or {}) do
+            if it.name:sub(1, 1) == "." and it.name ~= ".." then
+                count = count + 1
+            end
+        end
+        if App.show_hidden then
+            App.status_msg = string.format("Showing hidden files and folders (%d revealed).", count)
+            App.status_color = C.bright_yellow
+        else
+            App.status_msg = string.format("Hidden files/folders are now hidden (%d hidden).", count)
+            App.status_color = C.gray
+        end
         local left_items = App.get_filtered_items(App.left)
         if App.left.cursor > #left_items then App.left.cursor = math.max(1, #left_items) end
         local right_items = App.get_filtered_items(App.right)
@@ -3613,7 +3663,32 @@ local function main(...)
                 if it.name == "live_dept" then found_live = true break end
             end
             assert(found_live, "Must parse live item live_dept")
-            print("  [PASS] list_remote_directory live SSH command construction tests")
+            -- 21. Test hidden items hint and unparseable output detection
+            local unparse_popen = io.popen
+            io.popen = function()
+                return {
+                    read = function() return "'LC_ALL' is not recognized as an internal or external command\n__FSCP_EXIT__:0" end,
+                    close = function() end,
+                }
+            end
+            local _, unparse_err = list_remote_directory(live_cfg, "/test")
+            io.popen = unparse_popen
+            assert(unparse_err ~= nil and unparse_err:find("Cannot parse remote directory"), "Must report error for unparseable output")
+
+            App.show_hidden = false
+            App.host_cfg = live_cfg
+            App.right.dir = "/home/test"
+            local old_list = list_remote_directory
+            list_remote_directory = function()
+                return {
+                    { name = "..", size = 0, is_dir = true },
+                    { name = ".bashrc", size = 100, is_dir = false },
+                }, nil
+            end
+            App.refresh_right(true)
+            list_remote_directory = old_list
+            assert(App.status_msg:find("1 hidden item; press '.' to show", 1, true), "Must hint about hidden item")
+            print("  [PASS] list_remote_directory hidden items feedback and unparseable output tests")
 
             print(C.bold .. C.bright_green .. "[ALL TESTS PASSED SUCCESSFULLY]" .. C.reset)
             return

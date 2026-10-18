@@ -125,5 +125,68 @@ assert(captured:find("'/var/data/'"), "Remote path must contain trailing slash")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
+    def test_hidden_items_count_status_hint_and_toggle(self):
+        source = (ROOT / "bin/fscp.lua").read_text(encoding="utf-8")
+        source = source.rsplit("main(...)", 1)[0]
+        driver = r'''
+App.host_cfg = {name="office-node", hostname="office.local", source="ssh-config"}
+App.right.dir = "/home/worker"
+App.show_hidden = false
+local hidden_listing = {
+    {name="..", size=0, is_dir=true},
+    {name=".bashrc", size=1024, is_dir=false},
+    {name=".profile", size=512, is_dir=false},
+    {name=".ssh", size=4096, is_dir=true},
+}
+list_remote_directory = function(host, dir)
+    return hidden_listing, nil
+end
+
+App.refresh_right(true)
+assert(App.connected, "Should be connected")
+assert(App.status_msg:find("3 hidden items; press '.' to show", 1, true),
+    "Expected hidden items count hint in status_msg, got: " .. tostring(App.status_msg))
+
+-- Test toggling with '.'
+App.active_pane = "right"
+App.handle_input(".")
+assert(App.show_hidden == true, "show_hidden should be true")
+assert(App.status_msg:find("3 revealed", 1, true), "Status msg should mention 3 revealed: " .. tostring(App.status_msg))
+
+App.handle_input(".")
+assert(App.show_hidden == false, "show_hidden should be false")
+assert(App.status_msg:find("3 hidden", 1, true), "Status msg should mention 3 hidden: " .. tostring(App.status_msg))
+'''
+        result = subprocess.run(
+            [LUAJIT, "-"], input=source + driver, capture_output=True,
+            text=True, encoding="utf-8", timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_unparseable_remote_output_error(self):
+        source = (ROOT / "bin/fscp.lua").read_text(encoding="utf-8")
+        source = source.rsplit("main(...)", 1)[0]
+        driver = r'''
+local orig_popen = io.popen
+io.popen = function(cmd)
+    return {
+        read = function() return "'LC_ALL' is not recognized as an internal or external command\n__FSCP_EXIT__:0" end,
+        close = function() end,
+    }
+end
+local host = {name="win-host", hostname="10.0.0.2", user="admin", port="22", is_demo=false}
+local items, err = list_remote_directory(host, "/test")
+io.popen = orig_popen
+assert(err ~= nil, "Should report error when output cannot be parsed as ls entries")
+assert(err:find("Cannot parse remote directory", 1, true), "Error message should mention parsing failure: " .. tostring(err))
+assert(err:find("LC_ALL", 1, true), "Error message should include sample output: " .. tostring(err))
+'''
+        result = subprocess.run(
+            [LUAJIT, "-"], input=source + driver, capture_output=True,
+            text=True, encoding="utf-8", timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
