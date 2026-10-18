@@ -161,6 +161,100 @@ assert(apply_colors_to_session("user@host", PRESET_THEMES.dracula.colors, "user%
 ''', registry=True)
         self.assert_lua_passed(result)
 
+    def test_wsl_reads_actual_session_values_and_hex_dwords(self):
+        result = self.lua(r'''
+IS_WINDOWS = false
+is_wsl = function()
+    return true
+end
+run_wsl_registry = function(arguments)
+    assert(arguments[1] == "query" and arguments[3] == "/s")
+    return [[
+HKEY_CURRENT_USER\Software\SimonTatham\PuTTY\Sessions
+
+HKEY_CURRENT_USER\Software\SimonTatham\PuTTY\Sessions\user@host
+    HostName    REG_SZ    actual.example.org
+    PortNumber    REG_DWORD    0x8ae
+    UserName    REG_SZ    actual-user
+    Protocol    REG_SZ    ssh
+    PublicKeyFile    REG_SZ    C:\Users\Test User\id.ppk
+    AgentFwd    REG_DWORD    0x1
+
+HKEY_CURRENT_USER\Software\SimonTatham\PuTTY\Sessions\Default%20Settings
+    HostName    REG_SZ
+]]
+end
+local sessions = assert(fetch_all_sessions())
+assert(#sessions == 2)
+local session = sessions[2]
+assert(session.name == "user@host")
+assert(session.raw_name == "user@host")
+assert(session.host == "actual.example.org")
+assert(session.port == "2222", session.port)
+assert(session.user == "actual-user")
+assert(session.key_file == "C:\\Users\\Test User\\id.ppk")
+assert(session.agent_fwd == "1")
+assert(sessions[1].host == "")
+''')
+        self.assert_lua_passed(result)
+
+    def test_wsl_command_failure_preserves_command_and_diagnostic(self):
+        result = self.lua(r'''
+io.popen = function(command)
+    assert(command:find("'review'\\''host'", 1, true), command)
+    return {
+        read = function()
+            return "ERROR: Access is denied.\r\n\n__PUTTY_REG_STATUS__1\n"
+        end,
+        close = function()
+            return true
+        end
+    }
+end
+local output, err = run_wsl_registry({ "query", "review'host" })
+assert(output == nil)
+assert(err:find("reg.exe 'query'", 1, true), err)
+assert(err:find("status 1", 1, true), err)
+assert(err:find("Access is denied.", 1, true), err)
+''')
+        self.assert_lua_passed(result)
+
+    def test_wsl_apply_stops_on_failed_write(self):
+        result = self.lua(r'''
+IS_WINDOWS = false
+is_wsl = function()
+    return true
+end
+local calls = 0
+run_wsl_registry = function(arguments)
+    calls = calls + 1
+    assert(arguments[2]:find("Sessions\\user%40host", 1, true))
+    assert(arguments[4] == "Colour0")
+    return nil, "reg.exe: access denied"
+end
+local ok, err = apply_colors_to_session(
+    "user@host", PRESET_THEMES.dracula.colors, "user%40host"
+)
+assert(ok == false and calls == 1)
+assert(err == "reg.exe: access denied")
+''')
+        self.assert_lua_passed(result)
+
+    def test_wsl_query_failure_returns_diagnostic(self):
+        result = self.lua(r'''
+IS_WINDOWS = false
+is_wsl = function()
+    return true
+end
+run_wsl_registry = function()
+    return nil, "reg.exe query: permission denied"
+end
+local sessions, err = fetch_all_sessions()
+assert(sessions == nil)
+assert(err == "reg.exe query: permission denied")
+''')
+        self.assert_lua_passed(result)
+
 
 if __name__ == "__main__":
     unittest.main()

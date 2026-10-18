@@ -151,6 +151,83 @@ local function is_wsl()
     return false
 end
 
+local function shell_quote(value)
+    return "'" .. value:gsub("'", "'\\''") .. "'"
+end
+
+local function run_wsl_registry(arguments)
+    local command_parts = { "reg.exe" }
+    for _, argument in ipairs(arguments) do
+        table.insert(command_parts, shell_quote(argument))
+    end
+    local command = table.concat(command_parts, " ")
+    -- Lua 5.1 pipe:close() does not reliably expose the child's exit status.
+    local pipe, open_error = io.popen(
+        command .. " 2>&1; printf '\\n__PUTTY_REG_STATUS__%d\\n' \"$?\""
+    )
+    if not pipe then
+        return nil, "Could not launch " .. command .. ": " .. tostring(open_error)
+    end
+
+    local output = pipe:read("*all")
+    pipe:close()
+    local body, status = output:match("^(.*)\n__PUTTY_REG_STATUS__(%d+)%s*$")
+    if not status then
+        return nil, "Could not read exit status for " .. command .. ": " .. trim(output)
+    end
+    if tonumber(status) ~= 0 then
+        return nil, command .. " exited with status " .. status .. ": " .. trim(body)
+    end
+    return body
+end
+
+local function parse_wsl_sessions(output)
+    local fields = {
+        HostName = "host",
+        PortNumber = "port",
+        UserName = "user",
+        Protocol = "protocol",
+        PublicKeyFile = "key_file",
+        AgentFwd = "agent_fwd"
+    }
+    local sessions = {}
+    local session = nil
+    for line in output:gmatch("[^\n]+") do
+        line = line:gsub("\r$", "")
+        if line:match("^HKEY_") then
+            local raw_name = line:match(
+                "^HKEY_CURRENT_USER\\Software\\SimonTatham\\PuTTY\\Sessions\\([^\\]+)$"
+            )
+            session = nil
+            if raw_name then
+                session = {
+                    name = url_decode(raw_name),
+                    raw_name = raw_name,
+                    host = "",
+                    port = "22",
+                    user = "",
+                    protocol = "ssh",
+                    key_file = "",
+                    agent_fwd = "0"
+                }
+                table.insert(sessions, session)
+            end
+        elseif session then
+            local name, value_type, value = line:match("^%s+(%S+)%s+REG_(%w+)%s+(.*)$")
+            local field = fields[name]
+            if field and value_type == "DWORD" then
+                local number = tonumber(value)
+                if number then
+                    session[field] = tostring(number)
+                end
+            elseif field and value_type == "SZ" then
+                session[field] = value
+            end
+        end
+    end
+    return sessions
+end
+
 --------------------------------------------------------------------------------
 -- Preset Themes (22 RGB entries for Colour0..Colour21)
 --------------------------------------------------------------------------------
@@ -414,27 +491,13 @@ local function fetch_all_sessions()
             ffi.C.RegCloseKey(rootKey)
         end
     elseif is_wsl() then
-        local pipe = io.popen("reg.exe query 'HKCU\\Software\\SimonTatham\\PuTTY\\Sessions' 2>/dev/null")
-        if pipe then
-            for line in pipe:lines() do
-                local rawSession = line:match("PuTTY\\Sessions\\(.*)$")
-                if rawSession then
-                    rawSession = trim(rawSession)
-                    local sessionName = url_decode(rawSession)
-                    table.insert(sessions, {
-                        name = sessionName,
-                        raw_name = rawSession,
-                        host = sessionName,
-                        port = "22",
-                        user = "",
-                        protocol = "ssh",
-                        key_file = "",
-                        agent_fwd = "0"
-                    })
-                end
-            end
-            pipe:close()
+        local output, err = run_wsl_registry({
+            "query", "HKCU\\Software\\SimonTatham\\PuTTY\\Sessions", "/s"
+        })
+        if not output then
+            return nil, err
         end
+        sessions = parse_wsl_sessions(output)
     else
         -- Linux / Unix ~/.putty/sessions
         local pdir = os.getenv("HOME") .. "/.putty/sessions"
@@ -497,11 +560,15 @@ local function apply_colors_to_session(session_name, colors, raw_session)
         end
         return true
     elseif is_wsl() then
-        -- Use reg.exe in WSL
         local reg_path = string.format([[HKCU\Software\SimonTatham\PuTTY\Sessions\%s]], raw_session)
         for i = 0, 21 do
-            local cmd = string.format([[reg.exe add "%s" /v "Colour%d" /t REG_SZ /d "%s" /f >nul 2>&1]], reg_path, i, colors[i + 1])
-            os.execute(cmd)
+            local output, err = run_wsl_registry({
+                "add", reg_path, "/v", "Colour" .. i,
+                "/t", "REG_SZ", "/d", colors[i + 1], "/f"
+            })
+            if not output then
+                return false, err
+            end
         end
         return true
     else
@@ -622,7 +689,11 @@ Usage:
         end
     end
 
-    local sessions = fetch_all_sessions()
+    local sessions, session_error = fetch_all_sessions()
+    if not sessions then
+        io.stderr:write("Error: " .. session_error .. "\n")
+        return false
+    end
     if filter then
         local filtered = {}
         for _, s in ipairs(sessions) do
@@ -760,7 +831,11 @@ local function cmd_colors(args)
         end
 
         if apply_all then
-            local sessions = fetch_all_sessions()
+            local sessions, session_error = fetch_all_sessions()
+            if not sessions then
+                io.stderr:write("Error: " .. session_error .. "\n")
+                return false
+            end
             local seen = {}
             for _, s in ipairs(sessions) do seen[s.name] = true end
             if not seen["Default Settings"] then table.insert(sessions, { name = "Default Settings" }) end
