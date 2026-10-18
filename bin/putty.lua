@@ -55,6 +55,7 @@ if IS_WINDOWS then
         BOOL SetConsoleOutputCP(unsigned int wCodePageID);
         BOOL SetConsoleCP(unsigned int wCodePageID);
         DWORD GetFileAttributesA(const char* lpFileName);
+        DWORD FormatMessageA(DWORD dwFlags, const void* lpSource, DWORD dwMessageId, DWORD dwLanguageId, char* lpBuffer, DWORD nSize, void* Arguments);
     ]]
 
     pcall(function()
@@ -95,6 +96,16 @@ end
 
 local function trim(s)
     return (s:gsub("^%s*(.-)%s*$", "%1"))
+end
+
+local function registry_error(action, status)
+    local buffer = ffi.new("char[1024]")
+    local length = ffi.C.FormatMessageA(0x1200, nil, status, 0, buffer, 1024, nil)
+    local detail = "Windows error " .. tonumber(status)
+    if length > 0 then
+        detail = detail .. ": " .. trim(ffi.string(buffer, length))
+    end
+    return action .. " (" .. detail .. ")"
 end
 
 local function file_exists(path)
@@ -447,19 +458,29 @@ local function apply_colors_to_session(session_name, colors)
     if IS_WINDOWS then
         local phkSub = ffi.new("HKEY[1]")
         local subPath = "Software\\SimonTatham\\PuTTY\\Sessions\\" .. raw_session
-        if ffi.C.RegOpenKeyExA(HKEY_CURRENT_USER, subPath, 0, KEY_ALL_ACCESS, phkSub) ~= 0 then
-            -- Try create/open with KEY_WRITE
-            if ffi.C.RegOpenKeyExA(HKEY_CURRENT_USER, subPath, 0, KEY_WRITE, phkSub) ~= 0 then
-                return false, "Failed to open registry key: " .. subPath
-            end
+        local status = ffi.C.RegOpenKeyExA(
+            HKEY_CURRENT_USER, subPath, 0, KEY_WRITE, phkSub
+        )
+        if status ~= 0 then
+            return false, registry_error("Could not open registry key " .. subPath, status)
         end
         local subKey = phkSub[0]
         for i = 0, 21 do
             local valName = "Colour" .. i
             local valStr = colors[i + 1]
-            ffi.C.RegSetValueExA(subKey, valName, 0, REG_SZ, ffi.cast("const BYTE*", valStr), #valStr + 1)
+            status = ffi.C.RegSetValueExA(
+                subKey, valName, 0, REG_SZ,
+                ffi.cast("const BYTE*", valStr), #valStr + 1
+            )
+            if status ~= 0 then
+                ffi.C.RegCloseKey(subKey)
+                return false, registry_error("Could not write " .. valName, status)
+            end
         end
-        ffi.C.RegCloseKey(subKey)
+        status = ffi.C.RegCloseKey(subKey)
+        if status ~= 0 then
+            return false, registry_error("Could not close registry key " .. subPath, status)
+        end
         return true
     elseif is_wsl() then
         -- Use reg.exe in WSL
@@ -733,10 +754,17 @@ local function cmd_colors(args)
             io.write(string.format("Applying theme '%s' to %d PuTTY session(s)...\n", t.name, #sessions))
             local count = 0
             for _, s in ipairs(sessions) do
-                local ok = apply_colors_to_session(s.name, t.colors)
-                if ok then count = count + 1 end
+                local ok, err = apply_colors_to_session(s.name, t.colors)
+                if ok then
+                    count = count + 1
+                else
+                    io.stderr:write(string.format("Error: session '%s': %s\n", s.name, err))
+                end
             end
-            io.write(string.format("\27[32m✔ Successfully updated %d sessions in Registry.\27[0m\n", count))
+            io.write(string.format("Updated %d of %d session(s).\n", count, #sessions))
+            if count ~= #sessions then
+                return false
+            end
         else
             io.write(string.format("Applying theme '%s' to session '%s'... ", t.name, session_name))
             local ok, err = apply_colors_to_session(session_name, t.colors)
