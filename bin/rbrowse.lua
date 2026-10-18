@@ -2808,7 +2808,15 @@ local function run_tests()
     local orig_engine = ImageRenderer.preferred_engine
     ImageRenderer.preferred_engine = "ffi"
     local ffi_res, ffi_eng = ImageRenderer.render_half_blocks(DEMO_PNG_BYTES, 24, 10)
-    assert(ffi_eng == "FFI/GDI+", "Forced FFI engine must report 'FFI/GDI+'")
+    if IS_WINDOWS and GdiPlusRenderer.available then
+        assert(ffi_eng == "FFI/GDI+", "Available forced FFI engine must report 'FFI/GDI+'")
+        assert(ffi_res and #ffi_res > 0, "Available forced FFI engine must render preview lines")
+    else
+        assert(ffi_eng == "None", "Unavailable forced FFI engine must report 'None'")
+        assert(ffi_res and ffi_res[1] and ffi_res[1]:find("unavailable", 1, true),
+            "Unavailable forced FFI engine must explain the Windows GDI+ requirement")
+        print(C.gray .. "  [PASS] Forced FFI engine reports that Windows GDI+ is unavailable" .. C.reset)
+    end
 
     local c1 = ImageRenderer.cycle_engine()
     assert(c1 == "chafa" and ImageRenderer.preferred_engine == "chafa", "Cycling engine should transition to 'chafa'")

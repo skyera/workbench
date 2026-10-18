@@ -25,6 +25,31 @@ class SelfTestRegressions(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("ALL TESTS PASSED", result.stdout)
 
+    def test_rbrowse_forced_ffi_availability_and_engine_cycling(self):
+        # Test both platform branches without requiring a Windows host or
+        # installing external image conversion utilities.
+        source = (ROOT / "bin/rbrowse.lua").read_text().rsplit("main({ ... })", 1)[0]
+        driver = r'''
+ImageRenderer.preferred_engine = "ffi"
+IS_WINDOWS = false
+local lines, engine = ImageRenderer.render_half_blocks(DEMO_PNG_BYTES, 24, 10)
+assert(engine == "None" and lines[1]:find("unavailable", 1, true))
+IS_WINDOWS = true
+GdiPlusRenderer.available = false
+lines, engine = ImageRenderer.render_half_blocks(DEMO_PNG_BYTES, 24, 10)
+assert(engine == "None" and lines[1]:find("unavailable", 1, true))
+GdiPlusRenderer.available = true
+GdiPlusRenderer.render_half_blocks = function() return {"rendered pixels"} end
+lines, engine = ImageRenderer.render_half_blocks(DEMO_PNG_BYTES, 24, 10)
+assert(engine == "FFI/GDI+" and lines[1] == "rendered pixels")
+for _, expected in ipairs({"chafa", "magick", "python", "auto"}) do
+    assert(ImageRenderer.cycle_engine() == expected)
+end
+'''
+        result = subprocess.run([LUAJIT, "-"], input=source + driver,
+                                capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
