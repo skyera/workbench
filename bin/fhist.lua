@@ -133,6 +133,7 @@ else
         int open(const char *pathname, int flags, ...);
         int close(int fd);
         int usleep(unsigned int usec);
+        int isatty(int fd);
     ]]
 end
 
@@ -276,6 +277,19 @@ function Term.get_size()
         end
     end
     return 100, 30
+end
+
+function Term.is_stdout_tty()
+    if IS_WINDOWS then
+        local hOut = ffi.C.GetStdHandle(-11)
+        if hOut == nil or hOut == ffi.cast("HANDLE", -1) then
+            return false
+        end
+        local mode = ffi.new("DWORD[1]")
+        return ffi.C.GetConsoleMode(hOut, mode) ~= 0
+    else
+        return ffi.C.isatty(1) ~= 0
+    end
 end
 
 function Term.read_key()
@@ -728,6 +742,109 @@ function Engine.execute_in_shell(cmd)
     Term.init()
 end
 
+function Engine.run_command(cmd, shell_type)
+    if not cmd or #cmd == 0 then
+        return 0
+    end
+
+    if IS_WINDOWS then
+        local res = os.execute(cmd)
+        local code = (type(res) == "number") and res or (res == true and 0 or 1)
+
+        -- Fallback for PowerShell cmdlets that failed in direct cmd.exe execution
+        if code ~= 0 and shell_type == "powershell" then
+            local ps_cmd = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "' .. cmd:gsub('"', '\\"') .. '"'
+            local ps_res = os.execute(ps_cmd)
+            code = (type(ps_res) == "number") and ps_res or (ps_res == true and 0 or 1)
+        end
+        return code
+    else
+        local sh = os.getenv("SHELL") or "/bin/sh"
+        local res = os.execute(sh .. ' -c "' .. cmd:gsub('"', '\\"') .. '"')
+        return (type(res) == "number") and res or (res == true and 0 or 1)
+    end
+end
+
+function Engine.prompt_and_run(initial_cmd, shell_type)
+    if not initial_cmd or #initial_cmd == 0 then
+        Term.restore()
+        return 0
+    end
+
+    -- Return to normal terminal buffer and show cursor while keeping raw mode for inline editing
+    Term.write_tui("\27[?1049l\27[?25h" .. C.reset)
+
+    local prompt_prefix = C.b_cyan .. "❯ " .. C.reset
+    local prompt_cols = 2
+    local line_chars = {}
+    for i = 1, #initial_cmd do
+        line_chars[i] = initial_cmd:sub(i, i)
+    end
+    local cursor_pos = #line_chars + 1
+
+    local function refresh_line()
+        local text = table.concat(line_chars)
+        Term.write_tui("\r" .. prompt_prefix .. text .. "\27[K")
+        local col_offset = prompt_cols + cursor_pos - 1
+        if col_offset > 0 then
+            Term.write_tui(string.format("\r\27[%dC", col_offset))
+        else
+            Term.write_tui("\r")
+        end
+    end
+
+    refresh_line()
+
+    while true do
+        local key = Term.read_key()
+        if key == "ENTER" then
+            Term.write_tui("\n")
+            Term.restore()
+            local final_cmd = table.concat(line_chars)
+            return Engine.run_command(final_cmd, shell_type)
+        elseif key == "CTRL_C" or key == "ESC" then
+            Term.write_tui("\n")
+            Term.restore()
+            return 0
+        elseif key == "BACKSPACE" then
+            if cursor_pos > 1 then
+                table.remove(line_chars, cursor_pos - 1)
+                cursor_pos = cursor_pos - 1
+                refresh_line()
+            end
+        elseif key == "DELETE" then
+            if cursor_pos <= #line_chars then
+                table.remove(line_chars, cursor_pos)
+                refresh_line()
+            end
+        elseif key == "LEFT" then
+            if cursor_pos > 1 then
+                cursor_pos = cursor_pos - 1
+                refresh_line()
+            end
+        elseif key == "RIGHT" then
+            if cursor_pos <= #line_chars then
+                cursor_pos = cursor_pos + 1
+                refresh_line()
+            end
+        elseif key == "HOME" or key == "CTRL_A" then
+            cursor_pos = 1
+            refresh_line()
+        elseif key == "END" or key == "CTRL_E" then
+            cursor_pos = #line_chars + 1
+            refresh_line()
+        elseif key == "CTRL_U" then
+            line_chars = {}
+            cursor_pos = 1
+            refresh_line()
+        elseif #key == 1 and key:byte() >= 32 and key:byte() < 127 then
+            table.insert(line_chars, cursor_pos, key)
+            cursor_pos = cursor_pos + 1
+            refresh_line()
+        end
+    end
+end
+
 --------------------------------------------------------------------------------
 -- 6. Interactive TUI Engine
 --------------------------------------------------------------------------------
@@ -947,8 +1064,8 @@ local function run_tui(init_opts)
 
             table.insert(r_lines, "")
             table.insert(r_lines, " " .. C.b_green .. C.bold .. "Quick Actions:" .. C.reset)
-            table.insert(r_lines, "   " .. C.b_yellow .. "Enter" .. C.reset .. "     Select & output command to stdout")
-            table.insert(r_lines, "   " .. C.b_cyan .. "e / x" .. C.reset .. "     Run command directly in interactive subshell")
+            table.insert(r_lines, "   " .. C.b_yellow .. "Enter" .. C.reset .. "     Select & prompt command (Enter to run)")
+            table.insert(r_lines, "   " .. C.b_cyan .. "e / x" .. C.reset .. "     Run command in preview subshell")
             table.insert(r_lines, "   " .. C.b_green .. "y" .. C.reset .. "         Copy command to system clipboard")
             table.insert(r_lines, "   " .. C.b_magenta .. "s" .. C.reset .. "         Toggle sort mode (Recency / Frequency)")
         else
@@ -996,7 +1113,7 @@ local function run_tui(init_opts)
         if #state.status_msg > 0 then
             status_disp = C.b_green .. C.bold .. " ✔ " .. state.status_msg .. C.reset
         else
-            status_disp = string.format("%sEnter%s:Select  %se/x%s:Exec  %sy%s:Copy  %ss%s:Sort  %sTab%s:Tabs  %s/%s:Filter  %sq%s:Quit",
+            status_disp = string.format("%sEnter%s:Select  %se/x%s:Subshell  %sy%s:Copy  %ss%s:Sort  %sTab%s:Tabs  %s/%s:Filter  %sq%s:Quit",
                 C.b_yellow, C.gray, C.b_cyan, C.gray, C.b_green, C.gray, C.b_magenta, C.gray, C.b_cyan, C.gray, C.b_yellow, C.gray, C.b_red, C.reset)
         end
         add_line(" " .. status_disp)
@@ -1034,6 +1151,7 @@ local function run_tui(init_opts)
                 local cur = state.filtered[state.cursor]
                 if cur then
                     state.selected_cmd = cur.cmd
+                    state.selected_shell = cur.shell
                 end
                 break
             elseif key == "BACKSPACE" then
@@ -1103,16 +1221,26 @@ local function run_tui(init_opts)
                 local cur = state.filtered[state.cursor]
                 if cur then
                     state.selected_cmd = cur.cmd
+                    state.selected_shell = cur.shell
                 end
                 break
             end
         end
     end
 
-    Term.restore()
     if state.selected_cmd then
-        io.stdout:write(state.selected_cmd .. "\n")
-        io.stdout:flush()
+        if init_opts.print_only or not Term.is_stdout_tty() then
+            Term.restore()
+            io.stdout:write(state.selected_cmd .. "\n")
+            io.stdout:flush()
+        else
+            local code = Engine.prompt_and_run(state.selected_cmd, state.selected_shell)
+            if code and code ~= 0 then
+                os.exit(code)
+            end
+        end
+    else
+        Term.restore()
     end
 end
 
@@ -1235,6 +1363,12 @@ local function run_tests()
     assert_eq("Engine.load_all_history succeeds without error", type(items), "table")
     print(string.format("  [INFO] Discovered %d unique commands from %d total history entries.", #items, total_raw))
 
+    -- Test 9: Terminal TTY detection
+    assert_eq("Term.is_stdout_tty returns a boolean", type(Term.is_stdout_tty()), "boolean")
+
+    -- Test 10: Safe execution handling of empty commands
+    assert_eq("Engine.run_command handles empty command safely", Engine.run_command(""), 0)
+
     print(string.format("\nSelf-test summary: %d passed, %d failed.", passed, failed))
     if failed > 0 then os.exit(1) end
 end
@@ -1253,14 +1387,15 @@ Options:
   -l, --list           Print formatted history list and exit
   -n, --limit <N>      Maximum entries to list in -l mode (default: 100)
   -x, --exec           Directly execute the selected/matched command in a subshell
+  -p, --print          Print selected command to stdout upon exit instead of executing
   -y, --copy           Copy the top matching command to clipboard and exit
   --file <PATH>        Load history from custom file path
   --test               Run automated test suite and exit
   -h, --help           Show this help message
 
 TUI Keybindings:
-  Enter                Select command and print to stdout upon exit
-  e / x                Execute selected command directly in an interactive subshell
+  Enter                Execute selected command upon exit (or print if piped / -p)
+  e / x                Execute selected command in preview subshell and return
   y                    Copy selected command to clipboard (Win32 clip & OSC-52)
   s                    Toggle sort mode between Recency and Frequency
   Tab / Shift+Tab      Cycle category tabs (All -> Bash -> PowerShell -> Frequent)
@@ -1283,6 +1418,7 @@ local opts = {
     custom_file = nil,
     filter = "",
     limit = 100,
+    print_only = false,
 }
 
 local i = 1
@@ -1298,6 +1434,8 @@ while i <= #args do
         opts.mode = "list"
     elseif a == "-f" or a == "--freq" then
         opts.freq = true
+    elseif a == "-p" or a == "--print" then
+        opts.print_only = true
     elseif a == "-s" or a == "--shell" then
         i = i + 1
         local sh = (args[i] or ""):lower()
