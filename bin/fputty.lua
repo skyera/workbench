@@ -1096,9 +1096,9 @@ local function cmd_colors(args)
     local list_cmd    = string.format("luajit %q colors list", script_path)
 
     local fzf_cmd = string.format(
-        '%s | fzf --header-lines=2 --prompt="[LuaJIT] PuTTY Theme > " ' ..
+        '%s | fzf --expect=ctrl-a --header-lines=2 --prompt="[LuaJIT] PuTTY Theme > " ' ..
         '--layout=reverse --height=65%% --border --preview=%q --preview-window=right:55%%:wrap ' ..
-        '--header="LuaJIT FFI (650+ Themes) | ENTER: Apply to Default Settings | ESC: Cancel"',
+        '--header="ENTER: Apply to Default Settings | CTRL-A: Apply to ALL Sessions | ESC / Ctrl-C: Cancel"',
         list_cmd, preview_cmd
     )
 
@@ -1107,21 +1107,23 @@ local function cmd_colors(args)
         io.stderr:write("Error: fzf is not installed or failed to launch.\n")
         return false
     end
+    local key_pressed = pipe:read("*line")
     local selected = pipe:read("*line")
     pipe:close()
 
-    if selected and selected ~= "" then
-        local theme_key = selected:match("^(%S+)")
-        if theme_key and themes[theme_key] then
-            io.write(string.format("\nApply '%s' to [1] Default Settings or [2] ALL sessions? [1/2]: ", themes[theme_key].name))
-            io.flush()
-            local choice = io.read("*line")
-            if choice == "2" then
-                return cmd_colors({ "apply", theme_key, "-a" })
-            else
-                return cmd_colors({ "apply", theme_key, "-s", "Default Settings" })
-            end
-        end
+    if not key_pressed or not selected or selected == "" then
+        return true
+    end
+
+    local theme_key = selected:match("^(%S+)")
+    if not theme_key or not themes[theme_key] then
+        return true
+    end
+
+    if key_pressed == "ctrl-a" then
+        return cmd_colors({ "apply", theme_key, "-a" })
+    else
+        return cmd_colors({ "apply", theme_key, "-s", "Default Settings" })
     end
 end
 

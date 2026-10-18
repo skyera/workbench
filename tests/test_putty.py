@@ -719,5 +719,74 @@ assert(sessions[1].port == "2222")
                     self.assertEqual(result.returncode, expected_status, result.stdout + result.stderr)
 
 
+    def test_interactive_colors_cancels_cleanly_without_registry_writes(self):
+        result = self.lua(r'''
+local writes = 0
+apply_colors_to_session = function()
+    writes = writes + 1
+    return true
+end
+local original_popen = io.popen
+io.popen = function(cmd)
+    if cmd:find("fzf", 1, true) then
+        return {
+            read = function() return nil end,
+            close = function() return nil, "exit", 130 end,
+        }
+    end
+    return original_popen(cmd)
+end
+os.execute = function() return 0 end
+local res = cmd_colors({})
+assert(res == true, "cmd_colors should return true on cancellation")
+assert(writes == 0, "apply_colors_to_session must not be called when fzf is cancelled")
+''')
+        self.assert_lua_passed(result)
+
+    def test_interactive_colors_applies_default_on_enter_and_all_on_ctrla(self):
+        result = self.lua(r'''
+local applied_targets = {}
+apply_colors_to_session = function(target)
+    table.insert(applied_targets, target)
+    return true
+end
+local mock_output = { key = "", selected = "dracula" }
+local original_popen = io.popen
+io.popen = function(cmd)
+    if cmd:find("fzf", 1, true) then
+        local read_count = 0
+        return {
+            read = function()
+                read_count = read_count + 1
+                if read_count == 1 then return mock_output.key end
+                if read_count == 2 then return mock_output.selected end
+                return nil
+            end,
+            close = function() return true end,
+        }
+    end
+    return original_popen(cmd)
+end
+os.execute = function() return 0 end
+
+-- 1. Normal Enter -> Default Settings
+mock_output.key = ""
+mock_output.selected = "dracula"
+cmd_colors({})
+assert(#applied_targets == 1 and applied_targets[1] == "Default Settings")
+
+-- 2. Ctrl-A -> ALL sessions (adds session1, session2, plus Default Settings)
+fetch_all_sessions = function()
+    return { { name = "session1", raw_name = "session1" }, { name = "session2", raw_name = "session2" } }
+end
+mock_output.key = "ctrl-a"
+mock_output.selected = "dracula"
+cmd_colors({})
+assert(#applied_targets == 4)
+assert(applied_targets[2] == "session1" and applied_targets[3] == "session2" and applied_targets[4] == "Default Settings")
+''')
+        self.assert_lua_passed(result)
+
+
 if __name__ == "__main__":
     unittest.main()
