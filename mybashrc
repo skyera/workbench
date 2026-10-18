@@ -307,6 +307,10 @@ _load_starship_init() {
     fi
 }
 
+_omb_set_terminal_title() {
+    printf "\033]0;%s@%s: %s\007" "${USER}" "${HOSTNAME%%.*}" "${PWD/#$HOME/\~}"
+}
+
 if [[ "$SH_PROMPT_STYLE" == "oh-my-bash" && -n "$BASH_VERSION" ]]; then
     export OSH=$HOME/.oh-my-bash
     if [ ! -d "$OSH" ]; then
@@ -328,6 +332,9 @@ if [[ "$SH_PROMPT_STYLE" == "oh-my-bash" && -n "$BASH_VERSION" ]]; then
         export SCM_GIT_DISABLE_UNTRACKED_DIRTY=true
         export SCM_GIT_IGNORE_UNTRACKED=true
         source "$OSH/oh-my-bash.sh"
+        if declare -F _omb_util_add_prompt_command >/dev/null 2>&1; then
+            _omb_util_add_prompt_command _omb_set_terminal_title
+        fi
     else
         echo -e "\033[33m[mybashrc] Note: oh-my-bash could not be loaded. Falling back to custom prompt.\033[0m"
         SH_PROMPT_STYLE="custom"
@@ -403,7 +410,7 @@ if [[ -n "$BASH_VERSION" ]]; then
                 conda_env="${soft_green}(${CONDA_DEFAULT_ENV}) ${reset}"
             fi
             
-            _PRE="${status_indicator}${conda_env}${mint}\u@\h${reset}:${sky}\w"
+            _PRE="\[\e]0;\u@\h: \w\a\]${status_indicator}${conda_env}${mint}\u@\h${reset}:${sky}\w"
             _POST=" ${amber}${_PROMPT_CHAR}${reset} "
             _FORMAT="${lavender} (%s)"
             return $exit_code
@@ -438,7 +445,7 @@ if [[ -n "$BASH_VERSION" ]]; then
                 branch="${lavender} (${branch_name})"
             fi
             
-            PS1="${status_indicator}${conda_env}${mint}\u@\h${reset}:${sky}\w${branch} ${amber}${_PROMPT_CHAR}${reset} "
+            PS1="\[\e]0;\u@\h: \w\a\]${status_indicator}${conda_env}${mint}\u@\h${reset}:${sky}\w${branch} ${amber}${_PROMPT_CHAR}${reset} "
             return $exit_code
         }
     fi
@@ -830,6 +837,9 @@ switch_theme() {
             source "$OSH/oh-my-bash.sh" 2>/dev/null
         else
             source "$theme_script" 2>/dev/null
+        fi
+        if declare -F _omb_util_add_prompt_command >/dev/null 2>&1; then
+            _omb_util_add_prompt_command _omb_set_terminal_title
         fi
         _apply_overrides
         echo "Switched Oh-My-Bash theme to: $theme"
