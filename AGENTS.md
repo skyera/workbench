@@ -24,7 +24,8 @@ well-organized code over compact code.
 ### General Rules
 
 *   **One Statement per Line**: Do not pack assignments, calls, branches, or loops onto one line using semicolons or other separators. Expand control flow, including early returns, into clearly indented blocks.
-*   **Consistent Formatting**: Use consistent indentation, spacing around operators, and blank lines between logical steps. Follow established file conventions; for new files, use the language defaults below. Do not use alignment padding that makes later edits unnecessarily noisy.
+*   **Consistent Formatting & Vertical Paragraphing**: Use consistent indentation, spacing around operators, and blank lines between logical steps. Expanding compact code must not create unbroken vertical walls of code. Break functions longer than 15–20 lines into readable logical paragraphs (e.g., argument validation, data transformation, loops, state updates, resource acquisition/release). Group long branching ladders (such as key event handlers or CLI parsers) into logical clusters separated by blank lines and concise category comments.
+*   **Section Dividers**: For substantial single-file tools or modules (>300 lines), use clear 80-column section divider banners (e.g., `--------------------------------------------------------------------------------`) to delineate major layers: constants & FFI, utility helpers, domain/state logic, UI/rendering, host/CLI management, and entry points.
 *   **Descriptive Names**: Choose names that explain purpose and units, such as `refresh_interval_seconds` or `process_start_ticks`. Avoid cryptic abbreviations and single-letter names except for small loop indices or conventional local values.
 *   **Focused Functions**: Keep functions responsible for one coherent task. Extract complex conditions and repeated operations into named helpers. Prefer early returns to deeply nested branches while keeping each return in a readable block.
 *   **Logical File Structure**: Organize files into a short purpose/usage description, imports or dependencies, constants and types, supporting functions, application logic, and a clear entry point, as appropriate. Group related functionality together and keep platform-specific logic easy to locate.
@@ -56,6 +57,7 @@ well-organized code over compact code.
 *   Apply these rules as code is written; do not leave readability as optional follow-up work.
 *   Keep formatting changes within the task's scope. Avoid unrelated repository-wide formatting and keep broad formatting-only changes separate from behavior changes.
 *   Use existing formatter configuration when available. Do not introduce a mandatory formatter dependency without a task-related reason.
+*   **Preserve Structural Comment Invariants**: Never rename, move, or delete structural lifecycle marker comments (e.g., `-- Command-line entry point.`, `-- FFI Declarations`) that test harnesses, loaders, or build scripts inspect or split on.
 *   Before finishing, review the diff and run `git diff --check`, plus relevant syntax checks and tests for changed executable code. For formatting-only changes, explicitly verify that quoting, embedded scripts, and behavior remain intact.
 
 ## Error Handling & Diagnostic Guidelines
