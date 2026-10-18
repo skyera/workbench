@@ -44,16 +44,16 @@ class BinRegressions(unittest.TestCase):
         if driver is not None:
             # Expose the existing local engine to a test driver without changing
             # the production entry point or launching the interactive UI.
-            source = (ROOT / "bin" / (name + ".lua")).read_text()
+            source = (ROOT / "bin" / (name + ".lua")).read_text(encoding="utf-8")
             entry = "main(...)" if name == "fscp" else "main(arg)"
             source = source.rsplit(entry, 1)[0] + driver
             command = [LUAJIT, "-"]
         return subprocess.run(command, input=source, cwd=self.cwd, env=self.env,
-                              text=True, capture_output=True, timeout=20)
+                              text=True, encoding="utf-8", capture_output=True, timeout=20)
 
     def git(self, *args):
         return subprocess.run(["git", *args], cwd=self.cwd, env=self.env,
-                              text=True, capture_output=True, check=True).stdout
+                              text=True, encoding="utf-8", capture_output=True, check=True).stdout
 
     def init_repo(self):
         self.git("init", "-q", "-b", "master")

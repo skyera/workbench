@@ -23,7 +23,7 @@ def lua_string(value):
 
 
 def run_driver(driver):
-    source = (ROOT / "bin/fscp.lua").read_text().rsplit("main(...)", 1)[0]
+    source = (ROOT / "bin/fscp.lua").read_text(encoding="utf-8").rsplit("main(...)", 1)[0]
     return subprocess.run([LUAJIT, "-"], input=source + driver,
                           capture_output=True, text=True, encoding="utf-8", timeout=20)
 

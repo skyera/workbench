@@ -21,14 +21,14 @@ class SelfTestRegressions(unittest.TestCase):
             (ssh / "config").write_text("Host review-host\n HostName 192.0.2.1\n User review\n")
             env = dict(os.environ, HOME=temp, USERPROFILE=temp)
             result = subprocess.run([LUAJIT, str(ROOT / "bin/fssh.lua"), "--test"],
-                                    cwd=temp, env=env, capture_output=True, text=True, timeout=20)
+                                    cwd=temp, env=env, capture_output=True, text=True, encoding="utf-8", timeout=20)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("ALL TESTS PASSED", result.stdout)
 
     def test_rbrowse_forced_ffi_availability_and_engine_cycling(self):
         # Test both platform branches without requiring a Windows host or
         # installing external image conversion utilities.
-        source = (ROOT / "bin/rbrowse.lua").read_text().rsplit("main({ ... })", 1)[0]
+        source = (ROOT / "bin/rbrowse.lua").read_text(encoding="utf-8").rsplit("main({ ... })", 1)[0]
         driver = r'''
 ImageRenderer.preferred_engine = "ffi"
 IS_WINDOWS = false
@@ -47,7 +47,7 @@ for _, expected in ipairs({"chafa", "magick", "python", "auto"}) do
 end
 '''
         result = subprocess.run([LUAJIT, "-"], input=source + driver,
-                                capture_output=True, text=True, timeout=20)
+                                capture_output=True, text=True, encoding="utf-8", timeout=20)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
