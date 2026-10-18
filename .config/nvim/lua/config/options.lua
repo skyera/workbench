@@ -126,6 +126,24 @@ vim.api.nvim_create_autocmd("BufReadPost", {
   end,
 })
 
+-- Prefer built-in syntax rules after filetype plugins start their highlighters.
+vim.cmd("syntax enable")
+local builtin_syntax_group = vim.api.nvim_create_augroup("builtin_syntax", { clear = true })
+vim.api.nvim_create_autocmd("FileType", {
+    group = builtin_syntax_group,
+    pattern = "*",
+    callback = function(event)
+        vim.schedule(function()
+            if not vim.api.nvim_buf_is_valid(event.buf) then
+                return
+            end
+
+            vim.treesitter.stop(event.buf)
+            vim.bo[event.buf].syntax = vim.bo[event.buf].filetype
+        end)
+    end,
+})
+
 -- FileType specific settings
 -- Filename detection also handles new or empty memory-tool logs.
 vim.filetype.add({

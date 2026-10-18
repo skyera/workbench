@@ -294,25 +294,6 @@ return {
     end,
   },
 
-  -- Treesitter
-  {
-    "nvim-treesitter/nvim-treesitter",
-    enabled = false,
-    build = ":TSUpdate",
-    config = function()
-      require("nvim-treesitter").setup({
-        ensure_installed = { "c", "lua", "vim", "vimdoc", "query", "python", "javascript", "typescript", "html", "css" },
-        sync_install = false,
-        auto_install = true,
-        highlight = {
-          enable = true,
-          additional_vim_regex_highlighting = false,
-        },
-        indent = { enable = true },
-      })
-    end,
-  },
-
   -- Coding
   {
     "dhananjaylatkar/cscope_maps.nvim",
