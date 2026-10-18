@@ -4,4 +4,5 @@ if %errorlevel% equ 0 if exist "%~dp0fssh.lua" (
     luajit "%~dp0fssh.lua" %*
     exit /b %errorlevel%
 )
-python "%~dp0fssh.py" %*
+echo [ERROR] luajit is required to run fssh. 1>&2
+exit /b 1

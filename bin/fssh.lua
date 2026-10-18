@@ -84,8 +84,32 @@ else
                 ffi.C.SetConsoleMode(hOut, bit.bor(mode[0], 0x0004))
             end
         end
+        local hErr = ffi.C.GetStdHandle(ffi.cast("DWORD", -12))
+        if hErr ~= nil and hErr ~= ffi.cast("HANDLE", -1) then
+            local mode = ffi.new("DWORD[1]")
+            if ffi.C.GetConsoleMode(hErr, mode) ~= 0 then
+                ffi.C.SetConsoleMode(hErr, bit.bor(mode[0], 0x0004))
+            end
+        end
     end)
 end
+
+--------------------------------------------------------------------------------
+-- ANSI Colors
+--------------------------------------------------------------------------------
+local C = {
+    reset   = "\27[0m",
+    bold    = "\27[1m",
+    dim     = "\27[2m",
+    cyan    = "\27[36m",
+    green   = "\27[32m",
+    yellow  = "\27[33m",
+    blue    = "\27[34m",
+    magenta = "\27[35m",
+    red     = "\27[31m",
+    white   = "\27[37m",
+    gray    = "\27[90m",
+}
 
 --------------------------------------------------------------------------------
 -- Helper Utilities
@@ -646,26 +670,14 @@ end
 --------------------------------------------------------------------------------
 -- Execution & Connection Engine
 --------------------------------------------------------------------------------
-local function connect(selected_host, override_user, extra_args, dry_run, use_putty)
+local function build_connection_command(selected_host, override_user, extra_args, use_putty)
     local name = selected_host.name
     local hostname = selected_host.hostname
     local config_user = selected_host.user or ""
-    local user = (override_user ~= "") and override_user or config_user
+    local user = (override_user and override_user ~= "") and override_user or config_user
     local port = selected_host.port or "22"
     local key = selected_host.key or ""
     local source = selected_host.source or ""
-
-    -- Prompt user if missing (only in interactive mode, not during dry-run or piped stdin)
-    local is_interactive = not dry_run and (IS_WINDOWS or ffi.C.isatty(0) ~= 0)
-    if user == "" and source ~= "ssh-config" and is_interactive then
-        local default_user = os.getenv("USER") or os.getenv("USERNAME") or "root"
-        io.write(string.format("[fssh] No user configured for '%s'. Enter remote user [%s]: ", name, default_user))
-        io.flush()
-        local entered = io.read("*line")
-        if not entered then return end
-        entered = trim(entered)
-        user = (entered ~= "") and entered or default_user
-    end
 
     -- PuTTY mode
     if use_putty or (source == "putty" and IS_WINDOWS) then
@@ -675,13 +687,7 @@ local function connect(selected_host, override_user, extra_args, dry_run, use_pu
             table.insert(p_cmd, "-l")
             table.insert(p_cmd, user)
         end
-        if dry_run then
-            print("Dry run: " .. table.concat(p_cmd, " "))
-            return
-        end
-        print(string.format("[fssh] Launching PuTTY session: %s...", name))
-        os.execute(table.concat(p_cmd, " "))
-        return
+        return p_cmd, true
     end
 
     -- Standard OpenSSH
@@ -709,12 +715,43 @@ local function connect(selected_host, override_user, extra_args, dry_run, use_pu
         end
     end
 
-    for _, a in ipairs(extra_args) do
+    for _, a in ipairs(extra_args or {}) do
         table.insert(cmd, a)
     end
 
+    return cmd, false
+end
+
+local function connect(selected_host, override_user, extra_args, dry_run, use_putty)
+    local name = selected_host.name
+    local hostname = selected_host.hostname
+    local config_user = selected_host.user or ""
+    local user = (override_user ~= "") and override_user or config_user
+    local source = selected_host.source or ""
+
+    -- Prompt user if missing (only in interactive mode, not during dry-run or piped stdin)
+    local is_interactive = not dry_run and (IS_WINDOWS or ffi.C.isatty(0) ~= 0)
+    if user == "" and source ~= "ssh-config" and is_interactive then
+        local default_user = os.getenv("USER") or os.getenv("USERNAME") or "root"
+        io.write(string.format("[fssh] No user configured for '%s'. Enter remote user [%s]: ", name, default_user))
+        io.flush()
+        local entered = io.read("*line")
+        if not entered then return end
+        entered = trim(entered)
+        user = (entered ~= "") and entered or default_user
+        override_user = user
+    end
+
+    local cmd, is_putty = build_connection_command(selected_host, override_user, extra_args, use_putty)
+
     if dry_run then
         print("Dry run: " .. table.concat(cmd, " "))
+        return
+    end
+
+    if is_putty then
+        print(string.format("[fssh] Launching PuTTY session: %s...", name))
+        os.execute(table.concat(cmd, " "))
         return
     end
 
@@ -736,6 +773,68 @@ end
 -- CLI Entry Point
 --------------------------------------------------------------------------------
 local function main(args)
+    -- 0. Test Suite
+    if #args >= 1 and args[1] == "--test" then
+        print(C.bold .. C.cyan .. "[TEST] Running fssh.lua Automated Test Suite..." .. C.reset)
+
+        -- 1. Test host collection
+        local all_hosts = collect_all_hosts()
+        assert(#all_hosts > 0, "collect_all_hosts should discover at least 1 host")
+        print(string.format("  [PASS] collect_all_hosts(): discovered %d hosts", #all_hosts))
+
+        -- 2. Test format_preview
+        local sample_host = all_hosts[1]
+        local preview = format_preview(sample_host)
+        assert(preview and preview:find(sample_host.name), "Preview card must contain host name")
+        print("  [PASS] format_preview(): renders preview card")
+
+        -- 3. Test build_connection_command (OpenSSH config alias)
+        local ssh_alias_host = { name = "web-prod", hostname = "10.0.0.1", user = "admin", port = "22", source = "ssh-config" }
+        local c1 = build_connection_command(ssh_alias_host, "", {}, false)
+        assert(table.concat(c1, " ") == "ssh web-prod", "OpenSSH config host should use alias name: " .. table.concat(c1, " "))
+        print("  [PASS] build_connection_command(ssh-config): preserves alias")
+
+        -- 4. Test build_connection_command (User override on ssh-config)
+        local c2 = build_connection_command(ssh_alias_host, "deploy", {}, false)
+        assert(table.concat(c2, " ") == "ssh deploy@web-prod", "User override failed: " .. table.concat(c2, " "))
+        print("  [PASS] build_connection_command(user override): uses user@alias")
+
+        -- 5. Test build_connection_command (Custom host with non-standard port and key)
+        local custom_host = { name = "remote-node", hostname = "192.168.1.50", user = "root", port = "2222", key = "~/.ssh/id_ed25519", source = "custom" }
+        local c3 = build_connection_command(custom_host, "", {}, false)
+        assert(table.concat(c3, " ") == "ssh -p 2222 -i ~/.ssh/id_ed25519 root@192.168.1.50", "Custom host command failed: " .. table.concat(c3, " "))
+        print("  [PASS] build_connection_command(custom host): formats port, key, user@hostname")
+
+        -- 6. Test build_connection_command with extra arguments and commands
+        local c4 = build_connection_command(ssh_alias_host, "", { "-v", "-L", "8080:localhost:80", "df -h" }, false)
+        assert(table.concat(c4, " ") == "ssh web-prod -v -L 8080:localhost:80 df -h", "Extra args failed: " .. table.concat(c4, " "))
+        print("  [PASS] build_connection_command(extra args): passes flags and remote commands")
+
+        -- 7. Test PuTTY command formatting
+        local putty_host = { name = "pi5-session", hostname = "pi5.local", user = "pi", port = "22", source = "putty" }
+        local c5, is_p = build_connection_command(putty_host, "", {}, true)
+        assert(is_p == true, "Should identify PuTTY mode")
+        assert(table.concat(c5, " ") == "putty -load pi5-session", "PuTTY command failed: " .. table.concat(c5, " "))
+
+        local c6 = build_connection_command(putty_host, "root", {}, true)
+        assert(table.concat(c6, " ") == "putty -load pi5-session -l root", "PuTTY user override failed: " .. table.concat(c6, " "))
+        print("  [PASS] build_connection_command(putty): formats -load and -l overrides")
+
+        -- 8. Test dry-run execution
+        local dry_ran = false
+        local old_print = print
+        print = function(s)
+            if s and s:find("^Dry run: ssh web%-prod") then dry_ran = true end
+        end
+        connect(ssh_alias_host, "", {}, true, false)
+        print = old_print
+        assert(dry_ran, "connect dry-run should output command without error")
+        print("  [PASS] connect(dry_run): prints command string")
+
+        print(C.bold .. C.green .. "[ALL TESTS PASSED SUCCESSFULLY]" .. C.reset)
+        return
+    end
+
     local all_hosts = collect_all_hosts()
 
     -- 1. Preview Only mode (used by fzf live preview)
@@ -787,6 +886,7 @@ Options:
   -d, --dry-run               Print the ssh command without executing
   -u, --user <USER>           Override SSH user
   --putty                     Connect using PuTTY instead of OpenSSH (Windows)
+  --test                      Run automated self-tests
   -h, --help                  Show this help message
 ]])
             return
