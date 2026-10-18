@@ -106,6 +106,13 @@ if IS_WINDOWS then
                 ffi.C.SetConsoleMode(hOut, bit.bor(mode[0], 0x0004))
             end
         end
+        local hErr = ffi.C.GetStdHandle(ffi.cast("DWORD", -12))
+        if hErr ~= nil and hErr ~= ffi.cast("HANDLE", -1) then
+            local mode = ffi.new("DWORD[1]")
+            if ffi.C.GetConsoleMode(hErr, mode) ~= 0 then
+                ffi.C.SetConsoleMode(hErr, bit.bor(mode[0], 0x0004))
+            end
+        end
     end)
 else
     -- POSIX FFI for Linux / WSL testing
@@ -423,8 +430,69 @@ Options:
   -s, --scan        Scan target folders and report sizes only
   -y, --yes         Proceed with cleanup without interactive prompt
   -d, --dry-run     Simulate deletion without modifying files
+  --test            Run automated self-tests
   -h, --help        Show this help message
 ]])
+            return
+        elseif a == "--test" then
+            print(C.b_cyan .. "[TEST] Running clean_c_drive.lua Automated Verification Suite..." .. C.reset)
+
+            -- 1. Test Unicode conversion (round-trip)
+            if IS_WINDOWS then
+                local orig_str = "C:\\Windows\\Temp\\test_file.tmp"
+                local w = to_wide(orig_str)
+                assert(w ~= nil, "to_wide should return non-nil")
+                local back = from_wide(w)
+                assert(back == orig_str, string.format("Unicode conversion failed: expected '%s', got '%s'", orig_str, back))
+                print("  [PASS] to_wide and from_wide round-trip conversion")
+            end
+
+            -- 2. Test get_targets
+            local targets = get_targets()
+            assert(type(targets) == "table", "get_targets should return table")
+            assert(#targets > 0, "get_targets should discover targets")
+            for _, t in ipairs(targets) do
+                assert(t.name and t.name ~= "", "Target must have a name")
+                assert(t.path and t.path ~= "", "Target must have a path")
+            end
+            print(string.format("  [PASS] get_targets(): discovered %d valid cleanup targets", #targets))
+
+            -- 3. Test folder scanning on current repository
+            local scanned_bytes, scanned_files = scan_folder(".")
+            assert(scanned_files > 0, "scan_folder on '.' should discover files")
+            assert(scanned_bytes > 0, "scan_folder on '.' should discover positive bytes")
+            print(string.format("  [PASS] scan_folder('.'): found %d files (%d bytes)", scanned_files, scanned_bytes))
+
+            -- 4. Test dry-run folder cleaning on temporary test directory
+            local tmp_dir = os.getenv("TEMP") or "/tmp"
+            local test_folder = tmp_dir .. "\\clean_c_test_" .. tostring(os.time())
+            if not IS_WINDOWS then test_folder = tmp_dir .. "/clean_c_test_" .. tostring(os.time()) end
+            os.execute("mkdir \"" .. test_folder .. "\" >nul 2>&1 || mkdir -p \"" .. test_folder .. "\" 2>/dev/null")
+
+            local f1 = io.open(test_folder .. (IS_WINDOWS and "\\file1.tmp" or "/file1.tmp"), "w")
+            if f1 then f1:write("test content 1"); f1:close() end
+            local f2 = io.open(test_folder .. (IS_WINDOWS and "\\file2.tmp" or "/file2.tmp"), "w")
+            if f2 then f2:write("test content 2"); f2:close() end
+
+            local freed, del_f = clean_folder(test_folder, true) -- dry_run = true
+            assert(del_f == 2, string.format("Dry run should report 2 files, got %d", del_f))
+            assert(freed > 0, "Dry run should report positive freed bytes")
+
+            -- Verify files were NOT actually deleted in dry run
+            local check_f = io.open(test_folder .. (IS_WINDOWS and "\\file1.tmp" or "/file1.tmp"), "r")
+            assert(check_f ~= nil, "File should still exist after dry-run")
+            if check_f then check_f:close() end
+
+            -- Clean up real folder
+            clean_folder(test_folder, false)
+            if IS_WINDOWS then
+                os.execute("rmdir \"" .. test_folder .. "\" >nul 2>&1")
+            else
+                os.execute("rm -rf \"" .. test_folder .. "\" 2>/dev/null")
+            end
+            print("  [PASS] clean_folder dry-run simulation and safe cleanup")
+
+            print(C.b_green .. "[ALL TESTS PASSED SUCCESSFULLY]" .. C.reset)
             return
         elseif a == "-s" or a == "--scan" then
             scan_only = true

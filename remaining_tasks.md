@@ -49,7 +49,7 @@ The following older Python and PowerShell scripts are now obsolete and can be sa
 | :--- | :--- | :--- |
 | ~~**`bin/fssh.py`** (24.5 KB)~~<br>~~**`bin/fssh.ps1`**~~ | [`bin/fssh.lua`](bin/fssh.lua) (30.8 KB) | **Retired**: Removed `fssh.py` and `fssh.ps1`, eliminated Python fallbacks in `fssh.bat` and `fssh.sh`, added automated `--test` suite. |
 | **[`bin/dotag.py`](bin/dotag.py)** (15.2 KB) | [`bin/dotag.lua`](bin/dotag.lua) (81.6 KB) | Native LuaJIT implementation has full feature parity with zero Python dependencies. Remove `dotag.py`. |
-| **[`bin/clean_c_drive.ps1`](bin/clean_c_drive.ps1)** (4.4 KB) | [`bin/clean_c_drive.lua`](bin/clean_c_drive.lua) (21.4 KB) | Native LuaJIT tool uses Win32 `FindFirstFileW` and `GetDiskFreeSpaceExW` without PowerShell cold-start delay (~1.2s). Remove `clean_c_drive.ps1`. |
+| ~~**`bin/clean_c_drive.ps1`** (4.4 KB)~~ | [`bin/clean_c_drive.lua`](bin/clean_c_drive.lua) (21.4 KB) | **Retired**: Removed `clean_c_drive.ps1`, eliminated PowerShell fallback in `clean_c_drive.bat`, added dual-stream console VT init and automated `--test` suite. |
 
 ---
 
@@ -83,4 +83,5 @@ The following older Python and PowerShell scripts are now obsolete and can be sa
 - [x] **Redundant Git Scripts**: Retired `gbd.bat`, `gcb.bat`, `gcbf.bat`, and `gdbf.bat` in favor of `fbr` and `fco`. *(Shipped `2368724`)*
 - [x] **PuTTY Management**: Fixed theme discovery (618+ themes in ~79 ms) and retired legacy `putty_colors.py` / `putty_sessions.py`. *(Shipped `fa79270`)*
 - [x] **`fscp.lua` Consolidation**: Unified `fscp_tui.lua` and `fscp.lua` into a single Dual-Pane TUI default tool with `--fzf` mode and headless CLI support. *(Shipped `91fea9b`)*
-- [x] **`fssh` Modernization**: Retired legacy `fssh.py` and `fssh.ps1`, streamlined wrappers to native `fssh.lua`, added automated test suite. *(Completed)*
+- [x] **`fssh` Modernization**: Retired legacy `fssh.py` and `fssh.ps1`, streamlined wrappers to native `fssh.lua`, added automated test suite. *(Shipped `b9a1f0e`)*
+- [x] **`clean_c_drive.ps1` Retirement**: Removed legacy PowerShell script, streamlined `clean_c_drive.bat` to `clean_c_drive.lua`, added dual-stream console init and automated `--test` suite. *(Completed)*
