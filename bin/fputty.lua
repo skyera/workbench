@@ -1107,11 +1107,14 @@ local function cmd_colors(args)
         io.stderr:write("Error: fzf is not installed or failed to launch.\n")
         return false
     end
-    local key_pressed = pipe:read("*line")
-    local selected = pipe:read("*line")
-    pipe:close()
+    local ok_read, key_pressed, selected = pcall(function()
+        local k = pipe:read("*line")
+        local s = pipe:read("*line")
+        return k, s
+    end)
+    pcall(function() pipe:close() end)
 
-    if not key_pressed or not selected or selected == "" then
+    if not ok_read or not key_pressed or not selected or selected == "" then
         return true
     end
 
@@ -1131,22 +1134,22 @@ end
 -- CLI Entry Point
 --------------------------------------------------------------------------------
 local function main(args)
-    local cmd = args[1]
-    local result = nil
-    if cmd == "sessions" then
-        local sub_args = {}
-        for i = 2, #args do
-            table.insert(sub_args, args[i])
-        end
-        result = cmd_sessions(sub_args)
-    elseif cmd == "colors" or cmd == "themes" then
-        local sub_args = {}
-        for i = 2, #args do
-            table.insert(sub_args, args[i])
-        end
-        result = cmd_colors(sub_args)
-    elseif cmd == "-h" or cmd == "--help" or cmd == "help" then
-        print([[fputty.lua - PuTTY Session & Color Scheme Manager (LuaJIT FFI)
+    local ok, result = pcall(function()
+        local cmd = args[1]
+        if cmd == "sessions" then
+            local sub_args = {}
+            for i = 2, #args do
+                table.insert(sub_args, args[i])
+            end
+            return cmd_sessions(sub_args)
+        elseif cmd == "colors" or cmd == "themes" then
+            local sub_args = {}
+            for i = 2, #args do
+                table.insert(sub_args, args[i])
+            end
+            return cmd_colors(sub_args)
+        elseif cmd == "-h" or cmd == "--help" or cmd == "help" then
+            print([[fputty.lua - PuTTY Session & Color Scheme Manager (LuaJIT FFI)
 Usage:
   fputty.lua sessions [OPTIONS] [FILTER]
   fputty.lua colors [SUBCOMMAND] [THEME] [OPTIONS]
@@ -1155,11 +1158,23 @@ Commands:
   sessions                  List and export saved PuTTY sessions
   colors                    Browse, preview, apply, and export 650+ color themes
 ]])
-    elseif cmd == nil then
-        result = cmd_colors({})
-    else
-        result = report_error("Unknown command '" .. cmd .. "'. Run 'fputty.lua --help'.")
+            return true
+        elseif cmd == nil then
+            return cmd_colors({})
+        else
+            return report_error("Unknown command '" .. cmd .. "'. Run 'fputty.lua --help'.")
+        end
+    end)
+
+    if not ok then
+        if type(result) == "string" and result:find("interrupted", 1, true) then
+            os.exit(130)
+        else
+            io.stderr:write("Error: " .. tostring(result) .. "\n")
+            os.exit(1)
+        end
     end
+
     if result == false then
         os.exit(1)
     end

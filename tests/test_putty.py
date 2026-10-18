@@ -788,5 +788,30 @@ assert(applied_targets[2] == "session1" and applied_targets[3] == "session2" and
         self.assert_lua_passed(result)
 
 
+    def test_interactive_colors_catches_pipe_read_interrupted_gracefully(self):
+        result = self.lua(r'''
+local writes = 0
+apply_colors_to_session = function()
+    writes = writes + 1
+    return true
+end
+local original_popen = io.popen
+io.popen = function(cmd)
+    if cmd:find("fzf", 1, true) then
+        return {
+            read = function() error("interrupted!") end,
+            close = function() return nil, "signal", 2 end,
+        }
+    end
+    return original_popen(cmd)
+end
+os.execute = function() return 0 end
+local res = cmd_colors({})
+assert(res == true, "cmd_colors should catch interrupted! and return true")
+assert(writes == 0, "apply_colors_to_session must not be called when interrupted")
+''')
+        self.assert_lua_passed(result)
+
+
 if __name__ == "__main__":
     unittest.main()
