@@ -72,6 +72,21 @@ class BinRegressions(unittest.TestCase):
         self.assertEqual(json.loads(self.capture.read_text()),
                          ["-r", "-i", key, filename, "review-host:/remote dir"])
 
+    def test_dry_run_requires_a_host_and_never_executes_transfer(self):
+        for args in ([], ["--host"], ["--host", ""], ["--host", "   "]):
+            with self.subTest(args=args):
+                result = self.lua("fscp", "--dry-run", *args)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("--dry-run requires a host", result.stderr)
+                self.assertIn("--host <HOST>", result.stderr)
+                self.assertNotIn("stack traceback", result.stderr)
+                self.assertFalse(self.capture.exists())
+        result = self.lua("fscp", "--dry-run", "--scp", "--host", "review-host", "file.txt")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Dry run (scp):", result.stdout)
+        self.assertIn("review-host:~/", result.stdout)
+        self.assertFalse(self.capture.exists())
+
     def test_headless_rsync_remote_shell_has_no_outer_quotes(self):
         result = self.lua("fscp", "--rsync", "-H", "review-host", "-p", "2222",
                           "quarterly report.txt")

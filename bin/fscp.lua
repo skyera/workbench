@@ -3659,6 +3659,11 @@ TUI Keybindings:
         i = i + 1
     end
 
+    if dry_run and (not cli_host or trim(cli_host) == "") then
+        io.stderr:write("Error: --dry-run requires a host. Use --host <HOST> (or -H <HOST>).\n")
+        os.exit(1)
+    end
+
     local all_hosts = aggregate_ssh_hosts()
 
     -- Execution Dispatching:
