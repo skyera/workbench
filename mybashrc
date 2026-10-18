@@ -1527,16 +1527,6 @@ alias gbgd='git_clean_gone'
 alias gbgD='git_clean_gone -f'
 
 
-gdbf() {
-    local branches
-    branches=$(git branch --sort=-committerdate --format="%(if)%(HEAD)%(then)%(else)%(refname:short)%(end)" 2>/dev/null |
-        grep -v '^$' |
-        fzf --multi --height 40% --reverse --header="[Git Delete Branch] TAB to multi-select, ENTER to delete (-D)" --preview 'git log -15 --color=always --graph --pretty=format:"%Cred%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%cr)%Creset" {1}') || return 0
-    if [[ -n "$branches" ]]; then
-        echo "$branches" | xargs git branch -D "$@"
-    fi
-}
-
 alias fzlog='git-fuzzy log'
 alias fzstash='git-fuzzy stash'
 alias fzbranch='git-fuzzy branch'
