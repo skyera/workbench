@@ -2456,19 +2456,20 @@ function App.draw()
         C.bg_gray, C.bold .. C.bright_white, pad_string(footer, w), C.reset
     ))
 
-    io.write(table.concat(buf))
+    if App.modal == "help" then
+        App.draw_help_modal(buf)
+    elseif App.modal == "host_picker" then
+        App.draw_host_picker_modal(buf)
+    end
+
+    io.write("\27[?2026h" .. table.concat(buf))
     if App.pending_graphic then
         local g = App.pending_graphic
         io.write(string.format("\27[%d;%dH%s", g.y, g.x, g.data))
         App.pending_graphic = nil
     end
+    io.write("\27[?2026l")
     io.flush()
-
-    if App.modal == "help" then
-        App.draw_help_modal()
-    elseif App.modal == "host_picker" then
-        App.draw_host_picker_modal()
-    end
 end
 
 function App.open_host_picker()
@@ -2482,7 +2483,7 @@ function App.open_host_picker()
     App.modal = "host_picker"
 end
 
-function App.draw_host_picker_modal()
+function App.draw_host_picker_modal(target_buf)
     local w, h = App.term_w, App.term_h
     local mw = math.min(84, w - 4)
     local mh = math.min(18, h - 4)
@@ -2540,17 +2541,19 @@ function App.draw_host_picker_modal()
     table.insert(lines, BOX.v .. pad_string(esc_hint, mw - 2) .. BOX.v)
     table.insert(lines, BOX.bl .. BOX.h:rep(mw - 2) .. BOX.br)
 
-    local modal_buf = {}
+    local modal_buf = target_buf or {}
     for i, line in ipairs(lines) do
         table.insert(modal_buf, string.format("\27[%d;%dH%s%s%s",
             my + i - 1, mx, C.bold .. C.bright_cyan, line, C.reset
         ))
     end
-    io.write(table.concat(modal_buf))
-    io.flush()
+    if not target_buf then
+        io.write(table.concat(modal_buf))
+        io.flush()
+    end
 end
 
-function App.draw_help_modal()
+function App.draw_help_modal(target_buf)
     local w, h = App.term_w, App.term_h
     local mw = math.min(72, w - 4)
 
@@ -2580,15 +2583,17 @@ function App.draw_help_modal()
     local mx = math.floor((w - mw) / 2)
     local my = math.floor((h - mh) / 2)
 
-    local modal_buf = {}
+    local modal_buf = target_buf or {}
     table.insert(modal_buf, string.format("\27[%d;%dH%s┌%s┐%s", my, mx, C.bold .. C.bright_cyan, string.rep("─", mw - 2), C.reset))
     for idx, l in ipairs(lines) do
         table.insert(modal_buf, string.format("\27[%d;%dH%s│%s %s %s│%s",
             my + idx, mx, C.bold .. C.bright_cyan, C.reset, pad_string(l, mw - 4), C.bold .. C.bright_cyan, C.reset))
     end
     table.insert(modal_buf, string.format("\27[%d;%dH%s└%s┘%s", my + #lines + 1, mx, C.bold .. C.bright_cyan, string.rep("─", mw - 2), C.reset))
-    io.write(table.concat(modal_buf))
-    io.flush()
+    if not target_buf then
+        io.write(table.concat(modal_buf))
+        io.flush()
+    end
 end
 
 function App.handle_key(key)
@@ -2786,12 +2791,34 @@ function App.run()
         App.load_dir(App.current_dir)
     end
 
+    local last_w, last_h = Term.get_size()
+    App.term_w, App.term_h = last_w, last_h
+    App.draw()
+
     while App.running do
-        App.term_w, App.term_h = Term.get_size()
-        App.draw()
-        local key = Term.read_key()
-        if key then
+        local key = nil
+        while not key and App.running do
+            local cur_w, cur_h = Term.get_size()
+            if cur_w ~= last_w or cur_h ~= last_h then
+                last_w, last_h = cur_w, cur_h
+                App.term_w, App.term_h = cur_w, cur_h
+                App.draw()
+            end
+            key = Term.read_key()
+            if not key then
+                if IS_WINDOWS then
+                    ffi.C.Sleep(20)
+                else
+                    ffi.C.usleep(20000)
+                end
+            end
+        end
+
+        if key and App.running then
             App.handle_key(key)
+            if App.running then
+                App.draw()
+            end
         end
     end
 
