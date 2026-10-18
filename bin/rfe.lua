@@ -130,8 +130,26 @@ else
 end
 
 --------------------------------------------------------------------------------
--- ANSI Colors & Styling
+-- ANSI Colors, TrueColor Themes & Styling
 --------------------------------------------------------------------------------
+local function rgb_fg(r, g, b)
+    return string.format("\27[38;2;%d;%d;%dm", r, g, b)
+end
+
+local function rgb_bg(r, g, b)
+    return string.format("\27[48;2;%d;%d;%dm", r, g, b)
+end
+
+local function hex_fg(hex_code)
+    local r, g, b = hex_code:match("#?(%x%x)(%x%x)(%x%x)")
+    return rgb_fg(tonumber(r, 16), tonumber(g, 16), tonumber(b, 16))
+end
+
+local function hex_bg(hex_code)
+    local r, g, b = hex_code:match("#?(%x%x)(%x%x)(%x%x)")
+    return rgb_bg(tonumber(r, 16), tonumber(g, 16), tonumber(b, 16))
+end
+
 local C = {
     reset       = "\27[0m",
     bold        = "\27[1m",
@@ -166,6 +184,296 @@ local C = {
     bg_sel      = "\27[48;5;238m",
     bg_header   = "\27[48;5;24m",
 }
+
+local ThemeManager = {
+    current = "nord",
+    order = { "nord", "dracula", "tokyonight", "catppuccin", "gruvbox", "onedark", "solarized", "classic" },
+    themes = {
+        nord = {
+            name = "Nord",
+            desc = "Arctic ice-blue & polar night TrueColor palette",
+            colors = {
+                black          = hex_fg("2E3440"),
+                red            = hex_fg("BF616A"),
+                green          = hex_fg("A3BE8C"),
+                yellow         = hex_fg("EBCB8B"),
+                blue           = hex_fg("81A1C1"),
+                magenta        = hex_fg("B48EAD"),
+                cyan           = hex_fg("88C0D0"),
+                white          = hex_fg("D8DEE9"),
+                gray           = hex_fg("4C566A"),
+                bright_red     = hex_fg("D08770"),
+                bright_green   = hex_fg("A3BE8C"),
+                bright_yellow  = hex_fg("EBCB8B"),
+                bright_blue    = hex_fg("5E81AC"),
+                bright_magenta = hex_fg("B48EAD"),
+                bright_cyan    = hex_fg("8FBCBB"),
+                bright_white   = hex_fg("ECEFF4"),
+                bg_black       = hex_bg("2E3440"),
+                bg_blue        = hex_bg("5E81AC"),
+                bg_cyan        = hex_bg("88C0D0"),
+                bg_gray        = hex_bg("3B4252"),
+                bg_darkgray    = hex_bg("2E3440"),
+                bg_sel         = hex_bg("434C5E"),
+                bg_header      = hex_bg("3B4252"),
+            },
+        },
+        dracula = {
+            name = "Dracula",
+            desc = "High-contrast vampire purple/cyan/pink TrueColor palette",
+            colors = {
+                black          = hex_fg("282A36"),
+                red            = hex_fg("FF5555"),
+                green          = hex_fg("50FA7B"),
+                yellow         = hex_fg("F1FA8C"),
+                blue           = hex_fg("BD93F9"),
+                magenta        = hex_fg("FF79C6"),
+                cyan           = hex_fg("8BE9FD"),
+                white          = hex_fg("F8F8F2"),
+                gray           = hex_fg("6272A4"),
+                bright_red     = hex_fg("FF6E6E"),
+                bright_green   = hex_fg("69FF94"),
+                bright_yellow  = hex_fg("FFFFA5"),
+                bright_blue    = hex_fg("D6ACFF"),
+                bright_magenta = hex_fg("FF92DF"),
+                bright_cyan    = hex_fg("A4FFFF"),
+                bright_white   = hex_fg("FFFFFF"),
+                bg_black       = hex_bg("282A36"),
+                bg_blue        = hex_bg("BD93F9"),
+                bg_cyan        = hex_bg("8BE9FD"),
+                bg_gray        = hex_bg("44475A"),
+                bg_darkgray    = hex_bg("21222C"),
+                bg_sel         = hex_bg("44475A"),
+                bg_header      = hex_bg("383A59"),
+            },
+        },
+        tokyonight = {
+            name = "Tokyo Night",
+            desc = "Deep storm blue neon Tokyo nightlife palette",
+            colors = {
+                black          = hex_fg("1A1B26"),
+                red            = hex_fg("F7768E"),
+                green          = hex_fg("9ECE6A"),
+                yellow         = hex_fg("E0AF68"),
+                blue           = hex_fg("7AA2F7"),
+                magenta        = hex_fg("BB9AF7"),
+                cyan           = hex_fg("7DCFFF"),
+                white          = hex_fg("C0CAF5"),
+                gray           = hex_fg("565F89"),
+                bright_red     = hex_fg("FF899D"),
+                bright_green   = hex_fg("B9F27C"),
+                bright_yellow  = hex_fg("FF9E3B"),
+                bright_blue    = hex_fg("89DDFF"),
+                bright_magenta = hex_fg("C099FF"),
+                bright_cyan    = hex_fg("B4F9F8"),
+                bright_white   = hex_fg("D5DCF8"),
+                bg_black       = hex_bg("1A1B26"),
+                bg_blue        = hex_bg("7AA2F7"),
+                bg_cyan        = hex_bg("7DCFFF"),
+                bg_gray        = hex_bg("24283B"),
+                bg_darkgray    = hex_bg("16161E"),
+                bg_sel         = hex_bg("2F3549"),
+                bg_header      = hex_bg("1F2335"),
+            },
+        },
+        catppuccin = {
+            name = "Catppuccin Mocha",
+            desc = "Warm soothing pastel Mocha TrueColor palette",
+            colors = {
+                black          = hex_fg("1E1E2E"),
+                red            = hex_fg("F38BA8"),
+                green          = hex_fg("A6E3A1"),
+                yellow         = hex_fg("F9E2AF"),
+                blue           = hex_fg("89B4FA"),
+                magenta        = hex_fg("CBA6F7"),
+                cyan           = hex_fg("89DCEB"),
+                white          = hex_fg("CDD6F4"),
+                gray           = hex_fg("6C7086"),
+                bright_red     = hex_fg("EBA0AC"),
+                bright_green   = hex_fg("94E2D5"),
+                bright_yellow  = hex_fg("FAB387"),
+                bright_blue    = hex_fg("B4BEFE"),
+                bright_magenta = hex_fg("F5C2E7"),
+                bright_cyan    = hex_fg("74C7EC"),
+                bright_white   = hex_fg("BAC2DE"),
+                bg_black       = hex_bg("1E1E2E"),
+                bg_blue        = hex_bg("89B4FA"),
+                bg_cyan        = hex_bg("89DCEB"),
+                bg_gray        = hex_bg("313244"),
+                bg_darkgray    = hex_bg("181825"),
+                bg_sel         = hex_bg("45475A"),
+                bg_header      = hex_bg("181825"),
+            },
+        },
+        gruvbox = {
+            name = "Gruvbox Dark",
+            desc = "Retro warm earthen groove TrueColor palette",
+            colors = {
+                black          = hex_fg("282828"),
+                red            = hex_fg("CC241D"),
+                green          = hex_fg("98971A"),
+                yellow         = hex_fg("D79921"),
+                blue           = hex_fg("458588"),
+                magenta        = hex_fg("B16286"),
+                cyan           = hex_fg("689D6A"),
+                white          = hex_fg("EBDBB2"),
+                gray           = hex_fg("928374"),
+                bright_red     = hex_fg("FB4934"),
+                bright_green   = hex_fg("B8BB26"),
+                bright_yellow  = hex_fg("FABD2F"),
+                bright_blue    = hex_fg("83A598"),
+                bright_magenta = hex_fg("D3869B"),
+                bright_cyan    = hex_fg("8EC07C"),
+                bright_white   = hex_fg("FBF1C7"),
+                bg_black       = hex_bg("282828"),
+                bg_blue        = hex_bg("458588"),
+                bg_cyan        = hex_bg("689D6A"),
+                bg_gray        = hex_bg("3C3836"),
+                bg_darkgray    = hex_bg("1D2021"),
+                bg_sel         = hex_bg("504945"),
+                bg_header      = hex_bg("32302F"),
+            },
+        },
+        onedark = {
+            name = "One Dark",
+            desc = "Classic Atom/VSCode iconic dark palette",
+            colors = {
+                black          = hex_fg("282C34"),
+                red            = hex_fg("E06C75"),
+                green          = hex_fg("98C379"),
+                yellow         = hex_fg("E5C07B"),
+                blue           = hex_fg("61AFEF"),
+                magenta        = hex_fg("C678DD"),
+                cyan           = hex_fg("56B6C2"),
+                white          = hex_fg("ABB2BF"),
+                gray           = hex_fg("5C6370"),
+                bright_red     = hex_fg("BE5046"),
+                bright_green   = hex_fg("A5E075"),
+                bright_yellow  = hex_fg("F0C674"),
+                bright_blue    = hex_fg("4FA6ED"),
+                bright_magenta = hex_fg("D286E6"),
+                bright_cyan    = hex_fg("68CCD8"),
+                bright_white   = hex_fg("E6E6E6"),
+                bg_black       = hex_bg("282C34"),
+                bg_blue        = hex_bg("61AFEF"),
+                bg_cyan        = hex_bg("56B6C2"),
+                bg_gray        = hex_bg("3E4451"),
+                bg_darkgray    = hex_bg("21252B"),
+                bg_sel         = hex_bg("4B5263"),
+                bg_header      = hex_bg("21252B"),
+            },
+        },
+        solarized = {
+            name = "Solarized Dark",
+            desc = "Precision low-contrast solarized dark palette",
+            colors = {
+                black          = hex_fg("002B36"),
+                red            = hex_fg("DC322F"),
+                green          = hex_fg("859900"),
+                yellow         = hex_fg("B58900"),
+                blue           = hex_fg("268BD2"),
+                magenta        = hex_fg("D33682"),
+                cyan           = hex_fg("2AA198"),
+                white          = hex_fg("839496"),
+                gray           = hex_fg("657B83"),
+                bright_red     = hex_fg("CB4B16"),
+                bright_green   = hex_fg("98B100"),
+                bright_yellow  = hex_fg("C29800"),
+                bright_blue    = hex_fg("3399DD"),
+                bright_magenta = hex_fg("6C71C4"),
+                bright_cyan    = hex_fg("33B7AD"),
+                bright_white   = hex_fg("FDF6E3"),
+                bg_black       = hex_bg("002B36"),
+                bg_blue        = hex_bg("268BD2"),
+                bg_cyan        = hex_bg("2AA198"),
+                bg_gray        = hex_bg("073642"),
+                bg_darkgray    = hex_bg("001F27"),
+                bg_sel         = hex_bg("073642"),
+                bg_header      = hex_bg("073642"),
+            },
+        },
+        classic = {
+            name = "Classic ANSI",
+            desc = "Standard 16-color ANSI terminal fallback",
+            colors = {
+                black          = "\27[30m",
+                red            = "\27[31m",
+                green          = "\27[32m",
+                yellow         = "\27[33m",
+                blue           = "\27[34m",
+                magenta        = "\27[35m",
+                cyan           = "\27[36m",
+                white          = "\27[37m",
+                gray           = "\27[90m",
+                bright_red     = "\27[91m",
+                bright_green   = "\27[92m",
+                bright_yellow  = "\27[93m",
+                bright_blue    = "\27[94m",
+                bright_magenta = "\27[95m",
+                bright_cyan    = "\27[96m",
+                bright_white   = "\27[97m",
+                bg_black       = "\27[40m",
+                bg_blue        = "\27[44m",
+                bg_cyan        = "\27[46m",
+                bg_gray        = "\27[100m",
+                bg_darkgray    = "\27[48;5;236m",
+                bg_sel         = "\27[48;5;238m",
+                bg_header      = "\27[48;5;24m",
+            },
+        },
+    },
+}
+
+function ThemeManager.apply(name)
+    local key = name and name:lower() or "nord"
+    local t = ThemeManager.themes[key]
+    if not t then
+        return false, "Unknown theme '" .. tostring(name) .. "'"
+    end
+    ThemeManager.current = key
+
+    for k, v in pairs(t.colors) do
+        C[k] = v
+    end
+    return true
+end
+
+function ThemeManager.cycle()
+    local idx = 1
+    for i, name in ipairs(ThemeManager.order) do
+        if name == ThemeManager.current then
+            idx = i
+            break
+        end
+    end
+    idx = (idx % #ThemeManager.order) + 1
+    local next_theme = ThemeManager.order[idx]
+    ThemeManager.apply(next_theme)
+    return next_theme
+end
+
+function ThemeManager.list()
+    io.write(C.bold .. C.bright_cyan .. "Available Color Themes for rfe:\n" .. C.reset)
+    for _, k in ipairs(ThemeManager.order) do
+        local t = ThemeManager.themes[k]
+        local is_def = (k == "nord") and " (Default)" or ""
+        local mark = (k == ThemeManager.current) and (C.bold .. C.bright_green .. " ▶ " .. C.reset) or "   "
+        local preview = string.format("%s %s %s %s %s %s",
+            t.colors.bright_cyan .. "■" .. C.reset,
+            t.colors.bright_blue .. "■" .. C.reset,
+            t.colors.bright_green .. "■" .. C.reset,
+            t.colors.bright_yellow .. "■" .. C.reset,
+            t.colors.bright_magenta .. "■" .. C.reset,
+            t.colors.bright_red .. "■" .. C.reset
+        )
+        io.write(string.format("%s%-14s %s %-16s - %s\n", mark, k .. is_def, preview, t.name, t.desc))
+    end
+    io.write(string.format("\n%sUsage:%s rfe --theme <NAME>  |  Press '%st%s' inside rfe to cycle themes live.\n",
+        C.bold, C.reset, C.bold .. C.bright_yellow, C.reset))
+end
+
+-- Initialize default theme: Nord
+ThemeManager.apply("nord")
 
 -- Box drawing characters
 local BOX = {
@@ -2291,11 +2599,12 @@ function App.draw()
     else
         host_str = string.format("[%s@%s]", App.host_cfg.user or "root", App.host_cfg.hostname)
     end
-    local header_text = string.format(" %s%srfe v1.0%s │ %s%s%s │ Dir: %s%s%s │ Icons: %s%s%s ",
+    local header_text = string.format(" %s%srfe v1.0%s │ %s%s%s │ Dir: %s%s%s │ Theme: %s%s%s │ Icons: %s%s%s ",
         C.bold, C.bright_cyan, C.reset,
         C.bright_green, host_str, C.reset,
         C.bright_yellow, App.current_dir, C.reset,
-        C.bright_magenta, IconEngine.mode:upper(), C.reset
+        C.bold .. C.bright_magenta, ThemeManager.current:upper(), C.reset,
+        C.bright_blue, IconEngine.mode:upper(), C.reset
     )
     local rem_h = math.max(0, w - utf8_col_width(header_text))
     table.insert(buf, string.format("\27[1;1H%s%s%s%s\27[K", header_text, C.gray, BOX.h:rep(rem_h), C.reset))
@@ -2447,7 +2756,8 @@ function App.draw()
 
     -- 5. Footer Keybindings Guide
     local hidden_state = App.show_hidden and "ON" or ((App.hidden_count or 0) > 0 and string.format("OFF (%d)", App.hidden_count) or "OFF")
-    local footer = string.format(" [Enter/l] Open [h] Up [Tab/w] Focus [j/k/g/G] Move [H] Server [.] Hidden:%s [I] Icons [e] %s [/] Filter [?] Help [q] Quit ",
+    local footer = string.format(" [Enter/l] Open [h] Up [Tab/w] Focus [j/k/g/G] Move [t] %s [H] Server [.] Hidden:%s [I] Icons [e] %s [/] Filter [?] Help [q] Quit ",
+        ThemeManager.current:upper(),
         hidden_state,
         (ImageRenderer.preferred_engine or "auto"):upper()
     )
@@ -2570,6 +2880,7 @@ function App.draw_help_modal(target_buf)
         string.format("  %s%-18s%s %s", C.bold .. C.yellow, ".", C.reset, "Toggle hidden files/folders (.xxx)"),
         string.format("  %s%-18s%s %s", C.bold .. C.yellow, "J / K, PgDn/PgUp", C.reset, "Scroll preview content smoothly"),
         string.format("  %s%-18s%s %s", C.bold .. C.yellow, "I", C.reset, "Cycle icon mode (Nerd -> Emoji -> ASCII -> None)"),
+        string.format("  %s%-18s%s %s", C.bold .. C.yellow, "t", C.reset, "Cycle color theme (Nord -> Dracula -> Tokyo Night...)"),
         string.format("  %s%-18s%s %s", C.bold .. C.yellow, "e", C.reset, "Cycle image engine (Auto -> FFI -> Chafa -> Magick -> Python)"),
         string.format("  %s%-18s%s %s", C.bold .. C.yellow, "i", C.reset, "Toggle image renderer (Half-Blocks / OSC 1337)"),
         string.format("  %s%-18s%s %s", C.bold .. C.yellow, "/", C.reset, "Inline fuzzy filter current directory"),
@@ -2751,6 +3062,10 @@ function App.handle_key(key)
             local new_m = IconEngine.cycle()
             App.status_msg = "Icon Mode toggled to: " .. new_m:upper()
             App.status_color = C.bright_magenta
+        elseif key == "t" then
+            local new_theme = ThemeManager.cycle()
+            App.status_msg = "Theme set to: " .. new_theme:upper() .. " (" .. ThemeManager.themes[new_theme].name .. ")"
+            App.status_color = C.bright_cyan
         elseif key == "i" then
             ImageRenderer.protocol = (ImageRenderer.protocol == "blocks") and "graphics" or "blocks"
             App.status_msg = "Image Renderer toggled to: " .. ImageRenderer.protocol:upper()
@@ -3072,7 +3387,31 @@ local function run_tests()
     App.focus = "left"
     print(C.bright_green .. "  [PASS] Vim Key Navigation & Pane Focus: w, ctrl_w, g, G, ctrl_d, ctrl_u" .. C.reset)
 
-    print(C.bold .. C.bright_green .. "\nALL 18 TESTS PASSED SUCCESSFULLY!" .. C.reset)
+    -- 19. Color Themes: Nord Default, Palettes & Live Cycling
+    assert(ThemeManager.current == "nord", "Default theme must be 'nord'")
+    assert(#ThemeManager.order == 8, "Must have 8 predefined color themes")
+    for _, tname in ipairs(ThemeManager.order) do
+        local ok, err = ThemeManager.apply(tname)
+        assert(ok, "Theme apply failed for " .. tname .. ": " .. tostring(err))
+        assert(C.cyan ~= nil and C.blue ~= nil and C.green ~= nil, "Theme must populate color table C")
+    end
+    -- Test Theme cycling
+    ThemeManager.apply("nord")
+    local t1 = ThemeManager.cycle()
+    assert(t1 == "dracula", "Cycling from nord should yield dracula")
+    local t2 = ThemeManager.cycle()
+    assert(t2 == "tokyonight", "Cycling from dracula should yield tokyonight")
+    ThemeManager.apply("classic")
+    local t_wrap = ThemeManager.cycle()
+    assert(t_wrap == "nord", "Cycling from classic must wrap back to nord")
+    -- Test 't' hotkey in App.handle_key
+    ThemeManager.apply("nord")
+    App.handle_key("t")
+    assert(ThemeManager.current == "dracula", "'t' key in normal mode should cycle to dracula")
+    ThemeManager.apply("nord") -- restore default
+    print(C.bright_green .. "  [PASS] Color Themes: Nord Default, 8 Curated Palettes & Live Cycling ('t')" .. C.reset)
+
+    print(C.bold .. C.bright_green .. "\nALL 19 TESTS PASSED SUCCESSFULLY!" .. C.reset)
     return true
 end
 
@@ -3095,6 +3434,8 @@ Options:
   -u, --user <USER>       Remote SSH username
   -p, --port <PORT>       Remote SSH port (default: 22)
   -i, --identity <KEY>    Path to SSH private key
+  -t, --theme <NAME>      Color theme: nord (default), dracula, tokyonight, catppuccin,
+                          gruvbox, onedark, solarized, classic (or 'list')
   -e, --engine <ENGINE>   Image engine: auto (default), ffi, chafa, magick, python
   --icons <MODE>          Icon style: nerd (default), emoji, ascii, none
   --protocol <MODE>       Image protocol: blocks (default) or graphics (OSC 1337)
@@ -3130,6 +3471,22 @@ local function main(args)
             App.open_host_picker()
             App.draw_host_picker_modal()
             io.write("\n\n")
+            return
+        elseif (a == "-t" or a == "--theme") and i < #args then
+            i = i + 1
+            local t_name = args[i]
+            if t_name == "list" then
+                ThemeManager.list()
+                return
+            else
+                local ok, err = ThemeManager.apply(t_name)
+                if not ok then
+                    io.stderr:write(string.format("[ERROR] %s\nRun 'rfe --theme list' to view available themes.\n", err))
+                    os.exit(1)
+                end
+            end
+        elseif a == "--theme-list" or a == "--themes" then
+            ThemeManager.list()
             return
         elseif (a == "-e" or a == "--engine") and i < #args then
             i = i + 1
