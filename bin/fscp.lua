@@ -2432,12 +2432,12 @@ local function execute_headless_transfer(host, local_files, remote_path, pull_mo
         end
 
         if dry_run then
-            print(string.format("Dry run (pscp): %s", table.concat(p_cmd, " ")))
+            print(string.format("Dry run (pscp): %s", shell_command(p_cmd)))
             return
         end
         print(string.format("%s%s Tool: %spscp (PuTTY)%s", C.bright_cyan, tag, C.bold, C.reset))
-        print(string.format("%s%s Executing: %s%s", C.bright_cyan, tag, table.concat(p_cmd, " "), C.reset))
-        os.execute(table.concat(p_cmd, " "))
+        print(string.format("%s%s Executing: %s%s", C.bright_cyan, tag, shell_command(p_cmd), C.reset))
+        os.execute(shell_command(p_cmd))
         return
     end
 
@@ -2456,7 +2456,7 @@ local function execute_headless_transfer(host, local_files, remote_path, pull_mo
         local ssh_e = get_rsync_ssh_cmd(port, key)
         if ssh_e then
             table.insert(cmd, "-e")
-            table.insert(cmd, string.format("%q", ssh_e))
+            table.insert(cmd, ssh_e)
         end
 
         if pull_mode then
@@ -2477,7 +2477,7 @@ local function execute_headless_transfer(host, local_files, remote_path, pull_mo
         end
         if key ~= "" then
             table.insert(cmd, "-i")
-            table.insert(cmd, shell_escape(key))
+            table.insert(cmd, key)
         end
 
         if pull_mode then
@@ -2494,12 +2494,12 @@ local function execute_headless_transfer(host, local_files, remote_path, pull_mo
     local tool_name = use_rsync and "rsync" or "scp"
 
     if dry_run then
-        print(string.format("Dry run (%s): %s", tool_name, table.concat(cmd, " ")))
+        print(string.format("Dry run (%s): %s", tool_name, shell_command(cmd)))
         return
     end
 
     print(string.format("%s%s Tool: %s%s%s", C.bright_cyan, tag, C.bold, tool_name, C.reset))
-    print(string.format("%s%s Executing: %s%s", C.bright_cyan, tag, table.concat(cmd, " "), C.reset))
+    print(string.format("%s%s Executing: %s%s", C.bright_cyan, tag, shell_command(cmd), C.reset))
 
     if not IS_WINDOWS then
         local c_args = ffi.new("const char*[?]", #cmd + 1)
@@ -2509,7 +2509,7 @@ local function execute_headless_transfer(host, local_files, remote_path, pull_mo
         c_args[#cmd] = nil
         ffi.C.execvp(cmd[1], ffi.cast("char* const*", c_args))
     else
-        os.execute(table.concat(cmd, " "))
+        os.execute(shell_command(cmd))
     end
 end
 

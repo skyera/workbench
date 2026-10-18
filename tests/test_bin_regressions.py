@@ -63,8 +63,31 @@ class BinRegressions(unittest.TestCase):
         self.git("add", "file")
         self.git("commit", "-qm", "initial")
 
+    def test_headless_scp_identity_and_filenames_are_raw_arguments(self):
+        key = str(self.cwd / "my key's identity")
+        filename = "quarterly report; literal.txt"
+        result = self.lua("fscp", "--scp", "-H", "review-host", "-i", key,
+                          "-t", "/remote dir", filename)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.capture.read_text()),
+                         ["-r", "-i", key, filename, "review-host:/remote dir"])
 
+    def test_headless_rsync_remote_shell_has_no_outer_quotes(self):
+        result = self.lua("fscp", "--rsync", "-H", "review-host", "-p", "2222",
+                          "quarterly report.txt")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.capture.read_text()),
+                         ["-avzP", "-e", "ssh -p 2222", "quarterly report.txt",
+                          "review-host:~/"])
 
+    def test_headless_rsync_pull_keeps_identity_quoting_inside_remote_shell(self):
+        key = str(self.cwd / "my key")
+        result = self.lua("fscp", "--rsync", "--pull", "-H", "review-host",
+                          "-i", key, "-t", "/remote dir/report.txt")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.capture.read_text()),
+                         ["-avzP", "-e", "ssh -i '" + key + "'",
+                          "review-host:/remote dir/report.txt", "./"])
 
     def test_tui_rsync_upload_and_download_keep_shell_characters_literal(self):
         names = ["quarterly report.txt", "file; touch INJECTED", "a'b.txt",
