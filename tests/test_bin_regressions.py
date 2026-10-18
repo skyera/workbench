@@ -136,6 +136,34 @@ App.right.dir = "/remote dir"
         self.assertIn("[SUCCESS]", result.stdout)
         self.assertEqual(self.git("branch", "--show-current").strip(), "other")
 
+    def test_tui_scp_preserves_arguments_and_displays_transfer_failures(self):
+        driver = r'''
+Term.restore = function() end
+Term.enable_raw = function() end
+App.refresh_left = function() end
+App.refresh_right = function() end
+io.read = function() return "" end
+is_rsync_available = function() return false end
+App.host_cfg = {name="review-host", source="ssh-config", port="22"}
+App.left.dir = "local dir"
+App.right.dir = "/remote dir"
+App.execute_transfer("upload", {"%PATH%!TEMP!& literal.txt"})
+assert(App.status_color == C.bright_green)
+'''
+        result = self.lua("fscp", driver=driver)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.capture.read_text()),
+                         ["-r", "local dir/%PATH%!TEMP!& literal.txt", "review-host:/remote dir/"])
+        stub = self.cwd / "scp"
+        stub.write_text("#!/bin/sh\necho 'permission denied' >&2\nexit 17\n")
+        failed = driver.replace("assert(App.status_color == C.bright_green)",
+                                'assert(App.status_color == C.bright_red)\n'
+                                'assert(App.status_msg:find("Transfer failed", 1, true))')
+        result = self.lua("fscp", driver=failed)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("permission denied", result.stderr)
+        self.assertIn("Transfer failed", result.stderr)
+
     def test_worktree_and_submodule_failures_preserve_diagnostics(self):
         # Outside a repository, both operations must return failure and Git's
         # actual diagnostic rather than treating pipe closure as success.

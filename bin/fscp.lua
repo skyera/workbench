@@ -107,12 +107,17 @@ if IS_WINDOWS then
         LONG RegQueryValueExA(HKEY hKey, const char* lpValueName, DWORD* lpReserved, DWORD* lpType, BYTE* lpData, DWORD* lpcbData);
         LONG RegCloseKey(HKEY hKey);
         void Sleep(DWORD dwMilliseconds);
+        int MultiByteToWideChar(unsigned int CodePage, DWORD dwFlags, const char* src, int len, wchar_t* dest, int capacity);
+        DWORD GetLastError(void);
     ]]
 
     local msvcrt = ffi.load("msvcrt")
     ffi.cdef[[
         int _kbhit(void);
         int _getch(void);
+        intptr_t _wspawnvp(int mode, const wchar_t *command, const wchar_t *const *argv);
+        int *_errno(void);
+        char *strerror(int errnum);
     ]]
     _G.msvcrt = msvcrt
 else
@@ -561,6 +566,49 @@ local function shell_command(args)
     local escaped = {}
     for i, value in ipairs(args) do escaped[i] = shell_escape(value) end
     return table.concat(escaped, " ")
+end
+
+-- The Windows CRT joins spawn arguments into a command line. Escape quotes and
+-- trailing backslashes for its argv parser, without invoking cmd.exe.
+local function windows_quote_arg(value)
+    return '"' .. value:gsub('(\\*)"', function(slashes)
+        return slashes .. slashes .. '\\"'
+    end):gsub('(\\+)$', '%1%1') .. '"'
+end
+
+local function run_transfer(args)
+    if not IS_WINDOWS then return os.execute(shell_command(args)) end
+
+    local function to_wide(value)
+        local size = ffi.C.MultiByteToWideChar(65001, 8, value, #value, nil, 0)
+        if size == 0 then
+            return nil, string.format("Cannot encode transfer argument as UTF-16 (Windows error %d).", ffi.C.GetLastError())
+        end
+        local buf = ffi.new("wchar_t[?]", size + 1)
+        ffi.C.MultiByteToWideChar(65001, 8, value, #value, buf, size)
+        return buf
+    end
+
+    -- Transfer tools are executables. An explicit suffix prevents PATH lookup
+    -- from selecting a batch script and reintroducing shell expansion.
+    local executable = args[1]
+    if not executable:lower():match("%.exe$") then executable = executable .. ".exe" end
+    local command, err = to_wide(executable)
+    if not command then return nil, err end
+    local argv = ffi.new("const wchar_t *[?]", #args + 1)
+    local buffers = {} -- Keep all UTF-16 strings alive until the child exits.
+    for i, value in ipairs(args) do
+        buffers[i], err = to_wide(windows_quote_arg(value))
+        if not buffers[i] then return nil, err end
+        argv[i - 1] = buffers[i]
+    end
+    io.flush()
+    local status = tonumber(msvcrt._wspawnvp(0, command, argv)) -- _P_WAIT
+    if status == -1 then
+        return nil, string.format("Cannot launch %s: %s. Check that the executable is installed and on PATH.",
+            executable, ffi.string(msvcrt.strerror(msvcrt._errno()[0])))
+    end
+    return status
 end
 
 --------------------------------------------------------------------------------
@@ -2437,7 +2485,9 @@ local function execute_headless_transfer(host, local_files, remote_path, pull_mo
         end
         print(string.format("%s%s Tool: %spscp (PuTTY)%s", C.bright_cyan, tag, C.bold, C.reset))
         print(string.format("%s%s Executing: %s%s", C.bright_cyan, tag, shell_command(p_cmd), C.reset))
-        os.execute(shell_command(p_cmd))
+        local status, err = run_transfer(p_cmd)
+        if err then io.stderr:write(err .. "\n") end
+        os.exit(status or 1)
         return
     end
 
@@ -2509,7 +2559,9 @@ local function execute_headless_transfer(host, local_files, remote_path, pull_mo
         c_args[#cmd] = nil
         ffi.C.execvp(cmd[1], ffi.cast("char* const*", c_args))
     else
-        os.execute(shell_command(cmd))
+        local status, err = run_transfer(cmd)
+        if err then io.stderr:write(err .. "\n") end
+        os.exit(status or 1)
     end
 end
 
@@ -2522,6 +2574,7 @@ function App.execute_transfer(direction, items)
     io.flush()
 
     local is_upload = (direction == "upload")
+    local transfer_status, transfer_error = 0, nil
     print(C.bold .. C.bright_cyan .. "============================================================" .. C.reset)
     print(string.format("%s%s Starting %s: %d item(s)%s",
         C.bold, C.bright_yellow, is_upload and "UPLOAD (Local -> Remote)" or "DOWNLOAD (Remote -> Local)", #items, C.reset
@@ -2573,8 +2626,7 @@ function App.execute_transfer(direction, items)
 
             print("\nExecuting PSCP command:")
             print(C.gray .. shell_command(p_cmd) .. C.reset .. "\n")
-            local ret = os.execute(shell_command(p_cmd))
-            print(string.format("\nTransfer process finished with exit code: %s", tostring(ret)))
+            transfer_status, transfer_error = run_transfer(p_cmd)
         elseif use_rsync then
             ensure_cwrsync_fstab()
             local r_cmd = { "rsync", "-avzP" }
@@ -2599,35 +2651,38 @@ function App.execute_transfer(direction, items)
 
             print("\nExecuting Rsync command:")
             print(C.gray .. shell_command(r_cmd) .. C.reset .. "\n")
-            local ret = os.execute(shell_command(r_cmd))
-            print(string.format("\nTransfer process finished with exit code: %s", tostring(ret)))
+            transfer_status, transfer_error = run_transfer(r_cmd)
         else
-            local port_opt = (port ~= "") and ("-P " .. port) or ""
-            local key_opt = (key ~= "") and ("-i " .. shell_escape(key)) or ""
-
-            local cmd = ""
+            local cmd = { "scp", "-r" }
+            if port ~= "" then
+                table.insert(cmd, "-P")
+                table.insert(cmd, port)
+            end
+            if key ~= "" then
+                table.insert(cmd, "-i")
+                table.insert(cmd, key)
+            end
             if is_upload then
-                local escaped_items = {}
                 for _, it in ipairs(items) do
-                    local full_path = App.left.dir .. "/" .. it
-                    table.insert(escaped_items, shell_escape(full_path))
+                    table.insert(cmd, App.left.dir .. "/" .. it)
                 end
-                local remote_dest = string.format("%s:%s/", host, App.right.dir)
-                cmd = string.format("scp -r %s %s %s %s", port_opt, key_opt, table.concat(escaped_items, " "), shell_escape(remote_dest))
+                table.insert(cmd, string.format("%s:%s/", host, App.right.dir))
             else
-                local escaped_items = {}
                 for _, it in ipairs(items) do
-                    local remote_src = string.format("%s:%s/%s", host, App.right.dir, it)
-                    table.insert(escaped_items, shell_escape(remote_src))
+                    table.insert(cmd, string.format("%s:%s/%s", host, App.right.dir, it))
                 end
-                local local_dest = shell_escape(App.left.dir)
-                cmd = string.format("scp -r %s %s %s %s", port_opt, key_opt, table.concat(escaped_items, " "), local_dest)
+                table.insert(cmd, App.left.dir)
             end
 
             print("\nExecuting SCP command:")
-            print(C.gray .. cmd .. C.reset .. "\n")
-            local ret = os.execute(cmd)
-            print(string.format("\nTransfer process finished with exit code: %s", tostring(ret)))
+            print(C.gray .. shell_command(cmd) .. C.reset .. "\n")
+            transfer_status, transfer_error = run_transfer(cmd)
+        end
+        if transfer_status == 0 then
+            print("\nTransfer process finished with exit code: 0")
+        else
+            transfer_error = transfer_error or string.format("Transfer failed (process status %s). Review the command output above.", tostring(transfer_status))
+            io.stderr:write(transfer_error .. "\n")
         end
     end
 
@@ -2637,8 +2692,8 @@ function App.execute_transfer(direction, items)
     Term.enable_raw()
     App.refresh_left()
     App.refresh_right(true)
-    App.status_msg = "Transfer complete. Directory views refreshed."
-    App.status_color = C.bright_green
+    App.status_msg = transfer_error or "Transfer complete. Directory views refreshed."
+    App.status_color = transfer_error and C.bright_red or C.bright_green
 end
 
 --------------------------------------------------------------------------------
