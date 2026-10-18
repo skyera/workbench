@@ -52,8 +52,7 @@ The following configuration files in the repository are currently omitted during
 
 ### Phase 2: Consolidation & Legacy Cleanup
 - [x] **Retire Redundant Git Scripts**: Removed legacy `gbd.bat`, `gcb.bat`, `gcbf.bat`, and `gdbf.bat` (fully replaced by `fbr` and `fco`).
-- [x] **Retire Legacy PuTTY Python Scripts**: Removed `putty_colors.py` and `putty_sessions.py`, updated launchers to native `putty.lua`.
-- [ ] **Merge `fscp.lua` and `fscp_tui.lua`**: Unify into a single, cohesive tool.
+- [x] **Merge `fscp.lua` and `fscp_tui.lua`**: Consolidated into unified zero-dependency Dual-Pane TUI by default, with `--fzf` picker, headless CLI push/pull, and forwarding launchers. *(Shipped)*
 - [ ] **Modernize `fcd.lua`**: Add standalone TUI mode while maintaining shell pipeline compatibility.
 
 ### Phase 3: New Zero-Dependency Utilities
