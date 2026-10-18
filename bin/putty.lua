@@ -88,10 +88,24 @@ local function url_decode(str)
     end))
 end
 
-local function url_encode(str)
-    return (str:gsub("[^%w%-_%.~]", function(c)
-        return string.format("%%%02X", string.byte(c))
-    end))
+local function encode_session_name(name)
+    local encoded = {}
+    for index = 1, #name do
+        local character = name:sub(index, index)
+        local byte = name:byte(index)
+        local must_escape = byte < 32 or byte > 126
+            or character == " " or character == "\\"
+            or character == "*" or character == "?"
+            or character == "%" or character == "~"
+            or (index == 1 and character == ".")
+
+        if must_escape then
+            encoded[index] = string.format("%%%02X", byte)
+        else
+            encoded[index] = character
+        end
+    end
+    return table.concat(encoded)
 end
 
 local function trim(s)
@@ -452,8 +466,8 @@ local function fetch_all_sessions()
     return sessions
 end
 
-local function apply_colors_to_session(session_name, colors)
-    local raw_session = url_encode(session_name)
+local function apply_colors_to_session(session_name, colors, raw_session)
+    raw_session = raw_session or encode_session_name(session_name)
 
     if IS_WINDOWS then
         local phkSub = ffi.new("HKEY[1]")
@@ -754,7 +768,7 @@ local function cmd_colors(args)
             io.write(string.format("Applying theme '%s' to %d PuTTY session(s)...\n", t.name, #sessions))
             local count = 0
             for _, s in ipairs(sessions) do
-                local ok, err = apply_colors_to_session(s.name, t.colors)
+                local ok, err = apply_colors_to_session(s.name, t.colors, s.raw_name)
                 if ok then
                     count = count + 1
                 else
@@ -815,7 +829,10 @@ local function cmd_colors(args)
         end
 
         f:write("Windows Registry Editor Version 5.00\n\n")
-        f:write(string.format("[HKEY_CURRENT_USER\\Software\\SimonTatham\\PuTTY\\Sessions\\%s]\n", url_encode(session_name)))
+        f:write(string.format(
+            "[HKEY_CURRENT_USER\\Software\\SimonTatham\\PuTTY\\Sessions\\%s]\n",
+            encode_session_name(session_name)
+        ))
         for idx = 0, 21 do
             f:write(string.format('"Colour%d"="%s"\n', idx, t.colors[idx + 1]))
         end

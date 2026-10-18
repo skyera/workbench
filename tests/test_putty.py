@@ -96,6 +96,71 @@ assert(cmd_colors({ "apply", "dracula", "--all" }) == false)
         self.assertIn("Colour7", result.stderr)
         self.assertIn("Windows error 5", result.stderr)
 
+    def test_session_encoding_matches_putty_registry_names(self):
+        result = self.lua(r'''
+local cases = {
+    { "user@host", "user@host" },
+    { "a+b", "a+b" },
+    { "Default Settings", "Default%20Settings" },
+    { ".host", "%2Ehost" },
+    { "a.b", "a.b" },
+    { "~host", "%7Ehost" },
+    { "a\\b*?%", "a%5Cb%2A%3F%25" },
+    { "tab\tname", "tab%09name" },
+    { "caf\195\169", "caf%C3%A9" }
+}
+for _, case in ipairs(cases) do
+    local encoded = encode_session_name(case[1])
+    assert(encoded == case[2], encoded)
+    assert(url_decode(encoded) == case[1])
+end
+''')
+        self.assert_lua_passed(result)
+
+    def test_bulk_apply_preserves_original_registry_key(self):
+        result = self.lua(r'''
+fetch_all_sessions = function()
+    return {
+        { name = "user@host", raw_name = "user%40host" },
+        { name = "Default Settings", raw_name = "Default%20Settings" }
+    }
+end
+local visited = 0
+apply_colors_to_session = function(name, colors, raw_name)
+    visited = visited + 1
+    if name == "user@host" then
+        assert(raw_name == "user%40host")
+    else
+        assert(raw_name == "Default%20Settings")
+    end
+    return true
+end
+cmd_colors({ "apply", "dracula", "--all" })
+assert(visited == 2)
+''')
+        self.assert_lua_passed(result)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows Registry FFI types")
+    def test_apply_opens_canonical_or_preserved_registry_key(self):
+        result = self.lua(r'''
+local expected_path = "Software\\SimonTatham\\PuTTY\\Sessions\\user@host"
+registry_api.RegOpenKeyExA = function(root, path, options, access, handle)
+    assert(path == expected_path, path)
+    handle[0] = ffi.cast("HKEY", 1)
+    return 0
+end
+registry_api.RegSetValueExA = function()
+    return 0
+end
+registry_api.RegCloseKey = function()
+    return 0
+end
+assert(apply_colors_to_session("user@host", PRESET_THEMES.dracula.colors))
+expected_path = "Software\\SimonTatham\\PuTTY\\Sessions\\user%40host"
+assert(apply_colors_to_session("user@host", PRESET_THEMES.dracula.colors, "user%40host"))
+''', registry=True)
+        self.assert_lua_passed(result)
+
 
 if __name__ == "__main__":
     unittest.main()
