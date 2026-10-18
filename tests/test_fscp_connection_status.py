@@ -117,6 +117,8 @@ io.popen = orig_popen
 assert(err == nil, "Error should be nil: " .. tostring(err))
 assert(captured and captured:find("--time-style=+%Y-%m-%d", 1, true), "Command must contain time-style format string")
 assert(captured:find("'/var/data/'"), "Remote path must contain trailing slash")
+assert(not captured:find("\n"), "Command must be strictly single-line without embedded newlines")
+assert(captured:find("; echo; echo __FSCP_EXIT__:$?", 1, true), "Command must use clean exit marker")
 '''
         result = subprocess.run(
             [LUAJIT, "-"], input=source + driver, capture_output=True,

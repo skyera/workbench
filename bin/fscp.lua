@@ -1519,7 +1519,7 @@ local function list_remote_directory(host_cfg, remote_dir)
             end
             remote_path_arg = "'" .. p .. "'"
         end
-        local remote_sh = "(LC_ALL=C ls -la --time-style=+%Y-%m-%d\\ %H:%M:%S " .. remote_path_arg .. "); echo \"\n__FSCP_EXIT__:$?\""
+        local remote_sh = "(LC_ALL=C ls -la --time-style=+%Y-%m-%d\\ %H:%M:%S " .. remote_path_arg .. "); echo; echo __FSCP_EXIT__:$?"
         local cmd = string.format("ssh -n -o ConnectTimeout=4 -o BatchMode=yes -o StrictHostKeyChecking=accept-new %s \"%s\" \"%s\" 2>&1",
             table.concat(ssh_args, " "),
             target,
@@ -1540,7 +1540,7 @@ local function list_remote_directory(host_cfg, remote_dir)
         -- Fallback for non-GNU ls (BSD / macOS / Busybox) where --time-style is not supported
         if exit_code and exit_code ~= "0" then
             if clean_output:find("time%-style") or clean_output:find("unrecognized option") or clean_output:find("illegal option") then
-                local fallback_sh = "(LC_ALL=C ls -la " .. remote_path_arg .. "); echo \"\n__FSCP_EXIT__:$?\""
+                local fallback_sh = "(LC_ALL=C ls -la " .. remote_path_arg .. "); echo; echo __FSCP_EXIT__:$?"
                 local fallback_cmd = string.format("ssh -n -o ConnectTimeout=4 -o BatchMode=yes -o StrictHostKeyChecking=accept-new %s \"%s\" \"%s\" 2>&1",
                     table.concat(ssh_args, " "),
                     target,
