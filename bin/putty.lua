@@ -112,6 +112,19 @@ local function trim(s)
     return (s:gsub("^%s*(.-)%s*$", "%1"))
 end
 
+local function json_quote(value)
+    local escaped = value:gsub('[%z\1-\31\\"]', function(character)
+        if character == '"' then
+            return '\\"'
+        end
+        if character == "\\" then
+            return "\\\\"
+        end
+        return string.format("\\u%04x", character:byte())
+    end)
+    return '"' .. escaped .. '"'
+end
+
 local function registry_error(action, status)
     local buffer = ffi.new("char[1024]")
     local length = ffi.C.FormatMessageA(0x1200, nil, status, 0, buffer, 1024, nil)
@@ -708,8 +721,17 @@ Usage:
         io.write("[\n")
         for i, s in ipairs(sessions) do
             local comma = (i < #sessions) and "," or ""
-            io.write(string.format('  {"name": %q, "host": %q, "port": %q, "user": %q, "protocol": %q, "key_file": %q}%s\n',
-                s.name, s.host or "", s.port or "22", s.user or "", s.protocol or "ssh", s.key_file or "", comma))
+            io.write(string.format(
+                '  {"name": %s, "host": %s, "port": %s, "user": %s, '
+                    .. '"protocol": %s, "key_file": %s}%s\n',
+                json_quote(s.name),
+                json_quote(s.host or ""),
+                json_quote(s.port or "22"),
+                json_quote(s.user or ""),
+                json_quote(s.protocol or "ssh"),
+                json_quote(s.key_file or ""),
+                comma
+            ))
         end
         io.write("]\n")
         return

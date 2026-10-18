@@ -1,5 +1,6 @@
 """Exercise PuTTY exports and failure paths without changing saved sessions."""
 
+import json
 import os
 from pathlib import Path
 import shutil
@@ -254,6 +255,43 @@ assert(sessions == nil)
 assert(err == "reg.exe query: permission denied")
 ''')
         self.assert_lua_passed(result)
+
+    def test_json_export_round_trips_controls_quotes_paths_and_unicode(self):
+        result = self.lua(r'''
+local control_characters = {}
+for code = 0, 31 do
+    table.insert(control_characters, string.char(code))
+end
+fetch_all_sessions = function()
+    return {
+        {
+            name = table.concat(control_characters),
+            host = "host\"quoted",
+            key_file = "C:\\Users\\Test User\\key.ppk",
+            user = "caf\195\169"
+        },
+        { name = "plain" }
+    }
+end
+cmd_sessions({ "--json" })
+''')
+        self.assert_lua_passed(result)
+        sessions = json.loads(result.stdout)
+        self.assertEqual(sessions[0]["name"], "".join(chr(code) for code in range(32)))
+        self.assertEqual(sessions[0]["host"], 'host"quoted')
+        self.assertEqual(sessions[0]["key_file"], r"C:\Users\Test User\key.ppk")
+        self.assertEqual(sessions[0]["user"], "café")
+        self.assertEqual(sessions[1]["protocol"], "ssh")
+
+    def test_json_export_empty_sessions(self):
+        result = self.lua(r'''
+fetch_all_sessions = function()
+    return {}
+end
+cmd_sessions({ "--json" })
+''')
+        self.assert_lua_passed(result)
+        self.assertEqual(json.loads(result.stdout), [])
 
 
 if __name__ == "__main__":
