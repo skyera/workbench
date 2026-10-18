@@ -339,9 +339,17 @@ function Term.read_key()
         elseif ch == 27 then return "ESC"
         elseif ch == 8 then return "BACKSPACE"
         elseif ch == 9 then return "TAB"
+        elseif ch == 2 then return "CTRL_B"
         elseif ch == 3 then return "CTRL_C"
         elseif ch == 4 then return "CTRL_D"
+        elseif ch == 5 then return "CTRL_E"
+        elseif ch == 6 then return "CTRL_F"
+        elseif ch == 14 then return "CTRL_N"
+        elseif ch == 16 then return "CTRL_P"
+        elseif ch == 18 then return "CTRL_R"
         elseif ch == 21 then return "CTRL_U"
+        elseif ch == 23 then return "CTRL_W"
+        elseif ch == 25 then return "CTRL_Y"
         elseif ch == 32 then return "SPACE"
         end
         return string.char(ch)
@@ -355,9 +363,17 @@ function Term.read_key()
         elseif seq == "\n" or seq == "\r" then return "ENTER"
         elseif seq == "\t" then return "TAB"
         elseif seq == "\127" or seq == "\8" then return "BACKSPACE"
+        elseif seq == "\2" then return "CTRL_B"
         elseif seq == "\3" then return "CTRL_C"
         elseif seq == "\4" then return "CTRL_D"
+        elseif seq == "\5" then return "CTRL_E"
+        elseif seq == "\6" then return "CTRL_F"
+        elseif seq == "\14" then return "CTRL_N"
+        elseif seq == "\16" then return "CTRL_P"
+        elseif seq == "\18" then return "CTRL_R"
         elseif seq == "\21" then return "CTRL_U"
+        elseif seq == "\23" then return "CTRL_W"
+        elseif seq == "\25" then return "CTRL_Y"
         elseif seq == " " then return "SPACE"
         elseif seq == "\27[A" or seq == "\27OA" then return "UP"
         elseif seq == "\27[B" or seq == "\27OB" then return "DOWN"
@@ -382,6 +398,14 @@ end
 local function trim(s)
     if not s then return "" end
     return s:match("^%s*(.-)%s*$") or ""
+end
+
+local function delete_word(s)
+    if not s or #s == 0 then return "" end
+    s = s:gsub("%s+$", "")
+    s = s:gsub("/+$", "")
+    s = s:gsub("[^%s/]+$", "")
+    return s
 end
 
 local function pad_right(s, w)
@@ -720,6 +744,9 @@ local function run_tui(init_opts)
         sort_idx = 1, -- Default to Memory sort
         cursor = 1,
         scroll = 1,
+        preview_scroll = 0,
+        pending_op = nil,
+        body_h = 10,
         selected_set = {}, -- { [pid] = true }
         cached_details = {},
         status_msg = "",
@@ -860,6 +887,7 @@ local function run_tui(init_opts)
 
         -- 3. Pane Geometry
         local body_h = math.max(4, rows - 5)
+        state.body_h = body_h
         local left_w = math.floor(cols * 0.50)
         if cols < 90 then left_w = cols - 2 end
         local right_w = math.max(0, cols - left_w - 4)
@@ -879,49 +907,78 @@ local function run_tui(init_opts)
         -- Header divider
         local raw_hdr = pad_right(string.format("  %-3s  %-7s  %-10s %-4s  %s", "SEL", "PID", "MEM", "THR", "PROCESS NAME"), left_w)
         local list_hdr = C.b_blue .. C.bold .. raw_hdr .. C.reset
-        local right_title = cur_item and truncate(" 📋 PROCESS: " .. cur_item.name .. " (" .. cur_item.pid .. ")", math.max(10, right_w - 2)) or " 📋 PROCESS INSPECTOR"
+        local right_title
+        if state.mode == "help" then
+            right_title = " 📖 VIM KEYBINDINGS CHEATSHEET"
+        elseif cur_item then
+            right_title = truncate(" 📋 PROCESS: " .. cur_item.name .. " (" .. cur_item.pid .. ")", math.max(10, right_w - 2))
+        else
+            right_title = " 📋 PROCESS INSPECTOR"
+        end
         local right_hdr = (cols >= 90) and (C.b_white .. C.bold .. right_title .. C.reset) or ""
         local hdr_sep = (cols >= 90) and (C.gray .. "│" .. C.reset) or ""
         add_line(list_hdr .. " " .. hdr_sep .. " " .. right_hdr)
 
         -- Pre-load inspector content for right pane
         local r_lines = {}
-        if cols >= 90 and cur_item then
-            if not state.cached_details[cur_item.pid] then
-                state.cached_details[cur_item.pid] = Backend.get_proc_details(cur_item.pid) or cur_item
-            end
-            local d = state.cached_details[cur_item.pid]
+        if cols >= 90 then
+            if state.mode == "help" then
+                table.insert(r_lines, "")
+                table.insert(r_lines, C.b_yellow .. C.bold .. "  NAVIGATION & MOTIONS" .. C.reset)
+                table.insert(r_lines, string.format("   %s%-18s%s Move cursor down / up", C.b_cyan, "j / k, ^n / ^p", C.reset))
+                table.insert(r_lines, string.format("   %s%-18s%s Jump to first / last process", C.b_cyan, "gg / G", C.reset))
+                table.insert(r_lines, string.format("   %s%-18s%s Scroll half-page down / up", C.b_cyan, "Ctrl-d / Ctrl-u", C.reset))
+                table.insert(r_lines, string.format("   %s%-18s%s Scroll full-page down / up", C.b_cyan, "Ctrl-f / Ctrl-b", C.reset))
+                table.insert(r_lines, string.format("   %s%-18s%s Jump to High / Mid / Low screen", C.b_cyan, "H / M / L", C.reset))
+                table.insert(r_lines, string.format("   %s%-18s%s Recenter: Middle / Top / Bottom", C.b_cyan, "zz / zt / zb", C.reset))
+                table.insert(r_lines, string.format("   %s%-18s%s Scroll inspector card down / up", C.b_cyan, "Ctrl-e / Ctrl-y", C.reset))
+                table.insert(r_lines, "")
+                table.insert(r_lines, C.b_yellow .. C.bold .. "  SELECTION & PROCESS ACTIONS" .. C.reset)
+                table.insert(r_lines, string.format("   %s%-18s%s Toggle selection checkbox [x]", C.b_cyan, "v / Tab / Space", C.reset))
+                table.insert(r_lines, string.format("   %s%-18s%s Terminate process (prompt)", C.b_cyan, "d / Enter", C.reset))
+                table.insert(r_lines, string.format("   %s%-18s%s Force kill immediately (SIGKILL)", C.b_cyan, "D / K", C.reset))
+                table.insert(r_lines, string.format("   %s%-18s%s Cycle sort mode (RAM/PID/Name)", C.b_cyan, "s / S", C.reset))
+                table.insert(r_lines, string.format("   %s%-18s%s Switch tab: All / User / Heavy", C.b_cyan, "h / l, 1 / 2 / 3", C.reset))
+                table.insert(r_lines, string.format("   %s%-18s%s Refresh process list & memory", C.b_cyan, "r / Ctrl-r", C.reset))
+                table.insert(r_lines, string.format("   %s%-18s%s Real-time fuzzy filter (/)", C.b_cyan, "/", C.reset))
+                table.insert(r_lines, string.format("   %s%-18s%s Close help / exit fkill", C.b_cyan, "?, q / Esc", C.reset))
+            elseif cur_item then
+                if not state.cached_details[cur_item.pid] then
+                    state.cached_details[cur_item.pid] = Backend.get_proc_details(cur_item.pid) or cur_item
+                end
+                local d = state.cached_details[cur_item.pid]
 
-            table.insert(r_lines, "")
-            table.insert(r_lines, string.format("  %sProcess:%s  %s%s%s", C.b_yellow .. C.bold, C.reset, C.b_white .. C.bold, truncate(d.name, math.max(4, right_w - 12)), C.reset))
-            table.insert(r_lines, string.format("  %sPID:%s      %s%-7d%s %sParent PID:%s %s%s%s",
-                C.b_cyan .. C.bold, C.reset, C.b_yellow, d.pid, C.reset,
-                C.gray, C.reset, C.white, tostring(d.ppid or "N/A"), C.reset))
+                table.insert(r_lines, "")
+                table.insert(r_lines, string.format("  %sProcess:%s  %s%s%s", C.b_yellow .. C.bold, C.reset, C.b_white .. C.bold, truncate(d.name, math.max(4, right_w - 12)), C.reset))
+                table.insert(r_lines, string.format("  %sPID:%s      %s%-7d%s %sParent PID:%s %s%s%s",
+                    C.b_cyan .. C.bold, C.reset, C.b_yellow, d.pid, C.reset,
+                    C.gray, C.reset, C.white, tostring(d.ppid or "N/A"), C.reset))
 
-            table.insert(r_lines, string.format("  %sUser:%s     %s%-12s%s %sThreads:%s %s%s%s",
-                C.gray, C.reset, C.magenta, truncate(d.user or "User", 12), C.reset,
-                C.gray, C.reset, C.white, tostring(d.threads or 1), C.reset))
+                table.insert(r_lines, string.format("  %sUser:%s     %s%-12s%s %sThreads:%s %s%s%s",
+                    C.gray, C.reset, C.magenta, truncate(d.user or "User", 12), C.reset,
+                    C.gray, C.reset, C.white, tostring(d.threads or 1), C.reset))
 
-            local mem_info = format_mem(d.rss)
-            if d.vms and d.vms > 0 then
-                mem_info = mem_info .. string.format(" (Virt: %s)", format_mem(d.vms))
-            end
-            table.insert(r_lines, string.format("  %sMemory:%s   %s%s%s", C.b_green .. C.bold, C.reset, C.b_green, truncate(mem_info, math.max(4, right_w - 12)), C.reset))
+                local mem_info = format_mem(d.rss)
+                if d.vms and d.vms > 0 then
+                    mem_info = mem_info .. string.format(" (Virt: %s)", format_mem(d.vms))
+                end
+                table.insert(r_lines, string.format("  %sMemory:%s   %s%s%s", C.b_green .. C.bold, C.reset, C.b_green, truncate(mem_info, math.max(4, right_w - 12)), C.reset))
 
-            if d.state then
-                table.insert(r_lines, string.format("  %sState:%s    %s%s%s", C.gray, C.reset, C.cyan, d.state, C.reset))
-            end
+                if d.state then
+                    table.insert(r_lines, string.format("  %sState:%s    %s%s%s", C.gray, C.reset, C.cyan, d.state, C.reset))
+                end
 
-            table.insert(r_lines, "")
-            table.insert(r_lines, string.format("  %sExecutable Path:%s", C.b_white .. C.bold, C.reset))
-            table.insert(r_lines, "    " .. C.white .. truncate(d.exe or "N/A", math.max(4, right_w - 6)) .. C.reset)
+                table.insert(r_lines, "")
+                table.insert(r_lines, string.format("  %sExecutable Path:%s", C.b_white .. C.bold, C.reset))
+                table.insert(r_lines, "    " .. C.white .. truncate(d.exe or "N/A", math.max(4, right_w - 6)) .. C.reset)
 
-            table.insert(r_lines, "")
-            table.insert(r_lines, string.format("  %sCommand Line:%s", C.b_white .. C.bold, C.reset))
-            local cmd_str = d.cmd or d.name
-            local max_cmd_w = math.max(4, right_w - 6)
-            for chunk_idx = 1, math.min(#cmd_str, max_cmd_w * 4), max_cmd_w do
-                table.insert(r_lines, "    " .. C.gray .. truncate(cmd_str:sub(chunk_idx, chunk_idx + max_cmd_w - 1), max_cmd_w) .. C.reset)
+                table.insert(r_lines, "")
+                table.insert(r_lines, string.format("  %sCommand Line:%s", C.b_white .. C.bold, C.reset))
+                local cmd_str = d.cmd or d.name
+                local max_cmd_w = math.max(4, right_w - 6)
+                for chunk_idx = 1, math.min(#cmd_str, max_cmd_w * 4), max_cmd_w do
+                    table.insert(r_lines, "    " .. C.gray .. truncate(cmd_str:sub(chunk_idx, chunk_idx + max_cmd_w - 1), max_cmd_w) .. C.reset)
+                end
             end
         end
 
@@ -971,7 +1028,8 @@ local function run_tui(init_opts)
                 l_str = string.rep(" ", left_w)
             end
 
-            local r_str = r_lines[row] or ""
+            local r_idx = row + (state.preview_scroll or 0)
+            local r_str = r_lines[r_idx] or ""
             local sep_char = (cols >= 90) and (C.gray .. "│" .. C.reset) or ""
             add_line(l_str .. " " .. sep_char .. " " .. r_str)
         end
@@ -981,7 +1039,9 @@ local function run_tui(init_opts)
         add_line(C.gray .. footer_sep .. C.reset)
 
         local status_disp
-        if state.mode == "confirm_kill" then
+        if state.mode == "help" then
+            status_disp = C.b_yellow .. C.bold .. " [Help Mode] Press any key or ? to return to process list..." .. C.reset
+        elseif state.mode == "confirm_kill" then
             status_disp = C.bg_red .. C.b_white .. C.bold .. " " .. state.confirm_msg .. " (y/n): " .. C.reset
         elseif #state.status_msg > 0 then
             local col = (state.status_type == "ok") and C.b_green or C.b_red
@@ -991,9 +1051,9 @@ local function run_tui(init_opts)
             for _ in pairs(state.selected_set) do sel_cnt = sel_cnt + 1 end
             local sel_indicator = (sel_cnt > 0) and string.format("%s(%d selected)%s ", C.b_red, sel_cnt, C.gray) or ""
 
-            status_disp = string.format(" %s%sEnter/d%s:Kill  %sD/K%s:Force  %sTab%s:Select  %ss%s:Sort  %s/%s:Filter  %s1-3%s:Tabs  %sq%s:Quit",
+            status_disp = string.format(" %s%sj/k%s:Move  %sgg/G%s:Top/End  %s^d/^u%s:Page  %sv/Tab%s:Sel  %sd/D%s:Kill  %ss%s:Sort  %s?%s:Help  %sq%s:Quit",
                 sel_indicator,
-                C.b_yellow, C.gray, C.b_red, C.gray, C.b_cyan, C.gray, C.b_green, C.gray, C.b_yellow, C.gray, C.b_cyan, C.gray, C.b_red, C.reset)
+                C.b_cyan, C.gray, C.b_cyan, C.gray, C.b_cyan, C.gray, C.b_yellow, C.gray, C.b_red, C.gray, C.b_green, C.gray, C.b_yellow, C.gray, C.b_red, C.reset)
         end
         add_line(status_disp)
 
@@ -1030,8 +1090,12 @@ local function run_tui(init_opts)
             os.exit(0)
         end
 
+        -- Dismiss Help Mode on any key
+        if state.mode == "help" then
+            state.mode = "normal"
+
         -- A. Confirm Kill Mode
-        if state.mode == "confirm_kill" then
+        elseif state.mode == "confirm_kill" then
             if key == "y" or key == "Y" or key == "ENTER" or key == "d" or key == "D" then
                 if state.confirm_callback then
                     state.confirm_callback(true)
@@ -1058,21 +1122,42 @@ local function run_tui(init_opts)
             elseif key == "BACKSPACE" then
                 state.filter = state.filter:sub(1, math.max(0, #state.filter - 1))
                 apply_filter_and_sort()
+            elseif key == "CTRL_W" then
+                state.filter = delete_word(state.filter)
+                apply_filter_and_sort()
             elseif key == "CTRL_U" then
                 state.filter = ""
                 apply_filter_and_sort()
-            elseif key == "UP" then
+            elseif key == "UP" or key == "CTRL_P" then
                 state.cursor = math.max(1, state.cursor - 1)
-            elseif key == "DOWN" then
+                state.preview_scroll = 0
+            elseif key == "DOWN" or key == "CTRL_N" then
                 state.cursor = math.min(math.max(1, #state.filtered), state.cursor + 1)
-            elseif #key == 1 then
+                state.preview_scroll = 0
+            elseif #key == 1 and key:byte(1) >= 32 and key:byte(1) <= 126 then
                 state.filter = state.filter .. key
                 apply_filter_and_sort()
             end
 
         -- C. Normal Navigation Mode
         else
-            if key == "q" or key == "ESC" then
+            if state.pending_op == "g" then
+                if key == "g" then
+                    state.cursor = 1
+                    state.preview_scroll = 0
+                end
+                state.pending_op = nil
+            elseif state.pending_op == "z" then
+                local body_h = state.body_h or 10
+                if key == "z" then
+                    state.scroll = math.max(1, math.min(math.max(1, #state.filtered - body_h + 1), state.cursor - math.floor(body_h / 2)))
+                elseif key == "t" then
+                    state.scroll = math.max(1, math.min(math.max(1, #state.filtered - body_h + 1), state.cursor))
+                elseif key == "b" then
+                    state.scroll = math.max(1, math.min(math.max(1, #state.filtered - body_h + 1), state.cursor - body_h + 1))
+                end
+                state.pending_op = nil
+            elseif key == "q" or key == "ESC" then
                 if #state.filter > 0 then
                     state.filter = ""
                     apply_filter_and_sort()
@@ -1080,41 +1165,65 @@ local function run_tui(init_opts)
                     Term.restore()
                     os.exit(0)
                 end
+            elseif key == "?" then
+                state.mode = "help"
             elseif key == "/" then
                 state.prev_filter = state.filter
                 state.mode = "filter"
-            elseif key == "j" or key == "DOWN" then
+            elseif key == "g" then
+                state.pending_op = "g"
+            elseif key == "z" then
+                state.pending_op = "z"
+            elseif key == "j" or key == "DOWN" or key == "CTRL_N" then
                 state.cursor = math.min(math.max(1, #state.filtered), state.cursor + 1)
-            elseif key == "k" or key == "UP" then
+                state.preview_scroll = 0
+            elseif key == "k" or key == "UP" or key == "CTRL_P" then
                 state.cursor = math.max(1, state.cursor - 1)
-            elseif key == "PGDN" then
-                local _, rows = Term.get_size()
-                state.cursor = math.min(math.max(1, #state.filtered), state.cursor + math.max(1, rows - 7))
-            elseif key == "PGUP" then
-                local _, rows = Term.get_size()
-                state.cursor = math.max(1, state.cursor - math.max(1, rows - 7))
-            elseif key == "g" or key == "HOME" then
-                state.cursor = 1
+                state.preview_scroll = 0
+            elseif key == "CTRL_D" then
+                local half = math.max(1, math.floor((state.body_h or 10) / 2))
+                state.cursor = math.min(math.max(1, #state.filtered), state.cursor + half)
+                state.preview_scroll = 0
+            elseif key == "CTRL_U" then
+                local half = math.max(1, math.floor((state.body_h or 10) / 2))
+                state.cursor = math.max(1, state.cursor - half)
+                state.preview_scroll = 0
+            elseif key == "CTRL_F" or key == "PGDN" then
+                local page = math.max(1, state.body_h or 10)
+                state.cursor = math.min(math.max(1, #state.filtered), state.cursor + page)
+                state.preview_scroll = 0
+            elseif key == "CTRL_B" or key == "PGUP" then
+                local page = math.max(1, state.body_h or 10)
+                state.cursor = math.max(1, state.cursor - page)
+                state.preview_scroll = 0
+            elseif key == "H" then
+                state.cursor = math.max(1, math.min(#state.filtered, state.scroll))
+                state.preview_scroll = 0
+            elseif key == "M" then
+                state.cursor = math.max(1, math.min(#state.filtered, state.scroll + math.floor(((state.body_h or 10) - 1) / 2)))
+                state.preview_scroll = 0
+            elseif key == "L" then
+                state.cursor = math.max(1, math.min(#state.filtered, state.scroll + (state.body_h or 10) - 1))
+                state.preview_scroll = 0
             elseif key == "G" or key == "END" then
                 state.cursor = math.max(1, #state.filtered)
-            elseif key == "h" or key == "LEFT" then
-                state.tab_idx = (state.tab_idx == 1) and #TABS or (state.tab_idx - 1)
-                apply_filter_and_sort()
-            elseif key == "l" or key == "RIGHT" then
-                state.tab_idx = (state.tab_idx == #TABS) and 1 or (state.tab_idx + 1)
-                apply_filter_and_sort()
-            elseif key == "1" then
-                state.tab_idx = 1
-                apply_filter_and_sort()
-            elseif key == "2" then
-                state.tab_idx = 2
-                apply_filter_and_sort()
-            elseif key == "3" then
-                state.tab_idx = 3
-                apply_filter_and_sort()
-            elseif key == "s" or key == "S" then
-                state.sort_idx = (state.sort_idx == #SORT_MODES) and 1 or (state.sort_idx + 1)
-                apply_filter_and_sort()
+                state.preview_scroll = 0
+            elseif key == "HOME" then
+                state.cursor = 1
+                state.preview_scroll = 0
+            elseif key == "CTRL_E" then
+                state.preview_scroll = (state.preview_scroll or 0) + 1
+            elseif key == "CTRL_Y" then
+                state.preview_scroll = math.max(0, (state.preview_scroll or 0) - 1)
+            elseif key == "v" or key == "V" then
+                local item = state.filtered[state.cursor]
+                if item then
+                    if state.selected_set[item.pid] then
+                        state.selected_set[item.pid] = nil
+                    else
+                        state.selected_set[item.pid] = true
+                    end
+                end
             elseif key == "TAB" or key == "SPACE" then
                 local item = state.filtered[state.cursor]
                 if item then
@@ -1125,6 +1234,27 @@ local function run_tui(init_opts)
                     end
                 end
                 state.cursor = math.min(math.max(1, #state.filtered), state.cursor + 1)
+                state.preview_scroll = 0
+            elseif key == "r" or key == "CTRL_R" then
+                refresh_data()
+                apply_filter_and_sort()
+                state.status_msg = "Process list refreshed."
+                state.status_type = "ok"
+            elseif key == "h" or key == "LEFT" then
+                state.tab_idx = (state.tab_idx == 1) and #TABS or (state.tab_idx - 1)
+                apply_filter_and_sort()
+                state.preview_scroll = 0
+            elseif key == "l" or key == "RIGHT" then
+                state.tab_idx = (state.tab_idx == #TABS) and 1 or (state.tab_idx + 1)
+                apply_filter_and_sort()
+                state.preview_scroll = 0
+            elseif key == "1" or key == "2" or key == "3" then
+                state.tab_idx = tonumber(key)
+                apply_filter_and_sort()
+                state.preview_scroll = 0
+            elseif key == "s" or key == "S" then
+                state.sort_idx = (state.sort_idx == #SORT_MODES) and 1 or (state.sort_idx + 1)
+                apply_filter_and_sort()
             elseif key == "d" or key == "ENTER" or key == "D" or key == "K" then
                 local force = (key == "D" or key == "K")
                 local targets = {}
@@ -1412,6 +1542,29 @@ local function run_tests()
         end
     end
 
+    -- Test 6: delete_word helper
+    assert_eq("delete_word removes trailing word", delete_word("filter test"), "filter ")
+    assert_eq("delete_word with trailing spaces", delete_word("filter test   "), "filter ")
+    assert_eq("delete_word single word", delete_word("process"), "")
+    assert_eq("delete_word empty string", delete_word(""), "")
+
+    -- Test 7: Vim navigation math
+    local test_total = 50
+    local test_body_h = 10
+    local cur = 25
+    local scroll = 20
+    -- Half page down / up
+    local half = math.floor(test_body_h / 2)
+    assert_eq("Ctrl-d advances half page", math.min(test_total, cur + half), 30)
+    assert_eq("Ctrl-u retreats half page", math.max(1, cur - half), 20)
+    -- H / M / L
+    assert_eq("H jumps to top visible", math.max(1, math.min(test_total, scroll)), 20)
+    assert_eq("M jumps to mid visible", math.max(1, math.min(test_total, scroll + math.floor((test_body_h - 1) / 2))), 24)
+    assert_eq("L jumps to bottom visible", math.max(1, math.min(test_total, scroll + test_body_h - 1)), 29)
+    -- zz recenter
+    local zz_scroll = math.max(1, math.min(test_total - test_body_h + 1, cur - math.floor(test_body_h / 2)))
+    assert_eq("zz centers cursor in viewport", zz_scroll, 20)
+
     print(string.format("\nSelf-test summary: %d passed, %d failed.", passed, failed))
     if failed > 0 then os.exit(1) end
 end
@@ -1432,18 +1585,23 @@ Options:
   --test               Run built-in automated self-tests and exit
   -h, --help           Show this help message
 
-Interactive Controls:
-  j / k, Up / Down     Move cursor
-  h / l, Left / Right  Switch context tabs ([All Procs], [User Apps], [Heavy/RAM])
-  1 / 2 / 3            Direct tab jump
-  Tab / Space          Toggle multi-select checkbox [x]
-  d / Enter            Terminate selected process(es) with confirmation
-  D / K                Immediate force kill
-  s                    Cycle sort order (Memory -> PID -> Name -> Threads)
-  /                    Filter / search by name or PID
-  PgUp / PgDn          Page scroll
-  g / G, Home / End    Jump to first / last process
-  q / Esc              Exit]])
+Interactive Vim & Navigation Controls:
+  j / k, ^n / ^p, Up / Down Move cursor down / up
+  gg / G, Home / End        Jump to first / last process
+  Ctrl-d / Ctrl-u           Scroll half-page down / up
+  Ctrl-f / Ctrl-b           Scroll full-page down / up (PgDn / PgUp)
+  H / M / L                 Jump to High / Mid / Low screen position
+  zz / zt / zb              Recenter viewport: Center / Top / Bottom
+  Ctrl-e / Ctrl-y           Scroll right inspector card down / up
+  v / Tab / Space           Toggle multi-select checkbox [x]
+  d / Enter                 Terminate process(es) with confirmation
+  D / K                     Immediate force kill (SIGKILL)
+  h / l, 1 / 2 / 3          Switch context tab (All / User / Heavy)
+  s / S                     Cycle sort mode (Memory / PID / Name / Threads)
+  /                         Enter search filter mode (Ctrl-w to delete word)
+  r / Ctrl-r                Refresh processes and memory
+  ?                         Toggle built-in Vim Cheatsheet modal
+  q / Esc                   Exit fkill]])
 end
 
 --------------------------------------------------------------------------------
