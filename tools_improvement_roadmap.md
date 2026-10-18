@@ -26,7 +26,7 @@ These older batch, shell, and Python scripts have already been superseded by mod
 | :--- | :--- | :--- | :--- |
 | **[`gbd.bat`](bin/gbd.bat)** & **[`gdbf.bat`](bin/gdbf.bat)** | Retired | [`fbr.bat`](bin/fbr.bat) / [`fbr.lua`](bin/fbr.lua) | Removed in favor of native [`fbr`](bin/fbr.lua) branch manager. |
 | **[`gcb.bat`](bin/gcb.bat)** & **[`gcbf.bat`](bin/gcbf.bat)** | Retired | [`fco.bat`](bin/fco.bat) / [`fco.lua`](bin/fco.lua) | Removed in favor of native [`fco`](bin/fco.lua) checkout selector. |
-| **[`putty_colors.py`](bin/putty_colors.py)** & **[`putty_sessions.py`](bin/putty_sessions.py)** | Legacy Python scripts | [`putty.lua`](bin/putty.lua) (Win32 Registry FFI) | Remove or redirect wrappers to `putty.lua`, eliminating the Python runtime dependency. |
+| **[`putty_colors.py`](bin/putty_colors.py)** & **[`putty_sessions.py`](bin/putty_sessions.py)** | Retired | [`putty.lua`](bin/putty.lua) (Win32 Registry FFI) | Removed in favor of native Win32 FFI [`putty.lua`](bin/putty.lua). |
 | **[`sync_folder.ps1`](bin/sync_folder.ps1)** | PowerShell script (~1s cold start) | None yet | Rewrite into **`sync_folder.lua`** using native Win32 FFI and Robocopy streaming. |
 
 ---
@@ -52,6 +52,7 @@ The following configuration files in the repository are currently omitted during
 
 ### Phase 2: Consolidation & Legacy Cleanup
 - [x] **Retire Redundant Git Scripts**: Removed legacy `gbd.bat`, `gcb.bat`, `gcbf.bat`, and `gdbf.bat` (fully replaced by `fbr` and `fco`).
+- [x] **Retire Legacy PuTTY Python Scripts**: Removed `putty_colors.py` and `putty_sessions.py`, updated launchers to native `putty.lua`.
 - [ ] **Merge `fscp.lua` and `fscp_tui.lua`**: Unify into a single, cohesive tool.
 - [ ] **Modernize `fcd.lua`**: Add standalone TUI mode while maintaining shell pipeline compatibility.
 

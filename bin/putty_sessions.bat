@@ -1,7 +1,10 @@
 @echo off
+rem putty_sessions.bat - Launch putty.lua sessions via LuaJIT on Windows
+setlocal
 where luajit >nul 2>nul
-if %errorlevel% equ 0 if exist "%~dp0putty.lua" (
+if %ERRORLEVEL% equ 0 (
     luajit "%~dp0putty.lua" sessions %*
-    exit /b %errorlevel%
+    exit /b %ERRORLEVEL%
 )
-python "%~dp0putty_sessions.py" %*
+echo [ERROR] luajit is required to run putty.lua. 1>&2
+exit /b 1

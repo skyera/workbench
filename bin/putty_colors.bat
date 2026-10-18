@@ -1,7 +1,10 @@
 @echo off
+rem putty_colors.bat - Launch putty.lua colors via LuaJIT on Windows
+setlocal
 where luajit >nul 2>nul
-if %errorlevel% equ 0 if exist "%~dp0putty.lua" (
+if %ERRORLEVEL% equ 0 (
     luajit "%~dp0putty.lua" colors %*
-    exit /b %errorlevel%
+    exit /b %ERRORLEVEL%
 )
-python "%~dp0putty_colors.py" %*
+echo [ERROR] luajit is required to run putty.lua. 1>&2
+exit /b 1
