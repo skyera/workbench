@@ -680,6 +680,38 @@ end
 --------------------------------------------------------------------------------
 -- Subcommand: SESSIONS
 --------------------------------------------------------------------------------
+local function render_ssh_config(sessions)
+    local lines = { "# Generated from PuTTY Saved Sessions by putty.lua", "" }
+    for _, session in ipairs(sessions) do
+        if session.name ~= "Default Settings" and session.host and session.host ~= "" then
+            local fields = {
+                { "Host", session.name },
+                { "HostName", session.host },
+                { "User", session.user },
+                { "Port", session.port ~= "22" and session.port or nil },
+                { "IdentityFile", session.key_file }
+            }
+            for _, field in ipairs(fields) do
+                local keyword, value = field[1], field[2]
+                if value and value ~= "" then
+                    if value:find("%c") then
+                        return nil, string.format(
+                            "Cannot export %s for session %s: control characters are not "
+                                .. "supported in SSH config values. Edit the saved value first.",
+                            keyword, json_quote(session.name)
+                        )
+                    end
+                    local quoted = '"' .. value:gsub("\\", "\\\\"):gsub('"', '\\"') .. '"'
+                    local indentation = keyword == "Host" and "" or "    "
+                    table.insert(lines, indentation .. keyword .. " " .. quoted)
+                end
+            end
+            table.insert(lines, "")
+        end
+    end
+    return table.concat(lines, "\n") .. "\n"
+end
+
 local function cmd_sessions(args)
     local as_json = false
     local as_ssh = false
@@ -738,17 +770,12 @@ Usage:
     end
 
     if as_ssh then
-        io.write("# Generated from PuTTY Saved Sessions by putty.lua\n\n")
-        for _, s in ipairs(sessions) do
-            if s.name ~= "Default Settings" and s.host and s.host ~= "" then
-                io.write(string.format("Host %s\n", s.name))
-                io.write(string.format("    HostName %s\n", s.host))
-                if s.user and s.user ~= "" then io.write(string.format("    User %s\n", s.user)) end
-                if s.port and s.port ~= "22" and s.port ~= "" then io.write(string.format("    Port %s\n", s.port)) end
-                if s.key_file and s.key_file ~= "" then io.write(string.format("    IdentityFile %s\n", s.key_file)) end
-                io.write("\n")
-            end
+        local config, export_error = render_ssh_config(sessions)
+        if not config then
+            io.stderr:write("Error: " .. export_error .. "\n")
+            return false
         end
+        io.write(config)
         return
     end
 

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 import unittest
 
 
@@ -292,6 +293,88 @@ cmd_sessions({ "--json" })
 ''')
         self.assert_lua_passed(result)
         self.assertEqual(json.loads(result.stdout), [])
+
+    def test_ssh_export_quotes_values_and_openssh_accepts_spaced_key_path(self):
+        result = self.lua(r'''
+fetch_all_sessions = function()
+    return {
+        {
+            name = "review-host",
+            host = "example.org",
+            user = "review",
+            port = "2222",
+            key_file = "C:\\Users\\Test User\\key.ppk"
+        }
+    }
+end
+cmd_sessions({ "--ssh-config" })
+''')
+        self.assert_lua_passed(result)
+        self.assertIn('Host "review-host"', result.stdout)
+        self.assertIn('    Port "2222"', result.stdout)
+        self.assertIn(r'IdentityFile "C:\\Users\\Test User\\key.ppk"', result.stdout)
+
+        if os.name == "nt":
+            ssh = Path(os.environ.get("WINDIR", "C:/Windows")) / "System32/OpenSSH/ssh.exe"
+        else:
+            ssh = shutil.which("ssh")
+        if not ssh or not Path(ssh).exists():
+            self.skipTest("OpenSSH is unavailable for config parser verification")
+
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=".putty-test-",
+            suffix=".conf",
+            dir=ROOT,
+            delete=False,
+        ) as temporary:
+            temporary.write(result.stdout)
+            config = Path(temporary.name)
+
+        try:
+            parsed = subprocess.run(
+                [str(ssh), "-G", "-F", str(config), "review-host"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=20,
+            )
+        finally:
+            config.unlink()
+        self.assertEqual(parsed.returncode, 0, parsed.stdout + parsed.stderr)
+        self.assertIn("hostname example.org", parsed.stdout)
+        self.assertIn("port 2222", parsed.stdout)
+        self.assertIn("Test User", parsed.stdout)
+
+    def test_ssh_export_escapes_quotes_and_preserves_spaced_alias(self):
+        result = self.lua(r'''
+local config = assert(render_ssh_config({
+    {
+        name = "My server",
+        host = "example.org",
+        key_file = "path\\with\"quote"
+    }
+}))
+assert(config:find('Host "My server"', 1, true), config)
+assert(config:find('IdentityFile "path\\\\with\\"quote"', 1, true), config)
+''')
+        self.assert_lua_passed(result)
+
+    def test_ssh_export_rejects_control_characters_without_partial_output(self):
+        result = self.lua(r'''
+fetch_all_sessions = function()
+    return {
+        { name = "valid", host = "example.org" },
+        { name = "invalid", host = "example.org\nProxyCommand injected" }
+    }
+end
+assert(cmd_sessions({ "--ssh-config" }) == false)
+''')
+        self.assert_lua_passed(result)
+        self.assertEqual(result.stdout, "")
+        self.assertIn('HostName for session "invalid"', result.stderr)
+        self.assertIn("control characters", result.stderr)
 
 
 if __name__ == "__main__":
