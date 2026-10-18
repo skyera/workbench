@@ -25,6 +25,7 @@
 ]]
 
 local ffi = require("ffi")
+local bit = require("bit")
 
 local OS = ffi.os
 local IS_WINDOWS = (OS == "Windows")
@@ -53,6 +54,7 @@ if IS_WINDOWS then
         BOOL SetConsoleMode(HANDLE hConsoleHandle, DWORD dwMode);
         BOOL SetConsoleOutputCP(unsigned int wCodePageID);
         BOOL SetConsoleCP(unsigned int wCodePageID);
+        DWORD GetFileAttributesA(const char* lpFileName);
     ]]
 
     pcall(function()
@@ -99,6 +101,18 @@ local function file_exists(path)
     local f = io.open(path, "r")
     if f then f:close() return true end
     return false
+end
+
+local function dir_exists(path)
+    if not path or #path == 0 then return false end
+    if IS_WINDOWS then
+        local attr = ffi.C.GetFileAttributesA(path)
+        return attr ~= 0xFFFFFFFF and bit.band(attr, 0x10) ~= 0
+    else
+        local f = io.open(path .. "/.", "r")
+        if f then f:close() return true end
+        return false
+    end
 end
 
 local function is_wsl()
@@ -247,12 +261,21 @@ local function parse_reg_file(filepath)
 end
 
 local function get_repo_dir()
-    local src = debug.getinfo(1, "S").source:sub(2)
-    local dir = src:match("^(.*)[/\\]bin[/\\]") or src:match("^(.*)[/\\]") or "."
-    return dir:gsub("\\", "/")
+    local src = debug.getinfo(1, "S").source:sub(2):gsub("\\", "/")
+    if not src:match("^/") and not src:match("^%a:/") then
+        local p = io.popen(IS_WINDOWS and "cd" or "pwd")
+        local pwd = p and p:read("*line") or "."
+        if p then p:close() end
+        src = pwd:gsub("\\", "/") .. "/" .. src
+    end
+    local dir = src:match("^(.*)/bin/") or src:match("^(.*)/[^/]+$") or "."
+    return dir
 end
 
+local _THEME_CACHE = nil
+
 local function load_all_themes()
+    if _THEME_CACHE then return _THEME_CACHE end
     local themes = {}
     for k, v in pairs(PRESET_THEMES) do
         themes[k] = { name = v.name, author = v.author, colors = v.colors, source = "preset" }
@@ -266,24 +289,33 @@ local function load_all_themes()
     }
 
     for _, cdir in ipairs(candidates) do
-        if cdir and file_exists(cdir) then
-            local pipe = io.popen(string.format('find %q -type f -name "*.reg" 2>/dev/null', cdir))
+        if cdir and dir_exists(cdir) then
+            local cmd
+            if IS_WINDOWS then
+                cmd = string.format('dir /s /b /a-d "%s\\*.reg" 2>nul', cdir:gsub("/", "\\"))
+            else
+                cmd = string.format('find %q -type f -name "*.reg" 2>/dev/null', cdir)
+            end
+            local pipe = io.popen(cmd)
             if pipe then
                 for reg_path in pipe:lines() do
-                    local bname = reg_path:match("([^/\\]+)%.reg$")
-                    if bname then
-                        local key = bname:gsub("^%d+%.%s*", ""):lower():gsub("[^%w%-_]", "-"):gsub("%-+", "-")
-                        if not themes[key] then
-                            local colors = parse_reg_file(reg_path)
-                            if colors then
-                                local sub = reg_path:find("AlexAkulov") and "AlexAkulov" or (reg_path:find("iTerm2") and "iTerm2" or "custom")
-                                themes[key] = {
-                                    name = bname:gsub("^%d+%.%s*", ""),
-                                    author = sub,
-                                    colors = colors,
-                                    source = sub,
-                                    path = reg_path
-                                }
+                    reg_path = trim(reg_path)
+                    if #reg_path > 0 then
+                        local bname = reg_path:match("([^/\\]+)%.reg$")
+                        if bname then
+                            local key = bname:gsub("^%d+%.%s*", ""):lower():gsub("[^%w%-_]", "-"):gsub("%-+", "-")
+                            if not themes[key] then
+                                local colors = parse_reg_file(reg_path)
+                                if colors then
+                                    local sub = reg_path:find("AlexAkulov") and "AlexAkulov" or (reg_path:find("iTerm2") and "iTerm2" or "custom")
+                                    themes[key] = {
+                                        name = bname:gsub("^%d+%.%s*", ""),
+                                        author = sub,
+                                        colors = colors,
+                                        source = sub,
+                                        path = reg_path
+                                    }
+                                end
                             end
                         end
                     end
@@ -292,6 +324,7 @@ local function load_all_themes()
             end
         end
     end
+    _THEME_CACHE = themes
     return themes
 end
 
