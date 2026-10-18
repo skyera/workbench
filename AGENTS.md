@@ -15,6 +15,49 @@ For any issue, feature request, review, or modification task, the agent MUST fol
 
 Verification is the only path to finality. Do not assume success. Always double check and verify every fix or solution for correctness.
 
+## Code Readability & Organization
+
+These rules apply to new and modified code, including Lua, Python, shell scripts,
+PowerShell, batch files, embedded scripts, and test fixtures. Prefer readable,
+well-organized code over compact code.
+
+### General Rules
+
+*   **One Statement per Line**: Do not pack assignments, calls, branches, or loops onto one line using semicolons or other separators. Expand control flow, including early returns, into clearly indented blocks.
+*   **Consistent Formatting**: Use consistent indentation, spacing around operators, and blank lines between logical steps. Follow established file conventions; for new files, use the language defaults below. Do not use alignment padding that makes later edits unnecessarily noisy.
+*   **Descriptive Names**: Choose names that explain purpose and units, such as `refresh_interval_seconds` or `process_start_ticks`. Avoid cryptic abbreviations and single-letter names except for small loop indices or conventional local values.
+*   **Focused Functions**: Keep functions responsible for one coherent task. Extract complex conditions and repeated operations into named helpers. Prefer early returns to deeply nested branches while keeping each return in a readable block.
+*   **Logical File Structure**: Organize files into a short purpose/usage description, imports or dependencies, constants and types, supporting functions, application logic, and a clear entry point, as appropriate. Group related functionality together and keep platform-specific logic easy to locate.
+*   **Clear Boundaries**: Separate argument parsing, process or filesystem operations, data transformations, rendering, and input handling. Split modules when this clarifies responsibilities; avoid unnecessary abstraction and tiny forwarding modules.
+*   **Readable Data & Expressions**: Expand long argument lists, tables, dictionaries, and compound expressions across lines. Aim for lines under 100 characters where practical. Preserve literal commands, protocol records, and FFI declarations when wrapping would reduce clarity or alter meaning.
+*   **Useful Comments**: Explain intent, constraints, resource ownership, and non-obvious platform behavior. Replace obsolete comments when changing code. Avoid comments that merely restate the next line.
+*   **Explicit Cleanup**: Make acquisition and release of files, handles, pipes, and subprocesses visible. Keep cleanup and error handling readable rather than hiding them in dense expressions.
+
+### Language Conventions
+
+*   **Lua / LuaJIT**:
+    *   Use four spaces for indentation in new files. Expand `if`, `for`, `while`, and function bodies across lines rather than writing inline blocks.
+    *   Prefer `local` variables and named functions for substantial logic. Use multiline tables for complex records and state objects.
+    *   Keep FFI declarations grouped by API or platform. Name constants instead of scattering unexplained flags and numeric values. Document buffer lifetimes and handle ownership where they matter.
+*   **Python**:
+    *   Use four spaces for indentation and standard Python naming and import organization. Put module and class responsibilities in concise docstrings when helpful.
+    *   Use context managers for resources where appropriate. Specify encodings for text files and subprocess text when the encoding is known, including UTF-8 source files and protocol data.
+    *   Keep embedded Lua, shell, or collector scripts formatted as readable source, not compressed strings. Preserve their quoting and runtime behavior.
+*   **Shell (`sh` / `bash`)**:
+    *   Use four spaces for indentation in new files. Keep conditionals, loops, and functions in expanded blocks, with one logical command per line.
+    *   Quote variable expansions and paths appropriately. Use arrays for argument lists in Bash; use POSIX-compatible constructs in scripts whose shebang selects `sh`.
+    *   Split long pipelines or commands at logical boundaries using valid continuations. Do not change shell dialect or introduce `set -e` solely as part of formatting.
+*   **PowerShell & Windows Batch**:
+    *   Use consistent indentation and expanded control blocks. Give variables and labels descriptive names, and group setup, argument parsing, work, and cleanup clearly.
+    *   Preserve native quoting rules, delayed-expansion behavior, exit codes, and error streams. Do not compress commands or add fragile continuations merely to meet a line-length target.
+
+### Formatting & Verification
+
+*   Apply these rules as code is written; do not leave readability as optional follow-up work.
+*   Keep formatting changes within the task's scope. Avoid unrelated repository-wide formatting and keep broad formatting-only changes separate from behavior changes.
+*   Use existing formatter configuration when available. Do not introduce a mandatory formatter dependency without a task-related reason.
+*   Before finishing, review the diff and run `git diff --check`, plus relevant syntax checks and tests for changed executable code. For formatting-only changes, explicitly verify that quoting, embedded scripts, and behavior remain intact.
+
 ## Error Handling & Diagnostic Guidelines
 
 When designing and implementing logic across utilities, TUIs, scripts, and commands:
