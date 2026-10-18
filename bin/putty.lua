@@ -75,7 +75,6 @@ end
 local HKEY_CURRENT_USER = ffi.cast("void*", 0x80000001)
 local KEY_READ  = 0x20019
 local KEY_WRITE = 0x20006
-local KEY_ALL_ACCESS = 0xF003F
 local REG_SZ = 1
 local REG_DWORD = 4
 
@@ -110,6 +109,28 @@ end
 
 local function trim(s)
     return (s:gsub("^%s*(.-)%s*$", "%1"))
+end
+
+local function report_error(message)
+    io.stderr:write("Error: " .. message .. "\n")
+    return false
+end
+
+local function write_text_file(path, contents)
+    local file, open_error = io.open(path, "w")
+    if not file then
+        return false, "Could not open " .. path .. ": " .. tostring(open_error)
+    end
+
+    local written, write_error = file:write(contents)
+    local closed, close_error = file:close()
+    if not written then
+        return false, "Could not write " .. path .. ": " .. tostring(write_error)
+    end
+    if not closed then
+        return false, "Could not close " .. path .. ": " .. tostring(close_error)
+    end
+    return true
 end
 
 local function json_quote(value)
@@ -455,7 +476,10 @@ local function fetch_all_sessions()
 
     if IS_WINDOWS then
         local phkRoot = ffi.new("HKEY[1]")
-        if ffi.C.RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\SimonTatham\\PuTTY\\Sessions", 0, KEY_READ, phkRoot) == 0 then
+        local root_status = ffi.C.RegOpenKeyExA(
+            HKEY_CURRENT_USER, "Software\\SimonTatham\\PuTTY\\Sessions", 0, KEY_READ, phkRoot
+        )
+        if root_status == 0 then
             local rootKey = phkRoot[0]
             local idx = 0
             local nameBuf = ffi.new("char[260]")
@@ -463,8 +487,15 @@ local function fetch_all_sessions()
 
             while true do
                 nameLen[0] = 260
-                if ffi.C.RegEnumKeyExA(rootKey, idx, nameBuf, nameLen, nil, nil, nil, nil) ~= 0 then
+                local enum_status = ffi.C.RegEnumKeyExA(
+                    rootKey, idx, nameBuf, nameLen, nil, nil, nil, nil
+                )
+                if enum_status == 259 then
                     break
+                end
+                if enum_status ~= 0 then
+                    ffi.C.RegCloseKey(rootKey)
+                    return nil, registry_error("Could not enumerate PuTTY sessions", enum_status)
                 end
 
                 local rawSession = ffi.string(nameBuf, nameLen[0])
@@ -472,21 +503,35 @@ local function fetch_all_sessions()
 
                 local phkSub = ffi.new("HKEY[1]")
                 local subPath = "Software\\SimonTatham\\PuTTY\\Sessions\\" .. rawSession
-                if ffi.C.RegOpenKeyExA(HKEY_CURRENT_USER, subPath, 0, KEY_READ, phkSub) == 0 then
+                local sub_status = ffi.C.RegOpenKeyExA(
+                    HKEY_CURRENT_USER, subPath, 0, KEY_READ, phkSub
+                )
+                if sub_status == 0 then
                     local subKey = phkSub[0]
                     local valBuf = ffi.new("char[512]")
                     local valLen = ffi.new("DWORD[1]")
                     local valType = ffi.new("DWORD[1]")
+                    local query_error = nil
 
                     local function get_val(valName, defaultVal)
+                        if query_error then
+                            return defaultVal
+                        end
                         valLen[0] = 512
-                        if ffi.C.RegQueryValueExA(subKey, valName, nil, valType, ffi.cast("BYTE*", valBuf), valLen) == 0 then
+                        local query_status = ffi.C.RegQueryValueExA(
+                            subKey, valName, nil, valType, ffi.cast("BYTE*", valBuf), valLen
+                        )
+                        if query_status == 0 then
                             if valType[0] == REG_DWORD then
                                 return tostring(ffi.cast("DWORD*", valBuf)[0])
                             else
                                 local str = ffi.string(valBuf)
                                 return (str ~= "") and str or defaultVal
                             end
+                        elseif query_status ~= 2 then
+                            query_error = registry_error(
+                                "Could not read " .. subPath .. "\\" .. valName, query_status
+                            )
                         end
                         return defaultVal
                     end
@@ -502,10 +547,19 @@ local function fetch_all_sessions()
                         agent_fwd = get_val("AgentFwd", "0"),
                     })
                     ffi.C.RegCloseKey(subKey)
+                    if query_error then
+                        ffi.C.RegCloseKey(rootKey)
+                        return nil, query_error
+                    end
+                else
+                    ffi.C.RegCloseKey(rootKey)
+                    return nil, registry_error("Could not read registry key " .. subPath, sub_status)
                 end
                 idx = idx + 1
             end
             ffi.C.RegCloseKey(rootKey)
+        elseif root_status ~= 2 then
+            return nil, registry_error("Could not open PuTTY sessions registry key", root_status)
         end
     elseif is_wsl() then
         local output, err = run_wsl_registry({
@@ -517,7 +571,11 @@ local function fetch_all_sessions()
         sessions = parse_wsl_sessions(output)
     else
         -- Linux / Unix ~/.putty/sessions
-        local pdir = os.getenv("HOME") .. "/.putty/sessions"
+        local home = os.getenv("HOME")
+        if not home or home == "" then
+            return nil, "HOME is not set. Set HOME to your PuTTY configuration's parent directory."
+        end
+        local pdir = home .. "/.putty/sessions"
         local pipe = io.popen(string.format("ls -1 %q 2>/dev/null", pdir))
         if pipe then
             for item in pipe:lines() do
@@ -590,8 +648,17 @@ local function apply_colors_to_session(session_name, colors, raw_session)
         return true
     else
         -- Linux ~/.putty/sessions
-        local pdir = os.getenv("HOME") .. "/.putty/sessions"
-        os.execute(string.format("mkdir -p %q", pdir))
+        local home = os.getenv("HOME")
+        if not home or home == "" then
+            return false, "HOME is not set. Set HOME to your PuTTY configuration's parent directory."
+        end
+        local pdir = home .. "/.putty/sessions"
+        local mkdir_status = os.execute("mkdir -p " .. shell_quote(pdir))
+        if mkdir_status ~= 0 then
+            return false, "Could not create " .. pdir
+                .. ": mkdir exited with status " .. tostring(mkdir_status)
+                .. ". Check the directory permissions and the mkdir diagnostic above."
+        end
         local target = pdir .. "/" .. raw_session
         local lines = {}
         local f = io.open(target, "r")
@@ -606,13 +673,7 @@ local function apply_colors_to_session(session_name, colors, raw_session)
         for i = 0, 21 do
             table.insert(lines, string.format("Colour%d=%s", i, colors[i + 1]))
         end
-        local out = io.open(target, "w")
-        if out then
-            out:write(table.concat(lines, "\n") .. "\n")
-            out:close()
-            return true
-        end
-        return false, "Failed to write ~/.putty/sessions file"
+        return write_text_file(target, table.concat(lines, "\n") .. "\n")
     end
 end
 
@@ -722,8 +783,10 @@ local function cmd_sessions(args)
     local filter = nil
 
     for _, a in ipairs(args) do
-        if a == "--json" then as_json = true
-        elseif a == "--ssh-config" then as_ssh = true
+        if a == "--json" then
+            as_json = true
+        elseif a == "--ssh-config" then
+            as_ssh = true
         elseif a == "-h" or a == "--help" then
             print([[putty.lua sessions - View & Export PuTTY Sessions
 Usage:
@@ -734,8 +797,16 @@ Usage:
 ]])
             return
         elseif not a:match("^-") then
+            if filter then
+                return report_error("Specify one session filter. Quote filters containing spaces.")
+            end
             filter = a:lower()
+        else
+            return report_error("Unknown sessions option '" .. a .. "'. Run 'putty.lua sessions --help'.")
         end
+    end
+    if as_json and as_ssh then
+        return report_error("Choose either --json or --ssh-config.")
     end
 
     local sessions, session_error = fetch_all_sessions()
@@ -810,7 +881,17 @@ local function cmd_colors(args)
     local themes = load_all_themes()
     local sub = args[1]
 
-    if sub == "list" then
+    if sub == "-h" or sub == "--help" then
+        print([[Usage: putty.lua colors [list | preview THEME | apply THEME | export THEME]
+  apply THEME [-s SESSION | --all]
+  export THEME [-s SESSION] [-o FILE]
+  preview THEME [--raw]
+  Omit the subcommand to browse themes with fzf.]])
+        return
+    elseif sub == "list" then
+        if #args > 1 then
+            return report_error("colors list does not accept arguments.")
+        end
         io.write(string.format("%-28s %-16s %s\n", "THEME KEY", "AUTHOR / SOURCE", "DISPLAY NAME"))
         io.write(string.rep("─", 65) .. "\n")
         local sorted_keys = {}
@@ -827,23 +908,32 @@ local function cmd_colors(args)
         local raw = false
         local t_key = nil
         for i = 2, #args do
-            if args[i] == "--raw" then raw = true
-            elseif not t_key then t_key = args[i]:lower() end
+            if args[i] == "--raw" then
+                raw = true
+            elseif not t_key and not args[i]:match("^-") then
+                t_key = args[i]:lower()
+            else
+                return report_error("Unexpected preview argument '" .. args[i] .. "'.")
+            end
         end
         if not t_key then
             io.stderr:write("Usage: putty.lua colors preview <THEME> [--raw]\n")
-            return
+            return false
         end
         local t = themes[t_key]
         if not t then
             -- Partial match search
             for k, v in pairs(themes) do
-                if k:find(t_key, 1, true) then t = v t_key = k break end
+                if k:find(t_key, 1, true) then
+                    t = v
+                    t_key = k
+                    break
+                end
             end
         end
         if not t then
             io.stderr:write(string.format("Error: Theme '%s' not found. Run 'putty.lua colors list' to view.\n", t_key))
-            return
+            return false
         end
         render_preview(t_key, t, raw)
         return
@@ -859,28 +949,36 @@ local function cmd_colors(args)
             if a == "-s" or a == "--session" then
                 i = i + 1
                 session_name = args[i]
+                if not session_name or session_name == "" or session_name:match("^-") then
+                    return report_error("Option " .. a .. " requires a session name.")
+                end
             elseif a == "-a" or a == "--all" then
                 apply_all = true
             elseif not t_key and not a:match("^-") then
                 t_key = a:lower()
+            else
+                return report_error("Unexpected apply argument '" .. a .. "'.")
             end
             i = i + 1
         end
 
         if not t_key then
             io.stderr:write("Usage: putty.lua colors apply <THEME> [-s SESSION] [-a / --all]\n")
-            return
+            return false
         end
 
         local t = themes[t_key]
         if not t then
             for k, v in pairs(themes) do
-                if k:find(t_key, 1, true) then t = v break end
+                if k:find(t_key, 1, true) then
+                    t = v
+                    break
+                end
             end
         end
         if not t then
             io.stderr:write(string.format("Error: Unknown theme '%s'.\n", t_key))
-            return
+            return false
         end
 
         if apply_all then
@@ -913,7 +1011,8 @@ local function cmd_colors(args)
             if ok then
                 io.write("\27[32m✔ Done!\27[0m\n")
             else
-                io.write(string.format("\27[31m✘ Failed: %s\27[0m\n", err or "unknown error"))
+                io.write("\n")
+                return report_error(string.format("session '%s': %s", session_name, err))
             end
         end
         return
@@ -929,47 +1028,64 @@ local function cmd_colors(args)
             if a == "-s" or a == "--session" then
                 i = i + 1
                 session_name = args[i]
+                if not session_name or session_name == "" or session_name:match("^-") then
+                    return report_error("Option " .. a .. " requires a session name.")
+                end
             elseif a == "-o" or a == "--output" then
                 i = i + 1
                 out_file = args[i]
+                if not out_file or out_file == "" or out_file:match("^-") then
+                    return report_error("Option " .. a .. " requires an output filename.")
+                end
             elseif not t_key and not a:match("^-") then
                 t_key = a:lower()
+            else
+                return report_error("Unexpected export argument '" .. a .. "'.")
             end
             i = i + 1
         end
 
         if not t_key then
             io.stderr:write("Usage: putty.lua colors export <THEME> [-s SESSION] [-o FILE]\n")
-            return
+            return false
         end
 
         local t = themes[t_key]
         if not t then
             io.stderr:write(string.format("Error: Theme '%s' not found.\n", t_key))
-            return
+            return false
         end
 
         out_file = out_file or (t_key .. ".reg")
-        local f = io.open(out_file, "w")
-        if not f then
-            io.stderr:write(string.format("Error opening output file: %s\n", out_file))
-            return
-        end
-
-        f:write("Windows Registry Editor Version 5.00\n\n")
-        f:write(string.format(
-            "[HKEY_CURRENT_USER\\Software\\SimonTatham\\PuTTY\\Sessions\\%s]\n",
-            encode_session_name(session_name)
-        ))
+        local lines = {
+            "Windows Registry Editor Version 5.00",
+            "",
+            string.format(
+                "[HKEY_CURRENT_USER\\Software\\SimonTatham\\PuTTY\\Sessions\\%s]",
+                encode_session_name(session_name)
+            )
+        }
         for idx = 0, 21 do
-            f:write(string.format('"Colour%d"="%s"\n', idx, t.colors[idx + 1]))
+            table.insert(lines, string.format('"Colour%d"="%s"', idx, t.colors[idx + 1]))
         end
-        f:close()
+        local written, write_error = write_text_file(out_file, table.concat(lines, "\n") .. "\n")
+        if not written then
+            return report_error(write_error)
+        end
         io.write(string.format("Exported '%s' theme for session '%s' to %s\n", t.name, session_name, out_file))
         return
     end
 
+    if sub then
+        return report_error("Unknown colors subcommand '" .. sub .. "'. Run 'putty.lua colors --help'.")
+    end
+
     -- Default: Interactive FZF theme selector
+    local fzf_check = IS_WINDOWS and "where fzf >nul 2>&1"
+        or "command -v fzf >/dev/null 2>&1"
+    if os.execute(fzf_check) ~= 0 then
+        return report_error("fzf was not found in PATH. Install fzf to browse themes or use 'colors list'.")
+    end
     local script_path = debug.getinfo(1, "S").source:sub(2)
     if not script_path:match("^/") and not script_path:match("^%a:[/\\]") then
         local pwd = io.popen(IS_WINDOWS and "cd" or "pwd 2>/dev/null || pwd"):read("*line") or "."
@@ -989,7 +1105,7 @@ local function cmd_colors(args)
     local pipe = io.popen(fzf_cmd, "r")
     if not pipe then
         io.stderr:write("Error: fzf is not installed or failed to launch.\n")
-        return
+        return false
     end
     local selected = pipe:read("*line")
     pipe:close()
@@ -1001,9 +1117,9 @@ local function cmd_colors(args)
             io.flush()
             local choice = io.read("*line")
             if choice == "2" then
-                cmd_colors({ "apply", theme_key, "-a" })
+                return cmd_colors({ "apply", theme_key, "-a" })
             else
-                cmd_colors({ "apply", theme_key, "-s", "Default Settings" })
+                return cmd_colors({ "apply", theme_key, "-s", "Default Settings" })
             end
         end
     end
@@ -1014,14 +1130,19 @@ end
 --------------------------------------------------------------------------------
 local function main(args)
     local cmd = args[1]
+    local result = nil
     if cmd == "sessions" then
         local sub_args = {}
-        for i = 2, #args do table.insert(sub_args, args[i]) end
-        cmd_sessions(sub_args)
+        for i = 2, #args do
+            table.insert(sub_args, args[i])
+        end
+        result = cmd_sessions(sub_args)
     elseif cmd == "colors" or cmd == "themes" then
         local sub_args = {}
-        for i = 2, #args do table.insert(sub_args, args[i]) end
-        cmd_colors(sub_args)
+        for i = 2, #args do
+            table.insert(sub_args, args[i])
+        end
+        result = cmd_colors(sub_args)
     elseif cmd == "-h" or cmd == "--help" or cmd == "help" then
         print([[putty.lua - PuTTY Session & Color Scheme Manager (LuaJIT FFI)
 Usage:
@@ -1032,9 +1153,13 @@ Commands:
   sessions                  List and export saved PuTTY sessions
   colors                    Browse, preview, apply, and export 650+ color themes
 ]])
+    elseif cmd == nil then
+        result = cmd_colors({})
     else
-        -- No subcommand provided: if TTY, show interactive menu
-        cmd_colors({})
+        result = report_error("Unknown command '" .. cmd .. "'. Run 'putty.lua --help'.")
+    end
+    if result == false then
+        os.exit(1)
     end
 end
 
