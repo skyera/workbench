@@ -846,6 +846,9 @@ function Term.read_key()
         elseif ch == 3 then return "ctrl_c"
         elseif ch == 4 then return "ctrl_d"
         elseif ch == 21 then return "ctrl_u"
+        elseif ch == 23 then return "ctrl_w"
+        elseif ch == 2 then return "ctrl_b"
+        elseif ch == 6 then return "ctrl_f"
         elseif ch >= 32 and ch <= 126 then
             return string.char(ch)
         end
@@ -891,6 +894,9 @@ function Term.read_key()
                 elseif b == 3 then k = "ctrl_c"
                 elseif b == 4 then k = "ctrl_d"
                 elseif b == 21 then k = "ctrl_u"
+                elseif b == 23 then k = "ctrl_w"
+                elseif b == 2 then k = "ctrl_b"
+                elseif b == 6 then k = "ctrl_f"
                 elseif b >= 32 and b <= 126 then
                     k = string.char(b)
                 end
@@ -2440,7 +2446,7 @@ function App.draw()
 
     -- 5. Footer Keybindings Guide
     local hidden_state = App.show_hidden and "ON" or ((App.hidden_count or 0) > 0 and string.format("OFF (%d)", App.hidden_count) or "OFF")
-    local footer = string.format(" [Enter/l] Open [h] Up [~] Home [j/k] Select [H] Server [.] Hidden:%s [I] Icons [e] Engine:%s [/] Filter [?] Help [q] Quit ",
+    local footer = string.format(" [Enter/l] Open [h] Up [Tab/w] Focus [j/k/g/G] Move [H] Server [.] Hidden:%s [I] Icons [e] %s [/] Filter [?] Help [q] Quit ",
         hidden_state,
         (ImageRenderer.preferred_engine or "auto"):upper()
     )
@@ -2545,15 +2551,15 @@ end
 
 function App.draw_help_modal()
     local w, h = App.term_w, App.term_h
-    local mw = math.min(68, w - 4)
-    local mh = 17
-    local mx = math.floor((w - mw) / 2)
-    local my = math.floor((h - mh) / 2)
+    local mw = math.min(72, w - 4)
 
     local lines = {
         C.bold .. C.bright_cyan .. "            rbrowse.lua - Keyboard Controls Guide           " .. C.reset,
         C.gray .. string.rep("─", mw - 4) .. C.reset,
-        string.format("  %s%-18s%s %s", C.bold .. C.yellow, "j, Down / k, Up", C.reset, "Navigate files in active directory"),
+        string.format("  %s%-18s%s %s", C.bold .. C.yellow, "j, Down / k, Up", C.reset, "Navigate files / scroll preview"),
+        string.format("  %s%-18s%s %s", C.bold .. C.yellow, "g / Home, G / End", C.reset, "Jump to first / last item (or top/bottom)"),
+        string.format("  %s%-18s%s %s", C.bold .. C.yellow, "Ctrl-d / Ctrl-u", C.reset, "Jump 10 items / lines down / up"),
+        string.format("  %s%-18s%s %s", C.bold .. C.yellow, "Tab / w / Ctrl-w", C.reset, "Switch focus (File Tree <-> Preview)"),
         string.format("  %s%-18s%s %s", C.bold .. C.yellow, "Enter, l, Right", C.reset, "Drill down into folder / inspect item"),
         string.format("  %s%-18s%s %s", C.bold .. C.yellow, "h, Backspace", C.reset, "Navigate to parent folder (..)"),
         string.format("  %s%-18s%s %s", C.bold .. C.yellow, "H, s", C.reset, "Open Server Selector to switch host"),
@@ -2563,12 +2569,15 @@ function App.draw_help_modal()
         string.format("  %s%-18s%s %s", C.bold .. C.yellow, "e", C.reset, "Cycle image engine (Auto -> FFI -> Chafa -> Magick -> Python)"),
         string.format("  %s%-18s%s %s", C.bold .. C.yellow, "i", C.reset, "Toggle image renderer (Half-Blocks / OSC 1337)"),
         string.format("  %s%-18s%s %s", C.bold .. C.yellow, "/", C.reset, "Inline fuzzy filter current directory"),
-        string.format("  %s%-18s%s %s", C.bold .. C.yellow, "Tab", C.reset, "Switch focus between file tree & preview"),
         string.format("  %s%-18s%s %s", C.bold .. C.yellow, "d", C.reset, "Download selected file/folder via SCP"),
         string.format("  %s%-18s%s %s", C.bold .. C.yellow, "r", C.reset, "Refresh remote directory and clear cache"),
         string.format("  %s%-18s%s %s", C.bold .. C.yellow, "~", C.reset, "Jump to remote user home directory"),
         string.format("  %s%-18s%s %s", C.bold .. C.yellow, "? / Esc / q", C.reset, "Close this help dialog / Quit application"),
     }
+
+    local mh = #lines + 2
+    local mx = math.floor((w - mw) / 2)
+    local my = math.floor((h - mh) / 2)
 
     local modal_buf = {}
     table.insert(modal_buf, string.format("\27[%d;%dH%s┌%s┐%s", my, mx, C.bold .. C.bright_cyan, string.rep("─", mw - 2), C.reset))
@@ -2581,6 +2590,194 @@ function App.draw_help_modal()
     io.flush()
 end
 
+function App.handle_key(key)
+    if not key then return end
+
+    if App.modal == "help" then
+        if key == "escape" or key == "?" or key == "q" or key == "enter" then
+            App.modal = nil
+        end
+    elseif App.modal == "host_picker" then
+        local d = App.modal_data
+        if key == "escape" or key == "ctrl_c" or (not App.connected and key == "q") then
+            if not App.connected then
+                App.running = false
+            else
+                App.modal = nil
+            end
+        elseif key == "up" or key == "k" then
+            if d.cursor > 1 then d.cursor = d.cursor - 1 end
+        elseif key == "down" or key == "j" then
+            if d.cursor < #d.filtered then d.cursor = d.cursor + 1 end
+        elseif key == "page_up" or key == "ctrl_u" or key == "ctrl_b" then
+            d.cursor = math.max(1, d.cursor - 10)
+        elseif key == "page_down" or key == "ctrl_d" or key == "ctrl_f" then
+            d.cursor = math.min(#d.filtered, d.cursor + 10)
+        elseif (key == "g" and #d.filter == 0) or key == "home" then
+            d.cursor = 1
+        elseif (key == "G" and #d.filter == 0) or key == "end" then
+            d.cursor = math.max(1, #d.filtered)
+        elseif key == "enter" then
+            local chosen = d.filtered[d.cursor]
+            if chosen then
+                App.host_cfg = chosen
+                App.connected = true
+                App.modal = nil
+                Crawler.dir_cache = {}
+                Crawler.preview_cache = {}
+                if chosen.is_demo then
+                    App.load_dir("/home/user")
+                else
+                    App.load_dir("~")
+                end
+                App.status_msg = string.format("Connected to %s (%s)", chosen.name, chosen.hostname)
+                App.status_color = C.bright_green
+            end
+        elseif key == "backspace" then
+            if #d.filter > 0 then
+                d.filter = d.filter:sub(1, -2)
+                local res = {}
+                local q = d.filter:lower()
+                for _, h in ipairs(d.hosts) do
+                    if h.name:lower():find(q, 1, true) or (h.hostname and h.hostname:lower():find(q, 1, true)) then
+                        table.insert(res, h)
+                    end
+                end
+                d.filtered = res
+                d.cursor = math.max(1, math.min(d.cursor, #res))
+            end
+        elseif #key == 1 and key:byte(1) >= 32 and key:byte(1) <= 126 then
+            d.filter = d.filter .. key
+            local res = {}
+            local q = d.filter:lower()
+            for _, h in ipairs(d.hosts) do
+                if h.name:lower():find(q, 1, true) or (h.hostname and h.hostname:lower():find(q, 1, true)) then
+                    table.insert(res, h)
+                end
+            end
+            d.filtered = res
+            d.cursor = 1
+        end
+    elseif App.filter_mode then
+        if key == "enter" or key == "escape" then
+            App.filter_mode = false
+        elseif key == "backspace" then
+            if #App.filter_text > 0 then
+                App.filter_text = App.filter_text:sub(1, -2)
+                App.update_filter()
+            else
+                App.filter_mode = false
+            end
+        elseif #key == 1 then
+            App.filter_text = App.filter_text .. key
+            App.update_filter()
+        end
+    else
+        -- Normal navigation mode
+        if key == "q" or key == "ctrl_c" then
+            App.running = false
+        elseif key == "up" or key == "k" then
+            if App.focus == "right" then
+                App.preview_scroll = math.max(0, App.preview_scroll - 1)
+            else
+                if App.cursor > 1 then
+                    App.cursor = App.cursor - 1
+                    App.preview_scroll = 0
+                end
+            end
+        elseif key == "down" or key == "j" then
+            if App.focus == "right" then
+                App.preview_scroll = App.preview_scroll + 1
+            else
+                if App.cursor < #App.filtered_items then
+                    App.cursor = App.cursor + 1
+                    App.preview_scroll = 0
+                end
+            end
+        elseif key == "page_up" or key == "K" or key == "ctrl_u" or key == "ctrl_b" then
+            if App.focus == "left" then
+                App.cursor = math.max(1, App.cursor - 10)
+                App.preview_scroll = 0
+            else
+                App.preview_scroll = math.max(0, App.preview_scroll - 10)
+            end
+        elseif key == "page_down" or key == "J" or key == "ctrl_d" or key == "ctrl_f" then
+            if App.focus == "left" then
+                App.cursor = math.min(#App.filtered_items, App.cursor + 10)
+                App.preview_scroll = 0
+            else
+                App.preview_scroll = App.preview_scroll + 10
+            end
+        elseif key == "home" or key == "g" then
+            if App.focus == "left" then
+                App.cursor = 1
+                App.preview_scroll = 0
+            else
+                App.preview_scroll = 0
+            end
+        elseif key == "end" or key == "G" then
+            if App.focus == "left" then
+                App.cursor = math.max(1, #App.filtered_items)
+                App.preview_scroll = 0
+            else
+                App.preview_scroll = 9999
+            end
+        elseif key == "enter" or key == "l" or key == "right" then
+            App.drill_down()
+        elseif key == "backspace" or key == "h" or key == "left" then
+            App.go_parent()
+        elseif key == "tab" or key == "w" or key == "ctrl_w" then
+            App.focus = (App.focus == "left") and "right" or "left"
+        elseif key == "H" or key == "s" then
+            App.open_host_picker()
+        elseif key == "." then
+            App.show_hidden = not App.show_hidden
+            App.update_filter()
+            local count = App.hidden_count or 0
+            if App.show_hidden then
+                App.status_msg = string.format("Showing hidden files and folders (%d revealed).", count)
+                App.status_color = C.bright_yellow
+            else
+                App.status_msg = string.format("Hidden files/folders are now hidden (%d hidden).", count)
+                App.status_color = C.gray
+            end
+        elseif key == "I" then
+            local new_m = IconEngine.cycle()
+            App.status_msg = "Icon Mode toggled to: " .. new_m:upper()
+            App.status_color = C.bright_magenta
+        elseif key == "i" then
+            ImageRenderer.protocol = (ImageRenderer.protocol == "blocks") and "graphics" or "blocks"
+            App.status_msg = "Image Renderer toggled to: " .. ImageRenderer.protocol:upper()
+            App.status_color = C.bright_yellow
+        elseif key == "e" then
+            local eng = ImageRenderer.cycle_engine()
+            Crawler.preview_cache = {}
+            App.status_msg = "Image engine set to: " .. eng:upper()
+            App.status_color = C.bright_cyan
+        elseif key == "/" then
+            App.filter_mode = true
+            App.filter_text = ""
+        elseif key == "r" then
+            Crawler.dir_cache = {}
+            Crawler.preview_cache = {}
+            App.load_dir(App.current_dir)
+            App.status_msg = "Refreshed remote directory & cleared preview cache."
+            App.status_color = C.bright_green
+        elseif key == "~" then
+            App.load_dir(App.host_cfg.is_demo and "/home/user" or "~")
+        elseif key == "d" then
+            local sel = App.get_selected_item()
+            if sel then
+                App.status_msg = string.format("[Download] Run 'scp %s:%s/%s .' to pull locally.",
+                    App.host_cfg.hostname, App.current_dir, sel.name)
+                App.status_color = C.bright_yellow
+            end
+        elseif key == "?" then
+            App.modal = "help"
+        end
+    end
+end
+
 function App.run()
     Term.init()
     Term.enable_raw()
@@ -2589,153 +2786,11 @@ function App.run()
     end
 
     while App.running do
+        App.term_w, App.term_h = Term.get_size()
         App.draw()
         local key = Term.read_key()
-
         if key then
-            if App.modal == "help" then
-                if key == "escape" or key == "?" or key == "q" or key == "enter" then
-                    App.modal = nil
-                end
-            elseif App.modal == "host_picker" then
-                local d = App.modal_data
-                if key == "escape" or key == "ctrl_c" or (not App.connected and key == "q") then
-                    if not App.connected then
-                        App.running = false
-                    else
-                        App.modal = nil
-                    end
-                elseif key == "up" or key == "k" then
-                    if d.cursor > 1 then d.cursor = d.cursor - 1 end
-                elseif key == "down" or key == "j" then
-                    if d.cursor < #d.filtered then d.cursor = d.cursor + 1 end
-                elseif key == "enter" then
-                    local chosen = d.filtered[d.cursor]
-                    if chosen then
-                        App.host_cfg = chosen
-                        App.connected = true
-                        App.modal = nil
-                        Crawler.dir_cache = {}
-                        Crawler.preview_cache = {}
-                        if chosen.is_demo then
-                            App.load_dir("/home/user")
-                        else
-                            App.load_dir("~")
-                        end
-                        App.status_msg = string.format("Connected to %s (%s)", chosen.name, chosen.hostname)
-                        App.status_color = C.bright_green
-                    end
-                elseif key == "backspace" then
-                    if #d.filter > 0 then
-                        d.filter = d.filter:sub(1, -2)
-                        local res = {}
-                        local q = d.filter:lower()
-                        for _, h in ipairs(d.hosts) do
-                            if h.name:lower():find(q, 1, true) or (h.hostname and h.hostname:lower():find(q, 1, true)) then
-                                table.insert(res, h)
-                            end
-                        end
-                        d.filtered = res
-                        d.cursor = math.max(1, math.min(d.cursor, #res))
-                    end
-                elseif #key == 1 and key:byte(1) >= 32 and key:byte(1) <= 126 then
-                    d.filter = d.filter .. key
-                    local res = {}
-                    local q = d.filter:lower()
-                    for _, h in ipairs(d.hosts) do
-                        if h.name:lower():find(q, 1, true) or (h.hostname and h.hostname:lower():find(q, 1, true)) then
-                            table.insert(res, h)
-                        end
-                    end
-                    d.filtered = res
-                    d.cursor = 1
-                end
-            elseif App.filter_mode then
-                if key == "enter" or key == "escape" then
-                    App.filter_mode = false
-                elseif key == "backspace" then
-                    if #App.filter_text > 0 then
-                        App.filter_text = App.filter_text:sub(1, -2)
-                        App.update_filter()
-                    else
-                        App.filter_mode = false
-                    end
-                elseif #key == 1 then
-                    App.filter_text = App.filter_text .. key
-                    App.update_filter()
-                end
-            else
-                -- Normal navigation mode
-                if key == "q" or key == "ctrl_c" then
-                    App.running = false
-                elseif key == "up" or key == "k" then
-                    if App.cursor > 1 then
-                        App.cursor = App.cursor - 1
-                        App.preview_scroll = 0
-                    end
-                elseif key == "down" or key == "j" then
-                    if App.cursor < #App.filtered_items then
-                        App.cursor = App.cursor + 1
-                        App.preview_scroll = 0
-                    end
-                elseif key == "page_up" or key == "K" or key == "ctrl_u" then
-                    App.preview_scroll = math.max(0, App.preview_scroll - 5)
-                elseif key == "page_down" or key == "J" or key == "ctrl_d" then
-                    App.preview_scroll = App.preview_scroll + 5
-                elseif key == "enter" or key == "l" or key == "right" then
-                    App.drill_down()
-                elseif key == "backspace" or key == "h" or key == "left" then
-                    App.go_parent()
-                elseif key == "tab" then
-                    App.focus = (App.focus == "left") and "right" or "left"
-                elseif key == "H" or key == "s" then
-                    App.open_host_picker()
-                elseif key == "." then
-                    App.show_hidden = not App.show_hidden
-                    App.update_filter()
-                    local count = App.hidden_count or 0
-                    if App.show_hidden then
-                        App.status_msg = string.format("Showing hidden files and folders (%d revealed).", count)
-                        App.status_color = C.bright_yellow
-                    else
-                        App.status_msg = string.format("Hidden files/folders are now hidden (%d hidden).", count)
-                        App.status_color = C.gray
-                    end
-                elseif key == "I" then
-                    local new_m = IconEngine.cycle()
-                    App.status_msg = "Icon Mode toggled to: " .. new_m:upper()
-                    App.status_color = C.bright_magenta
-                elseif key == "i" then
-                    ImageRenderer.protocol = (ImageRenderer.protocol == "blocks") and "graphics" or "blocks"
-                    App.status_msg = "Image Renderer toggled to: " .. ImageRenderer.protocol:upper()
-                    App.status_color = C.bright_yellow
-                elseif key == "e" then
-                    local eng = ImageRenderer.cycle_engine()
-                    Crawler.preview_cache = {}
-                    App.status_msg = "Image engine set to: " .. eng:upper()
-                    App.status_color = C.bright_cyan
-                elseif key == "/" then
-                    App.filter_mode = true
-                    App.filter_text = ""
-                elseif key == "r" then
-                    Crawler.dir_cache = {}
-                    Crawler.preview_cache = {}
-                    App.load_dir(App.current_dir)
-                    App.status_msg = "Refreshed remote directory & cleared preview cache."
-                    App.status_color = C.bright_green
-                elseif key == "~" then
-                    App.load_dir(App.host_cfg.is_demo and "/home/user" or "~")
-                elseif key == "d" then
-                    local sel = App.get_selected_item()
-                    if sel then
-                        App.status_msg = string.format("[Download] Run 'scp %s:%s/%s .' to pull locally.",
-                            App.host_cfg.hostname, App.current_dir, sel.name)
-                        App.status_color = C.bright_yellow
-                    end
-                elseif key == "?" then
-                    App.modal = "help"
-                end
-            end
+            App.handle_key(key)
         end
     end
 
@@ -2948,7 +3003,48 @@ local function run_tests()
     assert(parsed[6].name == "report.pdf" and parsed[6].is_dir == false and parsed[6].size == 123456, "Regular file must parse size")
     print(C.bright_green .. "  [PASS] Remote Listing Parser: Domain Users, Symlinks, POSIX & European dates" .. C.reset)
 
-    print(C.bold .. C.bright_green .. "\nALL 17 TESTS PASSED SUCCESSFULLY!" .. C.reset)
+    -- 18. Vim Key Navigation & Pane Focus Switching (w, ctrl_w, g, G, ctrl_d, ctrl_u)
+    App.modal = nil
+    App.focus = "left"
+    App.cursor = 1
+    App.filtered_items = {
+        { name = "item1", is_dir = false },
+        { name = "item2", is_dir = false },
+        { name = "item3", is_dir = false },
+        { name = "item4", is_dir = false },
+        { name = "item5", is_dir = false },
+    }
+    App.handle_key("w")
+    assert(App.focus == "right", "'w' should switch focus to right preview pane")
+    App.handle_key("ctrl_w")
+    assert(App.focus == "left", "'ctrl_w' should switch focus back to left file list")
+    App.handle_key("G")
+    assert(App.cursor == 5, "'G' should move cursor to last item")
+    App.handle_key("g")
+    assert(App.cursor == 1, "'g' should move cursor to first item")
+    App.handle_key("ctrl_d")
+    assert(App.cursor == 5, "'ctrl_d' should advance cursor")
+    App.handle_key("ctrl_u")
+    assert(App.cursor == 1, "'ctrl_u' should jump cursor up")
+    -- Test right preview pane scrolling with Vim keys
+    App.focus = "right"
+    App.preview_scroll = 0
+    App.handle_key("j")
+    assert(App.preview_scroll == 1, "'j' in right pane should scroll preview down 1 line")
+    App.handle_key("k")
+    assert(App.preview_scroll == 0, "'k' in right pane should scroll preview up 1 line")
+    App.handle_key("ctrl_d")
+    assert(App.preview_scroll == 10, "'ctrl_d' in right pane should scroll preview down 10 lines")
+    App.handle_key("ctrl_u")
+    assert(App.preview_scroll == 0, "'ctrl_u' in right pane should scroll preview up 10 lines")
+    App.handle_key("G")
+    assert(App.preview_scroll == 9999, "'G' in right pane should jump to preview bottom")
+    App.handle_key("g")
+    assert(App.preview_scroll == 0, "'g' in right pane should jump to preview top")
+    App.focus = "left"
+    print(C.bright_green .. "  [PASS] Vim Key Navigation & Pane Focus: w, ctrl_w, g, G, ctrl_d, ctrl_u" .. C.reset)
+
+    print(C.bold .. C.bright_green .. "\nALL 18 TESTS PASSED SUCCESSFULLY!" .. C.reset)
     return true
 end
 

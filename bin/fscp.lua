@@ -385,6 +385,14 @@ function Term.read_key()
             return "ctrl_d"
         elseif ch == 5 then
             return "ctrl_e"
+        elseif ch == 21 then
+            return "ctrl_u"
+        elseif ch == 23 then
+            return "ctrl_w"
+        elseif ch == 2 then
+            return "ctrl_b"
+        elseif ch == 6 then
+            return "ctrl_f"
         elseif ch == 14 then
             return "ctrl_n"
         elseif ch == 19 then
@@ -428,6 +436,14 @@ function Term.read_key()
             return "ctrl_d"
         elseif ch == 5 then
             return "ctrl_e"
+        elseif ch == 21 then
+            return "ctrl_u"
+        elseif ch == 23 then
+            return "ctrl_w"
+        elseif ch == 2 then
+            return "ctrl_b"
+        elseif ch == 6 then
+            return "ctrl_f"
         elseif ch == 14 then
             return "ctrl_n"
         elseif ch == 19 then
@@ -1948,7 +1964,7 @@ function App.draw()
         end
     end
     local hidden_label = App.show_hidden and "ON" or (cur_hidden_count > 0 and string.format("OFF (%d)", cur_hidden_count) or "OFF")
-    local keyguide = string.format(" [Tab] Switch  [Space] Select  [H] Host/IP  [.] Hidden:%s  [u] Upload  [d] Download  [r] Refresh  [?] Help  [q] Quit ",
+    local keyguide = string.format(" [Tab/w] Switch  [Space] Select  [j/k/g/G] Move  [H] Host/IP  [.] Hidden:%s  [u] Upload  [d] Download  [?] Help  [q] Quit ",
         hidden_label
     )
     table.insert(buf, string.format("\27[%d;1H%s%s%s%s\27[0m\27[K",
@@ -2045,14 +2061,16 @@ end
 function App.draw_help_modal()
     local w, h = App.term_w, App.term_h
     local mw = math.min(72, w - 4)
-    local mh = 18
+    local mh = 20
     local mx = math.floor((w - mw) / 2)
     local my = math.floor((h - mh) / 2)
 
     local help_lines = {
         BOX.tl .. pad_string(" FSCP-TUI Keybindings & Guide ", mw - 2) .. BOX.tr,
-        BOX.v .. pad_string(" Tab                   Switch active pane (Left <-> Right)", mw - 2) .. BOX.v,
+        BOX.v .. pad_string(" Tab / w / Ctrl-w      Switch active pane (Left <-> Right)", mw - 2) .. BOX.v,
         BOX.v .. pad_string(" Up / k, Down / j      Move cursor up / down", mw - 2) .. BOX.v,
+        BOX.v .. pad_string(" g / Home, G / End     Jump to first / last item", mw - 2) .. BOX.v,
+        BOX.v .. pad_string(" Ctrl-d / Ctrl-u       Jump 15 items down / up", mw - 2) .. BOX.v,
         BOX.v .. pad_string(" Enter / l / Right     Enter selected directory", mw - 2) .. BOX.v,
         BOX.v .. pad_string(" Backspace / h / Left  Go up to parent directory (..)", mw - 2) .. BOX.v,
         BOX.v .. pad_string(" Space                 Toggle multi-select on current item", mw - 2) .. BOX.v,
@@ -2097,7 +2115,7 @@ function App.draw_host_picker_modal()
         BOX.v .. pad_string(" [↑/↓] Navigate  [Enter] Connect  [e] Edit  [d/Del] Delete  [n] New  [Esc] Cancel", mw - 2) .. BOX.v,
     }
 
-    local filter_prompt = (filter_str ~= "") and (" Filter / IP: " .. filter_str .. "_  [Del / Ctrl+D to delete]") or " Filter / IP: _ (Type to filter, or press 'e' to edit, 'd/Del' to delete, 'n' for form)"
+    local filter_prompt = (filter_str ~= "") and (" Filter / IP: " .. filter_str .. "_  [d/Del to delete]") or " Filter / IP: _ (Type to filter, or press 'e' to edit, 'd/Del' to delete, 'n' for form)"
     table.insert(lines, BOX.v .. pad_string(filter_prompt, mw - 2) .. BOX.v)
 
     table.insert(lines, BOX.v .. BOX.h:rep(mw - 2) .. BOX.v)
@@ -2923,10 +2941,14 @@ function App.handle_input(key)
             d.cursor = math.max(1, cur - 1)
         elseif key == "down" or key == "j" then
             d.cursor = math.min(total, cur + 1)
-        elseif key == "pageup" then
+        elseif key == "pageup" or key == "ctrl_u" or key == "ctrl_b" then
             d.cursor = math.max(1, cur - 10)
-        elseif key == "pagedown" then
+        elseif key == "pagedown" or key == "ctrl_d" or key == "ctrl_f" then
             d.cursor = math.min(total, cur + 10)
+        elseif (key == "g" and (not d.filter or d.filter == "")) or key == "home" then
+            d.cursor = 1
+        elseif (key == "G" and (not d.filter or d.filter == "")) or key == "end" then
+            d.cursor = math.max(1, total)
         elseif (key == "n" and (not d.filter or d.filter == "")) or key == "ctrl_n" then
             App.modal = "new_host_form"
             App.modal_data = {
@@ -2979,7 +3001,7 @@ function App.handle_input(key)
                     }
                 end
             end
-        elseif (key == "d" and (not d.filter or d.filter == "")) or key == "delete" or key == "ctrl_d" then
+        elseif (key == "d" and (not d.filter or d.filter == "")) or key == "delete" then
             local sel = filtered[cur]
             if sel then
                 if sel.is_form_launcher or sel.is_demo then
@@ -3188,7 +3210,7 @@ function App.handle_input(key)
     local other_pane = (App.active_pane == "left") and App.right or App.left
     local items = App.get_filtered_items(cur_pane)
 
-    if key == "tab" then
+    if key == "tab" or key == "w" or key == "ctrl_w" then
         App.active_pane = (App.active_pane == "left") and "right" or "left"
         App.status_msg = "Switched to " .. ((App.active_pane == "left") and "Local" or "Remote") .. " pane."
         App.status_color = C.gray
@@ -3200,13 +3222,13 @@ function App.handle_input(key)
         if cur_pane.cursor < #items then
             cur_pane.cursor = cur_pane.cursor + 1
         end
-    elseif key == "pageup" then
+    elseif key == "pageup" or key == "ctrl_u" or key == "ctrl_b" then
         cur_pane.cursor = math.max(1, cur_pane.cursor - 15)
-    elseif key == "pagedown" then
+    elseif key == "pagedown" or key == "ctrl_d" or key == "ctrl_f" then
         cur_pane.cursor = math.min(#items, cur_pane.cursor + 15)
-    elseif key == "home" then
+    elseif key == "home" or key == "g" then
         cur_pane.cursor = 1
-    elseif key == "end" then
+    elseif key == "end" or key == "G" then
         cur_pane.cursor = math.max(1, #items)
     elseif key == "enter" or key == "l" or key == "right" then
         local it = items[cur_pane.cursor]
@@ -3688,7 +3710,25 @@ local function main(...)
             App.refresh_right(true)
             list_remote_directory = old_list
             assert(App.status_msg:find("1 hidden item; press '.' to show", 1, true), "Must hint about hidden item")
-            print("  [PASS] list_remote_directory hidden items feedback and unparseable output tests")
+            -- 22. Test Vim key navigation in App.handle_input
+            App.modal = nil
+            App.active_pane = "left"
+            App.left.cursor = 1
+            App.handle_input("w")
+            assert(App.active_pane == "right", "'w' should switch active pane to right")
+            App.handle_input("ctrl_w")
+            assert(App.active_pane == "left", "'ctrl_w' should switch active pane to left")
+            App.left.cursor = 1
+            App.handle_input("G")
+            local max_left = #App.get_filtered_items(App.left)
+            assert(App.left.cursor == max_left, "'G' should move cursor to last item")
+            App.handle_input("g")
+            assert(App.left.cursor == 1, "'g' should move cursor to first item")
+            App.handle_input("ctrl_d")
+            assert(App.left.cursor == math.min(max_left, 16), "'ctrl_d' should jump cursor down")
+            App.handle_input("ctrl_u")
+            assert(App.left.cursor == 1, "'ctrl_u' should jump cursor up")
+            print("  [PASS] Vim key navigation tests in fscp")
 
             print(C.bold .. C.bright_green .. "[ALL TESTS PASSED SUCCESSFULLY]" .. C.reset)
             return
