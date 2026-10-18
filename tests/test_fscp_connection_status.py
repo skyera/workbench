@@ -67,6 +67,37 @@ assert(App.status_color == C.bright_yellow)
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_parse_ls_line_active_directory_and_formats(self):
+        source = (ROOT / "bin/fscp.lua").read_text(encoding="utf-8")
+        source = source.rsplit("main(...)", 1)[0]
+        driver = r'''
+local lines = {
+    "drwxrwxr-x 2 alice Domain Users 4096 2026-10-18 09:30:00 shared_dept",
+    "drwxrwxr-x 2 DOMAIN\\alice DOMAIN\\Domain Admins 8192 2026-10-18 09:30:00 admin_dept",
+    "drwxr-xr-x 2 user Domain Users 4096 Oct 18  2024 archive_dept",
+    "drwxr-xr-x@ 4 user staff 128 Oct 18 09:30 macos_dept",
+    "lrwxrwxrwx 1 user group 14 2026-10-18 09:30:00 symlink_dept -> /mnt/target",
+    "-rw-r--r-- 1 alice Domain Users 123456 2026-10-18 09:30:00 report.pdf",
+}
+local items = {}
+for _, line in ipairs(lines) do
+    local it = parse_ls_line(line)
+    if it then table.insert(items, it) end
+end
+assert(#items == 6, "Expected 6 parsed items, got " .. #items)
+assert(items[1].name == "shared_dept" and items[1].is_dir == true)
+assert(items[2].name == "admin_dept" and items[2].is_dir == true)
+assert(items[3].name == "archive_dept" and items[3].is_dir == true)
+assert(items[4].name == "macos_dept" and items[4].is_dir == true)
+assert(items[5].name == "symlink_dept" and items[5].is_dir == true)
+assert(items[6].name == "report.pdf" and items[6].is_dir == false and items[6].size == 123456)
+'''
+        result = subprocess.run(
+            [LUAJIT, "-"], input=source + driver, capture_output=True,
+            text=True, encoding="utf-8", timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

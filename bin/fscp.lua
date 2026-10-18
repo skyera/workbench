@@ -612,6 +612,70 @@ local function run_transfer(args)
 end
 
 --------------------------------------------------------------------------------
+-- Directory Listing Output Parser
+--------------------------------------------------------------------------------
+local MONTH_NAMES = {
+    Jan = 1, Feb = 2, Mar = 3, Apr = 4, May = 5, Jun = 6,
+    Jul = 7, Aug = 8, Sep = 9, Oct = 10, Nov = 11, Dec = 12,
+}
+
+local function parse_ls_line(line)
+    if not line or line == "" then
+        return nil
+    end
+
+    if line:match("^total%s+%d+") or line:match("^ls:") or line:match("^__FSCP_EXIT__") then
+        return nil
+    end
+
+    -- Match permissions column (including ACL '+', SELinux '.', and macOS '@')
+    local perms, rest = line:match("^([%-%a][%-%a%w%+%.%@]+)%s+(.*)$")
+    if not perms or not rest then
+        return nil
+    end
+
+    -- Look for timestamps from the right side to avoid breaking on spaces
+    -- in user or group names (e.g., Active Directory 'Domain Users').
+    local before_date, date, time, name = rest:match("^(.-)%s+(%d%d%d%d%-%d%d%-%d%d)%s+([%d:]+)%s+(.*)$")
+    local size = nil
+
+    if before_date then
+        size = before_date:match("(%d+)%s*$")
+    else
+        -- Fallback: standard POSIX 'Mon DD HH:MM' or 'Mon DD YYYY'
+        before_date, date, time, name = rest:match("^(.-)%s+([A-Z][a-z][a-z]%s+%d+)%s+([%d:]+)%s+(.*)$")
+        if before_date and MONTH_NAMES[date:sub(1, 3)] then
+            size = before_date:match("(%d+)%s*$")
+        else
+            -- Fallback: European 'DD Mon HH:MM' or 'DD Mon YYYY'
+            before_date, date, time, name = rest:match("^(.-)%s+(%d+%s+[A-Z][a-z][a-z])%s+([%d:]+)%s+(.*)$")
+            local mon = date and date:match("[A-Z][a-z][a-z]")
+            if before_date and mon and MONTH_NAMES[mon] then
+                size = before_date:match("(%d+)%s*$")
+            else
+                return nil
+            end
+        end
+    end
+
+    if not name or name == "." then
+        return nil
+    end
+
+    local link_target = name:match("^(.-)%s+%->%s+(.*)$")
+    local clean_name = link_target or name
+    local is_symlink = (perms:sub(1, 1) == "l")
+    local is_dir = (perms:sub(1, 1) == "d") or is_symlink
+
+    return {
+        name = clean_name,
+        is_dir = is_dir,
+        size = is_dir and 0 or tonumber(size or 0),
+        mtime = (date and time) and (date .. " " .. time) or "-",
+    }
+end
+
+--------------------------------------------------------------------------------
 -- Local Filesystem Scanner (FFI Win32 / POSIX)
 --------------------------------------------------------------------------------
 local function list_local_directory(dir_path)
@@ -648,18 +712,9 @@ local function list_local_directory(dir_path)
         local pipe = io.popen(cmd, "r")
         if pipe then
             for line in pipe:lines() do
-                local perms, size, date, time, name = line:match("^([%-%a][%-%a%w]+)%s+%d+%s+[^%s]+%s+[^%s]+%s+(%d+)%s+(%d%d%d%d%-%d%d%-%d%d)%s+([%d:]+)%s+(.*)$")
-                if not perms then
-                    perms, size, date, time, name = line:match("^([%-%a][%-%a%w]+)%s+%d+%s+[^%s]+%s+[^%s]+%s+(%d+)%s+([A-Za-z]+%s+%d+)%s+([%d:]+)%s+(.*)$")
-                end
-                if perms and name and name ~= "." then
-                    local is_dir = (perms:sub(1, 1) == "d")
-                    table.insert(items, {
-                        name = name,
-                        is_dir = is_dir,
-                        size = is_dir and 0 or tonumber(size or 0),
-                        mtime = (date and time) and (date .. " " .. time) or "-",
-                    })
+                local it = parse_ls_line(line)
+                if it then
+                    table.insert(items, it)
                 end
             end
             pipe:close()
@@ -1450,17 +1505,25 @@ local function list_remote_directory(host_cfg, remote_dir)
 
         local remote_path_arg
         if remote_dir == "~" or remote_dir == "" then
-            remote_path_arg = "~"
+            remote_path_arg = "~/"
         elseif remote_dir:sub(1, 2) == "~/" then
-            remote_path_arg = "~/'" .. remote_dir:sub(3):gsub("'", "'\\''") .. "'"
+            local sub = remote_dir:sub(3):gsub("'", "'\\''")
+            if sub:sub(-1) ~= "/" then
+                sub = sub .. "/"
+            end
+            remote_path_arg = "~/'" .. sub .. "'"
         else
-            remote_path_arg = "'" .. remote_dir:gsub("'", "'\\''") .. "'"
+            local p = remote_dir:gsub("'", "'\\''")
+            if p:sub(-1) ~= "/" then
+                p = p .. "/"
+            end
+            remote_path_arg = "'" .. p .. "'"
         end
-        local remote_sh = "LC_ALL=C ls -la --time-style=+%Y-%m-%d\\ %H:%M:%S " .. remote_path_arg
-        local cmd = string.format("ssh -n -o ConnectTimeout=4 -o BatchMode=yes -o StrictHostKeyChecking=accept-new %s \"%s\" \"%s\" 2>&1; echo \"\n__FSCP_EXIT__:$?\"",
+        local remote_sh = string.format("(LC_ALL=C ls -la --time-style=+%Y-%m-%d\\ %H:%M:%S %s); echo \"\n__FSCP_EXIT__:$?\"", remote_path_arg)
+        local cmd = string.format("ssh -n -o ConnectTimeout=4 -o BatchMode=yes -o StrictHostKeyChecking=accept-new %s \"%s\" \"%s\" 2>&1",
             table.concat(ssh_args, " "),
             target,
-            remote_sh
+            remote_sh:gsub('"', '\\"')
         )
 
         local pipe = io.popen(cmd, "r")
@@ -1477,11 +1540,11 @@ local function list_remote_directory(host_cfg, remote_dir)
         -- Fallback for non-GNU ls (BSD / macOS / Busybox) where --time-style is not supported
         if exit_code and exit_code ~= "0" then
             if clean_output:find("time%-style") or clean_output:find("unrecognized option") or clean_output:find("illegal option") then
-                local fallback_sh = "LC_ALL=C ls -la " .. remote_path_arg
-                local fallback_cmd = string.format("ssh -n -o ConnectTimeout=4 -o BatchMode=yes -o StrictHostKeyChecking=accept-new %s \"%s\" \"%s\" 2>&1; echo \"\n__FSCP_EXIT__:$?\"",
+                local fallback_sh = string.format("(LC_ALL=C ls -la %s); echo \"\n__FSCP_EXIT__:$?\"", remote_path_arg)
+                local fallback_cmd = string.format("ssh -n -o ConnectTimeout=4 -o BatchMode=yes -o StrictHostKeyChecking=accept-new %s \"%s\" \"%s\" 2>&1",
                     table.concat(ssh_args, " "),
                     target,
-                    fallback_sh
+                    fallback_sh:gsub('"', '\\"')
                 )
                 local fb_pipe = io.popen(fallback_cmd, "r")
                 if fb_pipe then
@@ -1509,22 +1572,9 @@ local function list_remote_directory(host_cfg, remote_dir)
         end
 
         for line in clean_output:gmatch("[^\r\n]+") do
-            local perms, size, date, time, name = line:match("^([%-%a][%-%a%w%+%.]+)%s+%d+%s+[^%s]+%s+[^%s]+%s+(%d+)%s+(%d%d%d%d%-%d%d%-%d%d)%s+([%d:]+)%s+(.*)$")
-            if not perms then
-                perms, size, date, time, name = line:match("^([%-%a][%-%a%w%+%.]+)%s+%d+%s+[^%s]+%s+[^%s]+%s+(%d+)%s+([A-Za-z]+%s+%d+)%s+([%d:]+)%s+(.*)$")
-            end
-            if perms and name and name ~= "." then
-                -- Handle symlink display: 'link -> target'
-                local link_target = name:match("^(.-)%s+%->%s+(.*)$")
-                local clean_name = link_target or name
-                local is_symlink = (perms:sub(1, 1) == "l")
-                local is_dir = (perms:sub(1, 1) == "d") or is_symlink
-                table.insert(items, {
-                    name = clean_name,
-                    is_dir = is_dir,
-                    size = is_dir and 0 or tonumber(size or 0),
-                    mtime = (date and time) and (date .. " " .. time) or "-",
-                })
+            local it = parse_ls_line(line)
+            if it then
+                table.insert(items, it)
             end
         end
     end
@@ -3516,6 +3566,30 @@ local function main(...)
             local r_avail = is_rsync_available()
             assert(type(r_avail) == "boolean", "is_rsync_available must return boolean")
             print(string.format("  [PASS] is_rsync_available(): %s", tostring(r_avail)))
+
+            -- 19. Test parse_ls_line for Active Directory domain groups and various formats
+            local ad_line = "drwxrwxr-x 2 alice Domain Users 4096 2026-10-18 09:30:00 shared_dept"
+            local ad_item = parse_ls_line(ad_line)
+            assert(ad_item ~= nil, "Domain Users directory must not be nil")
+            assert(ad_item.name == "shared_dept", "Name must be shared_dept")
+            assert(ad_item.is_dir == true, "Must be directory")
+
+            local both_domain = "drwxrwxr-x 2 DOMAIN\\alice DOMAIN\\Domain Admins 8192 2026-10-18 09:30:00 admin_dept"
+            local bd_item = parse_ls_line(both_domain)
+            assert(bd_item and bd_item.name == "admin_dept" and bd_item.is_dir == true)
+
+            local old_file = "drwxr-xr-x 2 user Domain Users 4096 Oct 18  2024 archive_dept"
+            local old_item = parse_ls_line(old_file)
+            assert(old_item and old_item.name == "archive_dept" and old_item.is_dir == true)
+
+            local macos_line = "drwxr-xr-x@ 4 user staff 128 Oct 18 09:30 macos_dept"
+            local macos_item = parse_ls_line(macos_line)
+            assert(macos_item and macos_item.name == "macos_dept" and macos_item.is_dir == true)
+
+            local symlink_line = "lrwxrwxrwx 1 user group 14 2026-10-18 09:30:00 symlink_dept -> /mnt/target"
+            local sym_item = parse_ls_line(symlink_line)
+            assert(sym_item and sym_item.name == "symlink_dept" and sym_item.is_dir == true)
+            print("  [PASS] parse_ls_line Active Directory, domain groups, and format tests")
 
             print(C.bold .. C.bright_green .. "[ALL TESTS PASSED SUCCESSFULLY]" .. C.reset)
             return
