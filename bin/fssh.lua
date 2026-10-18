@@ -785,7 +785,12 @@ local function main(args)
         -- 2. Test format_preview
         local sample_host = all_hosts[1]
         local preview = format_preview(sample_host)
-        assert(preview and preview:find(sample_host.name), "Preview card must contain host name")
+        assert(preview and preview:find(sample_host.name, 1, true), "Preview card must contain host name")
+        for _, name in ipairs({ "review-host", "build.example", "node[1]", "load%test" }) do
+            local fixture = { name = name, hostname = "192.0.2.1", source = "ssh-config" }
+            local card = format_preview(fixture)
+            assert(card:find(name, 1, true), "Preview card must contain literal host name: " .. name)
+        end
         print("  [PASS] format_preview(): renders preview card")
 
         -- 3. Test build_connection_command (OpenSSH config alias)
