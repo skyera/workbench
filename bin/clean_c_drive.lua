@@ -76,6 +76,7 @@ if IS_WINDOWS then
         BOOL DeleteFileW(LPCWSTR lpFileName);
         BOOL RemoveDirectoryW(LPCWSTR lpPathName);
         DWORD GetFileAttributesW(LPCWSTR lpFileName);
+        DWORD GetLastError(void);
         BOOL SetFileAttributesW(LPCWSTR lpFileName, DWORD dwFileAttributes);
 
         int MultiByteToWideChar(unsigned int CodePage, DWORD dwFlags, const char* lpMultiByteStr, int cbMultiByte, wchar_t* lpWideCharStr, int cchWideChar);
@@ -182,12 +183,32 @@ end
 --------------------------------------------------------------------------------
 local FILE_ATTRIBUTE_DIRECTORY = 0x10
 local FILE_ATTRIBUTE_READONLY  = 0x01
+local FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+local function report_skipped_reparse(path)
+    io.stderr:write("Skipped reparse point: " .. path .. " (junctions and symbolic links are not followed).\n")
+end
+
+local function can_traverse_win32(path)
+    local attributes = ffi.C.GetFileAttributesW(to_wide(path))
+    if attributes == 0xFFFFFFFF then
+        io.stderr:write(string.format("Cannot inspect directory '%s' (Windows error %d). Skipping it; check that it exists and is accessible.\n",
+            path, ffi.C.GetLastError()))
+        return false
+    end
+    if bit.band(attributes, FILE_ATTRIBUTE_REPARSE_POINT) ~= 0 then
+        report_skipped_reparse(path)
+        return false
+    end
+    return true
+end
 
 local function scan_folder_win32(dir_path)
     local total_bytes = 0
     local file_count = 0
 
     local function recurse(current_path)
+        if not can_traverse_win32(current_path) then return end
         local pattern = current_path .. "\\*"
         local find_data = ffi.new("WIN32_FIND_DATAW")
         local hFind = ffi.C.FindFirstFileW(to_wide(pattern), find_data)
@@ -200,7 +221,9 @@ local function scan_folder_win32(dir_path)
             if fname ~= "." and fname ~= ".." then
                 local full_child = current_path .. "\\" .. fname
                 local is_dir = (bit.band(find_data.dwFileAttributes, FILE_ATTRIBUTE_DIRECTORY) ~= 0)
-                if is_dir then
+                if bit.band(find_data.dwFileAttributes, FILE_ATTRIBUTE_REPARSE_POINT) ~= 0 then
+                    report_skipped_reparse(full_child)
+                elseif is_dir then
                     recurse(full_child)
                 else
                     local size = (tonumber(find_data.nFileSizeHigh) * 4294967296) + tonumber(find_data.nFileSizeLow)
@@ -265,6 +288,7 @@ local function clean_folder_win32(dir_path, dry_run)
     local deleted_dirs = 0
 
     local function recurse(current_path, is_root)
+        if not can_traverse_win32(current_path) then return end
         local pattern = current_path .. "\\*"
         local find_data = ffi.new("WIN32_FIND_DATAW")
         local hFind = ffi.C.FindFirstFileW(to_wide(pattern), find_data)
@@ -277,7 +301,9 @@ local function clean_folder_win32(dir_path, dry_run)
             if fname ~= "." and fname ~= ".." then
                 local full_child = current_path .. "\\" .. fname
                 local is_dir = (bit.band(find_data.dwFileAttributes, FILE_ATTRIBUTE_DIRECTORY) ~= 0)
-                if is_dir then
+                if bit.band(find_data.dwFileAttributes, FILE_ATTRIBUTE_REPARSE_POINT) ~= 0 then
+                    report_skipped_reparse(full_child)
+                elseif is_dir then
                     recurse(full_child, false)
                     if not dry_run then
                         if ffi.C.RemoveDirectoryW(to_wide(full_child)) ~= 0 then
