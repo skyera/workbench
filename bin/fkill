@@ -1,0 +1,4 @@
+#!/bin/sh
+# fkill - Launch fkill.lua via LuaJIT
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+exec luajit "$SCRIPT_DIR/fkill.lua" "$@"
