@@ -98,6 +98,32 @@ assert(items[6].name == "report.pdf" and items[6].is_dir == false and items[6].s
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_live_remote_command_construction(self):
+        source = (ROOT / "bin/fscp.lua").read_text(encoding="utf-8")
+        source = source.rsplit("main(...)", 1)[0]
+        driver = r'''
+local captured = nil
+local orig_popen = io.popen
+io.popen = function(cmd)
+    captured = cmd
+    return {
+        read = function() return "drwxr-xr-x 2 user group 4096 2026-10-18 09:30 dir1\n__FSCP_EXIT__:0" end,
+        close = function() end,
+    }
+end
+local host = {name="node1", hostname="10.0.0.1", user="deploy", port="22", is_demo=false}
+local items, err = list_remote_directory(host, "/var/data")
+io.popen = orig_popen
+assert(err == nil, "Error should be nil: " .. tostring(err))
+assert(captured and captured:find("--time-style=+%Y-%m-%d", 1, true), "Command must contain time-style format string")
+assert(captured:find("'/var/data/'"), "Remote path must contain trailing slash")
+'''
+        result = subprocess.run(
+            [LUAJIT, "-"], input=source + driver, capture_output=True,
+            text=True, encoding="utf-8", timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

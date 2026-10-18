@@ -1519,7 +1519,7 @@ local function list_remote_directory(host_cfg, remote_dir)
             end
             remote_path_arg = "'" .. p .. "'"
         end
-        local remote_sh = string.format("(LC_ALL=C ls -la --time-style=+%Y-%m-%d\\ %H:%M:%S %s); echo \"\n__FSCP_EXIT__:$?\"", remote_path_arg)
+        local remote_sh = "(LC_ALL=C ls -la --time-style=+%Y-%m-%d\\ %H:%M:%S " .. remote_path_arg .. "); echo \"\n__FSCP_EXIT__:$?\""
         local cmd = string.format("ssh -n -o ConnectTimeout=4 -o BatchMode=yes -o StrictHostKeyChecking=accept-new %s \"%s\" \"%s\" 2>&1",
             table.concat(ssh_args, " "),
             target,
@@ -1540,7 +1540,7 @@ local function list_remote_directory(host_cfg, remote_dir)
         -- Fallback for non-GNU ls (BSD / macOS / Busybox) where --time-style is not supported
         if exit_code and exit_code ~= "0" then
             if clean_output:find("time%-style") or clean_output:find("unrecognized option") or clean_output:find("illegal option") then
-                local fallback_sh = string.format("(LC_ALL=C ls -la %s); echo \"\n__FSCP_EXIT__:$?\"", remote_path_arg)
+                local fallback_sh = "(LC_ALL=C ls -la " .. remote_path_arg .. "); echo \"\n__FSCP_EXIT__:$?\""
                 local fallback_cmd = string.format("ssh -n -o ConnectTimeout=4 -o BatchMode=yes -o StrictHostKeyChecking=accept-new %s \"%s\" \"%s\" 2>&1",
                     table.concat(ssh_args, " "),
                     target,
@@ -3590,6 +3590,30 @@ local function main(...)
             local sym_item = parse_ls_line(symlink_line)
             assert(sym_item and sym_item.name == "symlink_dept" and sym_item.is_dir == true)
             print("  [PASS] parse_ls_line Active Directory, domain groups, and format tests")
+
+            -- 20. Test list_remote_directory live command construction without format errors
+            local orig_popen = io.popen
+            local captured_cmd = nil
+            io.popen = function(cmd, mode)
+                captured_cmd = cmd
+                return {
+                    read = function(self, opt)
+                        return "drwxrwxr-x 2 alice Domain Users 4096 2026-10-18 09:30:00 live_dept\n__FSCP_EXIT__:0"
+                    end,
+                    close = function() end,
+                }
+            end
+            local live_cfg = { name = "prod-box", hostname = "192.168.1.50", user = "admin", port = "22", is_demo = false }
+            local live_items, live_err = list_remote_directory(live_cfg, "/opt/app")
+            io.popen = orig_popen
+            assert(not live_err, "Live listing should succeed: " .. tostring(live_err))
+            assert(captured_cmd and captured_cmd:find("--time-style=+%Y-%m-%d", 1, true), "Command must contain valid time-style flag")
+            local found_live = false
+            for _, it in ipairs(live_items) do
+                if it.name == "live_dept" then found_live = true break end
+            end
+            assert(found_live, "Must parse live item live_dept")
+            print("  [PASS] list_remote_directory live SSH command construction tests")
 
             print(C.bold .. C.bright_green .. "[ALL TESTS PASSED SUCCESSFULLY]" .. C.reset)
             return
