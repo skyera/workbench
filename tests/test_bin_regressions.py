@@ -51,7 +51,17 @@ class BinRegressions(unittest.TestCase):
         return subprocess.run(command, input=source, cwd=self.cwd, env=self.env,
                               text=True, capture_output=True, timeout=20)
 
+    def git(self, *args):
+        return subprocess.run(["git", *args], cwd=self.cwd, env=self.env,
+                              text=True, capture_output=True, check=True).stdout
 
+    def init_repo(self):
+        self.git("init", "-q", "-b", "master")
+        self.git("config", "user.name", "Review")
+        self.git("config", "user.email", "review@example.invalid")
+        (self.cwd / "file").write_text("initial\n")
+        self.git("add", "file")
+        self.git("commit", "-qm", "initial")
 
 
 
@@ -82,7 +92,41 @@ App.right.dir = "/remote dir"
                 self.assertEqual(json.loads(self.capture.read_text()), ["-avzP", *expected])
                 self.assertFalse((self.cwd / "INJECTED").exists())
 
+    def test_checkout_rejection_is_an_error_and_success_still_works(self):
+        self.init_repo()
+        self.git("checkout", "-qb", "other")
+        (self.cwd / "file").write_text("other\n")
+        self.git("commit", "-qam", "other")
+        self.git("checkout", "-q", "master")
+        (self.cwd / "file").write_text("dirty\n")
+        result = self.lua("fco", "--no-force", "--batch", "other")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("[ERROR] Checkout failed", result.stderr)
+        self.assertIn("would be overwritten", result.stderr)
+        self.assertNotIn("[SUCCESS]", result.stdout)
+        self.assertEqual(self.git("branch", "--show-current").strip(), "master")
+        self.assertEqual((self.cwd / "file").read_text(), "dirty\n")
 
+        self.git("restore", "file")
+        result = self.lua("fco", "--no-force", "--batch", "other")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("[SUCCESS]", result.stdout)
+        self.assertEqual(self.git("branch", "--show-current").strip(), "other")
+
+    def test_worktree_and_submodule_failures_preserve_diagnostics(self):
+        # Outside a repository, both operations must return failure and Git's
+        # actual diagnostic rather than treating pipe closure as success.
+        result = self.lua("fco", driver=r'''
+local ok, _, out = Git.update_submodules(false)
+assert(not ok and out:find("not a git repository", 1, true), out)
+ok, _, out = Git.execute_worktree({type="local", name="master"}, "worktree")
+assert(not ok and out:find("not a git repository", 1, true), out)
+local succeeded, message = Git.run_command("exit 17")
+assert(not succeeded and message:find("failed", 1, true), message)
+succeeded, message = Git.run_command("printf '%05000d' 0")
+assert(succeeded and #message == 5000, "Long command output was truncated")
+''')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

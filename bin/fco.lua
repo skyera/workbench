@@ -134,6 +134,18 @@ else
     ]]
 end
 
+-- LuaJIT's Lua 5.1 file:close() discards subprocess exit status. Use the
+-- matching C runtime for opening, reading, and closing command pipes instead.
+ffi.cdef[[
+    void *popen(const char *command, const char *mode);
+    int pclose(void *stream);
+    void *_popen(const char *command, const char *mode);
+    int _pclose(void *stream);
+    size_t fread(void *buffer, size_t size, size_t count, void *stream);
+    int ferror(void *stream);
+    char *strerror(int errnum);
+]]
+
 --------------------------------------------------------------------------------
 -- Styling & Color Palette
 --------------------------------------------------------------------------------
@@ -500,6 +512,38 @@ end
 --------------------------------------------------------------------------------
 local Git = {}
 
+function Git.run_command(cmd)
+    local crt = IS_WINDOWS and msvcrt or ffi.C
+    local open_pipe = IS_WINDOWS and crt._popen or crt.popen
+    local close_pipe = IS_WINDOWS and crt._pclose or crt.pclose
+    local pipe = open_pipe(cmd .. " 2>&1", "r")
+    if pipe == nil then
+        return false, "Cannot start command '" .. cmd .. "': " .. ffi.string(crt.strerror(ffi.errno()))
+    end
+
+    local chunks = {}
+    local buffer = ffi.new("char[4096]")
+    while true do
+        local count = tonumber(crt.fread(buffer, 1, 4096, pipe))
+        if count > 0 then chunks[#chunks + 1] = ffi.string(buffer, count) end
+        if count < 4096 then break end
+    end
+    local read_error = crt.ferror(pipe) ~= 0 and ffi.string(crt.strerror(ffi.errno())) or nil
+    local status = close_pipe(pipe)
+    local wait_error = status == -1 and ffi.string(crt.strerror(ffi.errno())) or nil
+    local out = table.concat(chunks)
+    if read_error then
+        return false, out .. "\nCannot read output from '" .. cmd .. "': " .. read_error
+    end
+    if wait_error then
+        return false, out .. "\nCannot collect process status for '" .. cmd .. "': " .. wait_error
+    end
+    if status ~= 0 and out == "" then
+        out = string.format("Command '%s' failed (process status %d).", cmd, status)
+    end
+    return status == 0, out
+end
+
 function Git.is_repo()
     local p = io.popen("git rev-parse --is-inside-work-tree 2>nul")
     if not p then return false end
@@ -830,10 +874,8 @@ end
 
 function Git.execute_checkout(item, force)
     local cmd = Git.build_checkout_cmd(item, force)
-    local p = io.popen(cmd .. " 2>&1")
-    local out = p and p:read("*a") or ""
-    local ok = p and p:close()
-    return (ok == true or ok == 0), cmd, out
+    local ok, out = Git.run_command(cmd)
+    return ok, cmd, out
 end
 
 function Git.build_submodule_cmd(force)
@@ -846,10 +888,8 @@ end
 
 function Git.update_submodules(force)
     local cmd = Git.build_submodule_cmd(force)
-    local p = io.popen(cmd .. " 2>&1")
-    local out = p and p:read("*a") or ""
-    local ok = p and p:close()
-    return (ok == true or ok == 0), cmd, out
+    local ok, out = Git.run_command(cmd)
+    return ok, cmd, out
 end
 
 function Git.execute_worktree(item, path)
@@ -858,10 +898,8 @@ function Git.execute_worktree(item, path)
         target = item.name:gsub("^[^/]+/", "")
     end
     local cmd = string.format('git worktree add "%s" %s', path, target)
-    local p = io.popen(cmd .. " 2>&1")
-    local out = p and p:read("*a") or ""
-    local ok = p and p:close()
-    return (ok == true or ok == 0), cmd, out
+    local ok, out = Git.run_command(cmd)
+    return ok, cmd, out
 end
 
 --------------------------------------------------------------------------------
@@ -1831,6 +1869,15 @@ local function run_test_suite()
             failed = failed + 1
         end
     end
+
+    -- Command status must work under LuaJIT even though file:close() does not
+    -- expose the child's exit code. These commands work in sh and cmd.exe.
+    local command_ok, command_out = Git.run_command("echo fco-command-output")
+    assert_eq(command_ok, true, "Command runner detects success")
+    assert_eq(command_out:find("fco-command-output", 1, true) ~= nil, true, "Command runner captures output")
+    command_ok, command_out = Git.run_command("exit 17")
+    assert_eq(command_ok, false, "Command runner detects nonzero exit status")
+    assert_eq(command_out:find("failed", 1, true) ~= nil, true, "Silent command failure has a diagnostic")
 
     -- Test 1: Fuzzy Matching Algorithm
     print("\n[Test 1] Fuzzy Search Algorithm...")
