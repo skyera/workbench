@@ -151,12 +151,31 @@ end
 --------------------------------------------------------------------------------
 -- ANSI Colors & Styling
 --------------------------------------------------------------------------------
+local function rgb_fg(r, g, b)
+    return string.format("\27[38;2;%d;%d;%dm", r, g, b)
+end
+
+local function rgb_bg(r, g, b)
+    return string.format("\27[48;2;%d;%d;%dm", r, g, b)
+end
+
+local function hex_fg(hex_code)
+    local r, g, b = hex_code:match("#?(%x%x)(%x%x)(%x%x)")
+    return rgb_fg(tonumber(r, 16), tonumber(g, 16), tonumber(b, 16))
+end
+
+local function hex_bg(hex_code)
+    local r, g, b = hex_code:match("#?(%x%x)(%x%x)(%x%x)")
+    return rgb_bg(tonumber(r, 16), tonumber(g, 16), tonumber(b, 16))
+end
+
 local C = {
     reset       = "\27[0m",
     bold        = "\27[1m",
     dim         = "\27[2m",
-    reverse     = "\27[7m",
+    italic      = "\27[3m",
     underline   = "\27[4m",
+    reverse     = "\27[7m",
 
     black       = "\27[30m",
     red         = "\27[31m",
@@ -180,9 +199,309 @@ local C = {
     bg_blue     = "\27[44m",
     bg_cyan     = "\27[46m",
     bg_gray     = "\27[100m",
+    bg_darkgray = "\27[48;5;236m",
     bg_darkblue = "\27[48;5;24m",
     bg_sel      = "\27[48;5;238m",
+    bg_header   = "\27[48;5;24m",
 }
+
+local ThemeManager = {
+    current = "nord",
+    order = { "nord", "dracula", "tokyonight", "catppuccin", "gruvbox", "onedark", "solarized", "classic" },
+    themes = {
+        nord = {
+            name = "Nord",
+            desc = "Arctic ice-blue & polar night TrueColor palette",
+            colors = {
+                black          = hex_fg("2E3440"),
+                red            = hex_fg("BF616A"),
+                green          = hex_fg("A3BE8C"),
+                yellow         = hex_fg("EBCB8B"),
+                blue           = hex_fg("81A1C1"),
+                magenta        = hex_fg("B48EAD"),
+                cyan           = hex_fg("88C0D0"),
+                white          = hex_fg("D8DEE9"),
+                gray           = hex_fg("4C566A"),
+                bright_red     = hex_fg("D08770"),
+                bright_green   = hex_fg("A3BE8C"),
+                bright_yellow  = hex_fg("EBCB8B"),
+                bright_blue    = hex_fg("5E81AC"),
+                bright_magenta = hex_fg("B48EAD"),
+                bright_cyan    = hex_fg("8FBCBB"),
+                bright_white   = hex_fg("ECEFF4"),
+                bg_black       = hex_bg("2E3440"),
+                bg_blue        = hex_bg("5E81AC"),
+                bg_cyan        = hex_bg("88C0D0"),
+                bg_gray        = hex_bg("3B4252"),
+                bg_darkgray    = hex_bg("2E3440"),
+                bg_darkblue    = hex_bg("3B4252"),
+                bg_sel         = hex_bg("434C5E"),
+                bg_header      = hex_bg("3B4252"),
+            },
+        },
+        dracula = {
+            name = "Dracula",
+            desc = "High-contrast vampire purple/cyan/pink TrueColor palette",
+            colors = {
+                black          = hex_fg("282A36"),
+                red            = hex_fg("FF5555"),
+                green          = hex_fg("50FA7B"),
+                yellow         = hex_fg("F1FA8C"),
+                blue           = hex_fg("BD93F9"),
+                magenta        = hex_fg("FF79C6"),
+                cyan           = hex_fg("8BE9FD"),
+                white          = hex_fg("F8F8F2"),
+                gray           = hex_fg("6272A4"),
+                bright_red     = hex_fg("FF6E6E"),
+                bright_green   = hex_fg("69FF94"),
+                bright_yellow  = hex_fg("FFFFA5"),
+                bright_blue    = hex_fg("D6ACFF"),
+                bright_magenta = hex_fg("FF92DF"),
+                bright_cyan    = hex_fg("A4FFFF"),
+                bright_white   = hex_fg("FFFFFF"),
+                bg_black       = hex_bg("282A36"),
+                bg_blue        = hex_bg("BD93F9"),
+                bg_cyan        = hex_bg("8BE9FD"),
+                bg_gray        = hex_bg("44475A"),
+                bg_darkgray    = hex_bg("21222C"),
+                bg_darkblue    = hex_bg("383A59"),
+                bg_sel         = hex_bg("44475A"),
+                bg_header      = hex_bg("383A59"),
+            },
+        },
+        tokyonight = {
+            name = "Tokyo Night",
+            desc = "Clean Tokyo city night blue & magenta palette",
+            colors = {
+                black          = hex_fg("15161E"),
+                red            = hex_fg("F7768E"),
+                green          = hex_fg("9ECE6A"),
+                yellow         = hex_fg("E0AF68"),
+                blue           = hex_fg("7AA2F7"),
+                magenta        = hex_fg("BB9AF7"),
+                cyan           = hex_fg("7DCFFF"),
+                white          = hex_fg("A9B1D6"),
+                gray           = hex_fg("565F89"),
+                bright_red     = hex_fg("FF7A93"),
+                bright_green   = hex_fg("B9F27C"),
+                bright_yellow  = hex_fg("FF9E3B"),
+                bright_blue    = hex_fg("7DA6FF"),
+                bright_magenta = hex_fg("C0CAF5"),
+                bright_cyan    = hex_fg("0DB9D7"),
+                bright_white   = hex_fg("C0CAF5"),
+                bg_black       = hex_bg("1A1B26"),
+                bg_blue        = hex_bg("7AA2F7"),
+                bg_cyan        = hex_bg("7DCFFF"),
+                bg_gray        = hex_bg("24283B"),
+                bg_darkgray    = hex_bg("16161E"),
+                bg_darkblue    = hex_bg("283457"),
+                bg_sel         = hex_bg("2F3549"),
+                bg_header      = hex_bg("24283B"),
+            },
+        },
+        catppuccin = {
+            name = "Catppuccin Mocha",
+            desc = "Soothing warm pastel TrueColor palette",
+            colors = {
+                black          = hex_fg("11111B"),
+                red            = hex_fg("F38BA8"),
+                green          = hex_fg("A6E3A1"),
+                yellow         = hex_fg("F9E2AF"),
+                blue           = hex_fg("89B4FA"),
+                magenta        = hex_fg("CBA6F7"),
+                cyan           = hex_fg("94E2D5"),
+                white          = hex_fg("CDD6F4"),
+                gray           = hex_fg("6C7086"),
+                bright_red     = hex_fg("EBA0AC"),
+                bright_green   = hex_fg("A6E3A1"),
+                bright_yellow  = hex_fg("F9E2AF"),
+                bright_blue    = hex_fg("B4BEFE"),
+                bright_magenta = hex_fg("F5C2E7"),
+                bright_cyan    = hex_fg("89DCEB"),
+                bright_white   = hex_fg("F5E0DC"),
+                bg_black       = hex_bg("1E1E2E"),
+                bg_blue        = hex_bg("89B4FA"),
+                bg_cyan        = hex_bg("94E2D5"),
+                bg_gray        = hex_bg("313244"),
+                bg_darkgray    = hex_bg("181825"),
+                bg_darkblue    = hex_bg("313244"),
+                bg_sel         = hex_bg("45475A"),
+                bg_header      = hex_bg("313244"),
+            },
+        },
+        gruvbox = {
+            name = "Gruvbox Dark",
+            desc = "Retro warm earthen groove TrueColor palette",
+            colors = {
+                black          = hex_fg("282828"),
+                red            = hex_fg("CC241D"),
+                green          = hex_fg("98971A"),
+                yellow         = hex_fg("D79921"),
+                blue           = hex_fg("458588"),
+                magenta        = hex_fg("B16286"),
+                cyan           = hex_fg("689D6A"),
+                white          = hex_fg("EBDBB2"),
+                gray           = hex_fg("928374"),
+                bright_red     = hex_fg("FB4934"),
+                bright_green   = hex_fg("B8BB26"),
+                bright_yellow  = hex_fg("FABD2F"),
+                bright_blue    = hex_fg("83A598"),
+                bright_magenta = hex_fg("D3869B"),
+                bright_cyan    = hex_fg("8EC07C"),
+                bright_white   = hex_fg("FBF1C7"),
+                bg_black       = hex_bg("282828"),
+                bg_blue        = hex_bg("458588"),
+                bg_cyan        = hex_bg("689D6A"),
+                bg_gray        = hex_bg("3C3836"),
+                bg_darkgray    = hex_bg("1D2021"),
+                bg_darkblue    = hex_bg("32302F"),
+                bg_sel         = hex_bg("504945"),
+                bg_header      = hex_bg("32302F"),
+            },
+        },
+        onedark = {
+            name = "One Dark",
+            desc = "Classic Atom/VSCode iconic dark palette",
+            colors = {
+                black          = hex_fg("282C34"),
+                red            = hex_fg("E06C75"),
+                green          = hex_fg("98C379"),
+                yellow         = hex_fg("E5C07B"),
+                blue           = hex_fg("61AFEF"),
+                magenta        = hex_fg("C678DD"),
+                cyan           = hex_fg("56B6C2"),
+                white          = hex_fg("ABB2BF"),
+                gray           = hex_fg("5C6370"),
+                bright_red     = hex_fg("BE5046"),
+                bright_green   = hex_fg("A5E075"),
+                bright_yellow  = hex_fg("F0C674"),
+                bright_blue    = hex_fg("4FA6ED"),
+                bright_magenta = hex_fg("D286E6"),
+                bright_cyan    = hex_fg("68CCD8"),
+                bright_white   = hex_fg("E6E6E6"),
+                bg_black       = hex_bg("282C34"),
+                bg_blue        = hex_bg("61AFEF"),
+                bg_cyan        = hex_bg("56B6C2"),
+                bg_gray        = hex_bg("3E4451"),
+                bg_darkgray    = hex_bg("21252B"),
+                bg_darkblue    = hex_bg("21252B"),
+                bg_sel         = hex_bg("4B5263"),
+                bg_header      = hex_bg("21252B"),
+            },
+        },
+        solarized = {
+            name = "Solarized Dark",
+            desc = "Precision low-contrast solarized dark palette",
+            colors = {
+                black          = hex_fg("002B36"),
+                red            = hex_fg("DC322F"),
+                green          = hex_fg("859900"),
+                yellow         = hex_fg("B58900"),
+                blue           = hex_fg("268BD2"),
+                magenta        = hex_fg("D33682"),
+                cyan           = hex_fg("2AA198"),
+                white          = hex_fg("839496"),
+                gray           = hex_fg("657B83"),
+                bright_red     = hex_fg("CB4B16"),
+                bright_green   = hex_fg("98B100"),
+                bright_yellow  = hex_fg("C29800"),
+                bright_blue    = hex_fg("3399DD"),
+                bright_magenta = hex_fg("6C71C4"),
+                bright_cyan    = hex_fg("33B7AD"),
+                bright_white   = hex_fg("FDF6E3"),
+                bg_black       = hex_bg("002B36"),
+                bg_blue        = hex_bg("268BD2"),
+                bg_cyan        = hex_bg("2AA198"),
+                bg_gray        = hex_bg("073642"),
+                bg_darkgray    = hex_bg("001F27"),
+                bg_darkblue    = hex_bg("073642"),
+                bg_sel         = hex_bg("073642"),
+                bg_header      = hex_bg("073642"),
+            },
+        },
+        classic = {
+            name = "Classic ANSI",
+            desc = "Standard 16-color ANSI terminal fallback",
+            colors = {
+                black          = "\27[30m",
+                red            = "\27[31m",
+                green          = "\27[32m",
+                yellow         = "\27[33m",
+                blue           = "\27[34m",
+                magenta        = "\27[35m",
+                cyan           = "\27[36m",
+                white          = "\27[37m",
+                gray           = "\27[90m",
+                bright_red     = "\27[91m",
+                bright_green   = "\27[92m",
+                bright_yellow  = "\27[93m",
+                bright_blue    = "\27[94m",
+                bright_magenta = "\27[95m",
+                bright_cyan    = "\27[96m",
+                bright_white   = "\27[97m",
+                bg_black       = "\27[40m",
+                bg_blue        = "\27[44m",
+                bg_cyan        = "\27[46m",
+                bg_gray        = "\27[100m",
+                bg_darkgray    = "\27[48;5;236m",
+                bg_darkblue    = "\27[48;5;24m",
+                bg_sel         = "\27[48;5;238m",
+                bg_header      = "\27[48;5;24m",
+            },
+        },
+    },
+}
+
+function ThemeManager.apply(name)
+    local key = name and name:lower() or "nord"
+    local t = ThemeManager.themes[key]
+    if not t then
+        return false, "Unknown theme '" .. tostring(name) .. "'"
+    end
+    ThemeManager.current = key
+
+    for k, v in pairs(t.colors) do
+        C[k] = v
+    end
+    return true
+end
+
+function ThemeManager.cycle()
+    local idx = 1
+    for i, name in ipairs(ThemeManager.order) do
+        if name == ThemeManager.current then
+            idx = i
+            break
+        end
+    end
+    idx = (idx % #ThemeManager.order) + 1
+    local next_theme = ThemeManager.order[idx]
+    ThemeManager.apply(next_theme)
+    return next_theme
+end
+
+function ThemeManager.list()
+    io.write(C.bold .. C.bright_cyan .. "Available Color Themes for fscp:\n" .. C.reset)
+    for _, k in ipairs(ThemeManager.order) do
+        local t = ThemeManager.themes[k]
+        local is_def = (k == "nord") and " (Default)" or ""
+        local mark = (k == ThemeManager.current) and (C.bold .. C.bright_green .. " ▶ " .. C.reset) or "   "
+        local preview = string.format("%s %s %s %s %s %s",
+            t.colors.bright_cyan .. "■" .. C.reset,
+            t.colors.bright_blue .. "■" .. C.reset,
+            t.colors.bright_green .. "■" .. C.reset,
+            t.colors.bright_yellow .. "■" .. C.reset,
+            t.colors.bright_magenta .. "■" .. C.reset,
+            t.colors.bright_red .. "■" .. C.reset
+        )
+        io.write(string.format("%s%-14s %s %-16s - %s\n", mark, k .. is_def, preview, t.name, t.desc))
+    end
+    io.write(string.format("\n%sUsage:%s fscp --theme <NAME>  |  Press '%st%s' inside fscp to cycle themes live.\n",
+        C.bold, C.reset, C.bold .. C.bright_yellow, C.reset))
+end
+
+-- Initialize default theme: Nord
+ThemeManager.apply("nord")
 
 -- Box drawing characters with ASCII fallback
 local BOX_UNICODE = {
@@ -1801,7 +2120,7 @@ function App.draw()
         host_display = C.bright_red .. string.format("[Disconnected: %s]", target_display) .. C.reset
     end
 
-    local styled_title = string.format(" %s%sFSCP-TUI v1.0%s | %s ", C.bold, C.bright_cyan, C.reset, host_display)
+    local styled_title = string.format(" %s%sFSCP-TUI v1.0%s | %s | %sTheme: %s%s%s ", C.bold, C.bright_cyan, C.reset, host_display, C.dim, C.bold .. C.bright_yellow, ThemeManager.current:upper(), C.reset)
     local rem_len = math.max(0, w - utf8_col_width(styled_title))
     table.insert(buf, string.format("\27[1;1H%s%s%s%s\27[0m\27[K", styled_title, C.cyan, BOX.h:rep(rem_len), C.reset))
 
@@ -1964,7 +2283,8 @@ function App.draw()
         end
     end
     local hidden_label = App.show_hidden and "ON" or (cur_hidden_count > 0 and string.format("OFF (%d)", cur_hidden_count) or "OFF")
-    local keyguide = string.format(" [Tab/w] Switch  [Space] Select  [j/k/g/G] Move  [H] Host/IP  [.] Hidden:%s  [u] Upload  [d] Download  [?] Help  [q] Quit ",
+    local keyguide = string.format(" [Tab/w] Switch  [Space] Select  [j/k/g/G] Move  [H] Host/IP  [t] %s  [.] Hidden:%s  [u] Upload  [d] Download  [?] Help  [q] Quit ",
+        ThemeManager.current:upper(),
         hidden_label
     )
     table.insert(buf, string.format("\27[%d;1H%s%s%s%s\27[0m\27[K",
@@ -2061,7 +2381,7 @@ end
 function App.draw_help_modal()
     local w, h = App.term_w, App.term_h
     local mw = math.min(72, w - 4)
-    local mh = 20
+    local mh = 21
     local mx = math.floor((w - mw) / 2)
     local my = math.floor((h - mh) / 2)
 
@@ -2079,6 +2399,7 @@ function App.draw_help_modal()
         BOX.v .. pad_string(" u / F5                Upload selected items (Local -> Remote)", mw - 2) .. BOX.v,
         BOX.v .. pad_string(" d / F5                Download selected items (Remote -> Local)", mw - 2) .. BOX.v,
         BOX.v .. pad_string(" r                     Refresh directory contents", mw - 2) .. BOX.v,
+        BOX.v .. pad_string(" t                     Cycle color theme (Nord, Dracula, etc.)", mw - 2) .. BOX.v,
         BOX.v .. pad_string(" ~                     Jump directly to Home directory", mw - 2) .. BOX.v,
         BOX.v .. pad_string(" H                     Open Host Picker (Switch Remote Host)", mw - 2) .. BOX.v,
         BOX.v .. pad_string(" /                     Filter items in current pane", mw - 2) .. BOX.v,
@@ -3402,6 +3723,10 @@ function App.handle_input(key)
             cursor = 1,
             filter = "",
         }
+    elseif key == "t" then
+        local next_t = ThemeManager.cycle()
+        App.status_msg = "Theme switched to " .. ThemeManager.themes[next_t].name
+        App.status_color = C.bright_yellow
     elseif key == "?" then
         App.modal = "help"
     elseif key == "q" or key == "ctrl_c" then
@@ -3730,6 +4055,22 @@ local function main(...)
             assert(App.left.cursor == 1, "'ctrl_u' should jump cursor up")
             print("  [PASS] Vim key navigation tests in fscp")
 
+            -- 23. Test ThemeManager palette switching and cycling
+            assert(ThemeManager.current == "nord", "Default theme must be nord")
+            local orig_gray = C.gray
+            local ok, err = ThemeManager.apply("dracula")
+            assert(ok and ThemeManager.current == "dracula", "Theme apply dracula failed: " .. tostring(err))
+            assert(C.gray ~= orig_gray, "Dracula gray must differ from nord")
+            local cycled = ThemeManager.cycle()
+            assert(cycled == "tokyonight" and ThemeManager.current == "tokyonight", "Cycling after dracula must yield tokyonight")
+            for _, t_name in ipairs(ThemeManager.order) do
+                local a_ok = ThemeManager.apply(t_name)
+                assert(a_ok, "Theme apply failed for " .. t_name)
+            end
+            ThemeManager.apply("nord")
+            assert(ThemeManager.current == "nord", "Reset to nord failed")
+            print("  [PASS] ThemeManager 8-palette switching and cycling tests")
+
             print(C.bold .. C.bright_green .. "[ALL TESTS PASSED SUCCESSFULLY]" .. C.reset)
             return
         elseif a == "--snapshot" then
@@ -3791,6 +4132,8 @@ Usage:
   fscp -P [OPTIONS]                        # Headless pull transfer
 
 Interactive TUI Options:
+  --theme <NAME>              Set color theme (nord, dracula, tokyonight, etc.)
+  --theme list                List all available color themes with previews
   --demo                      Launch TUI in simulated offline demo mode
   --ascii                     Use ASCII box characters instead of Unicode
   --tui                       Explicitly force Dual-Pane TUI mode
@@ -3825,6 +4168,7 @@ TUI Keybindings:
   u / F5         Upload to remote current directory
   d / F5         Download to local current directory
   r              Refresh active pane
+  t              Cycle color theme (Nord, Dracula, TokyoNight, etc.)
   H              Open Host / Server Picker
   n              Add new SSH connection form
   ?              Help screen
@@ -3839,6 +4183,24 @@ TUI Keybindings:
             force_tui = true
         elseif a == "--tui" then
             force_tui = true
+        elseif a == "--theme" then
+            if i + 1 <= #args and not args[i + 1]:match("^-") then
+                i = i + 1
+                local theme_arg = args[i]:lower()
+                if theme_arg == "list" then
+                    ThemeManager.list()
+                    return
+                end
+                local ok, err = ThemeManager.apply(theme_arg)
+                if not ok then
+                    io.stderr:write("Error: " .. tostring(err) .. "\n")
+                    io.stderr:write("Run 'fscp --theme list' to view available color themes.\n")
+                    os.exit(1)
+                end
+            else
+                ThemeManager.list()
+                return
+            end
         elseif a == "--fzf" then
             force_fzf = true
         elseif a == "-r" or a == "--rsync" then
