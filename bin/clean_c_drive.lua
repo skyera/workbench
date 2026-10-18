@@ -208,7 +208,9 @@ local function scan_folder_win32(dir_path)
     local file_count = 0
 
     local function recurse(current_path)
-        if not can_traverse_win32(current_path) then return end
+        if not can_traverse_win32(current_path) then
+            return
+        end
         local pattern = current_path .. "\\*"
         local find_data = ffi.new("WIN32_FIND_DATAW")
         local hFind = ffi.C.FindFirstFileW(to_wide(pattern), find_data)
@@ -288,7 +290,9 @@ local function clean_folder_win32(dir_path, dry_run)
     local deleted_dirs = 0
 
     local function recurse(current_path, is_root)
-        if not can_traverse_win32(current_path) then return end
+        if not can_traverse_win32(current_path) then
+            return
+        end
         local pattern = current_path .. "\\*"
         local find_data = ffi.new("WIN32_FIND_DATAW")
         local hFind = ffi.C.FindFirstFileW(to_wide(pattern), find_data)

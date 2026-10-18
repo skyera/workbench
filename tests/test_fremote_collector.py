@@ -1,12 +1,13 @@
 """Linux collector tests using disposable child processes and /proc."""
+
 import contextlib
 import importlib.util
 import io
-from pathlib import Path
 import subprocess
 import sys
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,16 +17,20 @@ ROOT = Path(__file__).resolve().parents[1]
 class RemoteCollectorTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        spec = importlib.util.spec_from_file_location("collector", ROOT / "bin/fremote_collector.py")
+        spec = importlib.util.spec_from_file_location(
+            "collector", ROOT / "bin/fremote_collector.py"
+        )
         cls.module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.module)
 
     def child(self):
         process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+
         def cleanup():
             if process.poll() is None:
                 process.kill()
             process.wait(timeout=5)
+
         self.addCleanup(cleanup)
         return process
 
@@ -45,7 +50,11 @@ class RemoteCollectorTests(unittest.TestCase):
             collector.snapshot()
         frames = output.getvalue().split("E\n")
         self.assertEqual(len(frames), 3)
-        row = next(line.split("\t") for line in frames[1].splitlines() if line.startswith("P\t%d\t" % child.pid))
+        row = next(
+            line.split("\t")
+            for line in frames[1].splitlines()
+            if line.startswith("P\t%d\t" % child.pid)
+        )
         self.assertGreaterEqual(float(row[4]), 0)
         self.assertGreater(int(row[5]), 0)
         result = self.command(collector, "DETAIL\t%d\t%s" % (child.pid, row[3]))
@@ -58,7 +67,9 @@ class RemoteCollectorTests(unittest.TestCase):
         child = self.child()
         start = self.module.process_stat(child.pid)["start"]
         with patch.object(self.module.os, "pidfd_open") as opened:
-            result = self.command(self.module.Collector(), "SIGNAL\t%d\t%d\t15" % (child.pid, start + 1))
+            result = self.command(
+                self.module.Collector(), "SIGNAL\t%d\t%d\t15" % (child.pid, start + 1)
+            )
             opened.assert_not_called()
         self.assertIn("PID was reused", bytes.fromhex(result.strip().split("\t")[1]).decode())
         self.assertIsNone(child.poll())
@@ -73,7 +84,9 @@ class RemoteCollectorTests(unittest.TestCase):
     def test_permission_errors_and_invalid_commands_preserve_diagnostics(self):
         child = self.child()
         start = self.module.process_stat(child.pid)["start"]
-        with patch.object(self.module.os, "pidfd_open", side_effect=PermissionError(1, "Operation not permitted")):
+        with patch.object(
+            self.module.os, "pidfd_open", side_effect=PermissionError(1, "Operation not permitted")
+        ):
             result = self.command(self.module.Collector(), "SIGNAL\t%d\t%d\t9" % (child.pid, start))
         message = bytes.fromhex(result.strip().split("\t")[1]).decode()
         self.assertIn("Operation not permitted", message)

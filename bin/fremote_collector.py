@@ -26,11 +26,15 @@ def process_stat(pid):
     with open("/proc/%d/stat" % pid, encoding="utf-8", errors="replace") as stream:
         raw = stream.read()
     end = raw.rfind(")")
-    fields = raw[end + 2:].split()
+    fields = raw[end + 2 :].split()
     return {
-        "pid": pid, "name": raw[raw.find("(") + 1:end], "state": fields[0],
-        "ppid": int(fields[1]), "ticks": int(fields[11]) + int(fields[12]),
-        "threads": int(fields[17]), "start": int(fields[19]),
+        "pid": pid,
+        "name": raw[raw.find("(") + 1 : end],
+        "state": fields[0],
+        "ppid": int(fields[1]),
+        "ticks": int(fields[11]) + int(fields[12]),
+        "threads": int(fields[17]),
+        "start": int(fields[19]),
         "rss": max(0, int(fields[21])) * os.sysconf("SC_PAGE_SIZE"),
     }
 
@@ -74,19 +78,40 @@ class Collector:
                         self.users[uid] = str(uid)
                 identity = (row["pid"], row["start"])
                 previous = self.previous.get(identity)
-                usage = max(0.0, 100 * (row["ticks"] - previous) / self.hz / elapsed) if previous is not None and elapsed else -1.0
+                usage = -1.0
+                if previous is not None and elapsed:
+                    elapsed_cpu_seconds = (row["ticks"] - previous) / self.hz
+                    usage = max(0.0, 100 * elapsed_cpu_seconds / elapsed)
                 current[identity] = row["ticks"]
                 processes.append((row, uid, self.users[uid], usage))
             except (OSError, ValueError, IndexError):
                 # Processes can exit between directory enumeration and stat.
                 continue
-        emit("H", 1, int(time.time()), os.getuid(), memory["MemTotal"],
-             memory["MemTotal"] - memory.get("MemAvailable", memory.get("MemFree", 0)),
-             "%.1f" % busy, text(" ".join("%.2f" % n for n in os.getloadavg())))
+        emit(
+            "H",
+            1,
+            int(time.time()),
+            os.getuid(),
+            memory["MemTotal"],
+            memory["MemTotal"] - memory.get("MemAvailable", memory.get("MemFree", 0)),
+            "%.1f" % busy,
+            text(" ".join("%.2f" % n for n in os.getloadavg())),
+        )
         for row, uid, user, usage in processes:
-            emit("P", row["pid"], row["ppid"], row["start"], "%.1f" % usage,
-                 row["rss"], row["threads"], row["state"], uid,
-                 int(max(0, uptime - row["start"] / self.hz)), text(user), text(row["name"]))
+            emit(
+                "P",
+                row["pid"],
+                row["ppid"],
+                row["start"],
+                "%.1f" % usage,
+                row["rss"],
+                row["threads"],
+                row["state"],
+                uid,
+                int(max(0, uptime - row["start"] / self.hz)),
+                text(user),
+                text(row["name"]),
+            )
         emit("E")
         self.previous, self.previous_time, self.previous_cpu = current, now, cpu
 
@@ -100,7 +125,9 @@ class Collector:
             emit("R")
             return True
         try:
-            if action not in ("DETAIL", "SIGNAL") or len(fields) != (4 if action == "SIGNAL" else 3):
+            if action not in ("DETAIL", "SIGNAL") or len(fields) != (
+                4 if action == "SIGNAL" else 3
+            ):
                 raise ValueError("Invalid collector command")
             pid, start = int(fields[1]), int(fields[2])
             if pid <= 0 or start < 0:
@@ -111,7 +138,12 @@ class Collector:
             if action == "DETAIL":
                 try:
                     with open("/proc/%d/cmdline" % pid, "rb") as stream:
-                        cmd = stream.read(65536).replace(b"\0", b" ").decode("utf-8", "replace").strip()
+                        cmd = (
+                            stream.read(65536)
+                            .replace(b"\0", b" ")
+                            .decode("utf-8", "replace")
+                            .strip()
+                        )
                     cmd = cmd or "[" + row["name"] + "]"
                 except OSError as error:
                     cmd = "Cannot read command: " + str(error)
@@ -127,7 +159,9 @@ class Collector:
                 if pid in (1, os.getpid(), os.getppid()):
                     raise ValueError("Refusing to signal init or this monitoring session")
                 if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
-                    raise RuntimeError("Safe signalling requires Linux pidfd support and Python 3.9+; use your SSH shell instead")
+                    raise RuntimeError(
+                        "Safe signalling requires Linux pidfd support and Python 3.9+; use your SSH shell instead"
+                    )
                 fd = os.pidfd_open(pid)
                 try:
                     # Validate after opening: pidfd binds the signal to this process.
@@ -136,7 +170,12 @@ class Collector:
                     signal.pidfd_send_signal(fd, sig)
                 finally:
                     os.close(fd)
-                emit("A", pid, start, text("Sent " + signal.Signals(sig).name + "; awaiting next snapshot"))
+                emit(
+                    "A",
+                    pid,
+                    start,
+                    text("Sent " + signal.Signals(sig).name + "; awaiting next snapshot"),
+                )
         except (OSError, ValueError, RuntimeError) as error:
             message = str(error)
             if isinstance(error, PermissionError):

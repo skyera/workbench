@@ -1,8 +1,35 @@
 -- Native nonblocking child pipes and terminal support. No shell on the client.
 local ffi, bit = require('ffi'), require('bit')
-local M = { windows = ffi.os == 'Windows' }
-if M.windows then
-    ffi.cdef[[
+local native = { windows = ffi.os == 'Windows' }
+
+local UTF8_CODE_PAGE = 65001
+local INVALID_UTF8_IS_ERROR = 8
+local FORMAT_MESSAGE_FLAGS = 0x1200 -- FROM_SYSTEM | IGNORE_INSERTS
+local HANDLE_FLAG_INHERIT = 1
+local STARTF_USESTDHANDLES = 0x100
+local CREATE_NO_WINDOW = 0x08000000
+local ENABLE_VIRTUAL_TERMINAL_PROCESSING = 4
+local DISABLED_WINDOWS_INPUT_MODES = 0x2 + 0x4 + 0x8 -- LINE_INPUT | ECHO_INPUT | WINDOW_INPUT
+local STD_INPUT_HANDLE = -10
+local STD_OUTPUT_HANDLE = -11
+local STD_ERROR_HANDLE = -12
+
+local CLOCK_MONOTONIC = 1
+local F_GETFL = 3
+local F_SETFL = 4
+local O_NONBLOCK = 0x800
+local POLLIN = 1
+local POLLOUT = 4
+local POLL_ERROR_OR_HANGUP = 0x18 -- POLLERR | POLLHUP
+local SIGPIPE = 13
+local SIGKILL = 9
+local WNOHANG = 1
+local DISABLED_POSIX_LOCAL_MODES = 0x1 + 0x2 + 0x8 -- ISIG | ICANON | ECHO
+local TIOCGWINSZ = 0x5413
+
+-- Native declarations remain grouped by platform to preserve their ABI layout.
+if native.windows then
+    ffi.cdef([[
         typedef void *HANDLE;
         typedef unsigned long DWORD;
         typedef int BOOL;
@@ -45,11 +72,13 @@ if M.windows then
         void Sleep(DWORD);
         int _kbhit(void);
         int _getch(void);
-    ]]
-    M.crt = ffi.load('msvcrt')
+    ]])
+    native.crt = ffi.load('msvcrt')
 else
-    if ffi.os ~= 'Linux' then error('fremote currently supports Windows and Linux clients') end
-    ffi.cdef[[
+    if ffi.os ~= 'Linux' then
+        error('fremote currently supports Windows and Linux clients')
+    end
+    ffi.cdef([[
         int pipe(int *); int fork(void); int dup2(int, int); int close(int);
         int execvp(const char *, char *const *); void _exit(int);
         void (*signal(int, void (*)(int)))(int);
@@ -65,123 +94,206 @@ else
         int tcgetattr(int, struct termios *); int tcsetattr(int,int,const struct termios *);
         struct winsize { unsigned short ws_row,ws_col,ws_xpixel,ws_ypixel; };
         int ioctl(int,unsigned long,...);
-    ]]
+    ]])
 end
 
-local function wide(s)
-    local n = ffi.C.MultiByteToWideChar(65001, 8, s, #s, nil, 0)
-    if n == 0 then error('Cannot encode process argument as UTF-16') end
-    local b = ffi.new('wchar_t[?]', n+1)
-    assert(ffi.C.MultiByteToWideChar(65001, 8, s, #s, b, n) ~= 0)
-    return b
+local function wide(value)
+    local count =
+        ffi.C.MultiByteToWideChar(UTF8_CODE_PAGE, INVALID_UTF8_IS_ERROR, value, #value, nil, 0)
+    if count == 0 then
+        error('Cannot encode process argument as UTF-16')
+    end
+    local buffer = ffi.new('wchar_t[?]', count + 1)
+    assert(
+        ffi.C.MultiByteToWideChar(
+            UTF8_CODE_PAGE,
+            INVALID_UTF8_IS_ERROR,
+            value,
+            #value,
+            buffer,
+            count
+        ) ~= 0
+    )
+    return buffer
 end
 
-function M.error(code)
-    if not M.windows then return ffi.string(ffi.C.strerror(code or ffi.errno())) end
+function native.error(code)
+    if not native.windows then
+        return ffi.string(ffi.C.strerror(code or ffi.errno()))
+    end
     code = code or ffi.C.GetLastError()
-    local b = ffi.new('wchar_t[2048]')
-    local n = ffi.C.FormatMessageW(0x1200, nil, code, 0, b, 2048, nil)
-    if n == 0 then return 'Windows error ' .. tonumber(code) end
-    local size = ffi.C.WideCharToMultiByte(65001, 0, b, n, nil, 0, nil, nil)
+    local buffer = ffi.new('wchar_t[2048]')
+    local count = ffi.C.FormatMessageW(FORMAT_MESSAGE_FLAGS, nil, code, 0, buffer, 2048, nil)
+    if count == 0 then
+        return 'Windows error ' .. tonumber(code)
+    end
+    local size = ffi.C.WideCharToMultiByte(UTF8_CODE_PAGE, 0, buffer, count, nil, 0, nil, nil)
     local out = ffi.new('char[?]', size)
-    ffi.C.WideCharToMultiByte(65001, 0, b, n, out, size, nil, nil)
+    ffi.C.WideCharToMultiByte(UTF8_CODE_PAGE, 0, buffer, count, out, size, nil, nil)
     return ffi.string(out, size):gsub('%s+$', '') .. ' (Windows error ' .. tonumber(code) .. ')'
 end
 
-function M.quote(s)
-    return '"' .. s:gsub('(\\*)"', function(b) return b..b..'\\"' end):gsub('(\\+)$','%1%1') .. '"'
+function native.quote(value)
+    return '"'
+        .. value
+            :gsub('(\\*)"', function(backslashes)
+                return backslashes .. backslashes .. '\\"'
+            end)
+            :gsub('(\\+)$', '%1%1')
+        .. '"'
 end
 
-function M.now()
-    if M.windows then return tonumber(ffi.C.GetTickCount64()) / 1000 end
-    local t = ffi.new('struct timespec')
-    ffi.C.clock_gettime(1, t)
-    return tonumber(t.tv_sec) + tonumber(t.tv_nsec) / 1e9
+function native.now()
+    if native.windows then
+        return tonumber(ffi.C.GetTickCount64()) / 1000
+    end
+    local clock_time = ffi.new('struct timespec')
+    ffi.C.clock_gettime(CLOCK_MONOTONIC, clock_time)
+    return tonumber(clock_time.tv_sec) + tonumber(clock_time.tv_nsec) / 1e9
 end
 
-function M.sleep(ms)
-    if M.windows then ffi.C.Sleep(ms) else ffi.C.usleep(ms*1000) end
+function native.sleep(ms)
+    if native.windows then
+        ffi.C.Sleep(ms)
+    else
+        ffi.C.usleep(ms * 1000)
+    end
 end
 
-local Child = {}; Child.__index = Child
-function M.spawn(args)
+-- Child process ownership and pipe I/O.
+local Child = {}
+Child.__index = Child
+function native.spawn(args)
     local child = setmetatable({}, Child)
-    if M.windows then
+    if native.windows then
         local handles = {}
         local function fail(message)
-            local reason = M.error()
-            for _, h in ipairs(handles) do ffi.C.CloseHandle(h) end
+            local reason = native.error()
+            for _, handle in ipairs(handles) do
+                ffi.C.CloseHandle(handle)
+            end
             return nil, message .. ': ' .. reason
         end
-        local sa = ffi.new('SECURITY_ATTRIBUTES')
-        sa.nLength,sa.bInheritHandle=ffi.sizeof(sa),1
+        local security_attributes = ffi.new('SECURITY_ATTRIBUTES')
+        security_attributes.nLength, security_attributes.bInheritHandle =
+            ffi.sizeof(security_attributes), 1
         local function pipe()
-            local r,w = ffi.new('HANDLE[1]'),ffi.new('HANDLE[1]')
-            if ffi.C.CreatePipe(r,w,sa,0) == 0 then return nil end
-            handles[#handles+1], handles[#handles+2] = r[0],w[0]
-            return r[0], w[0]
+            local read_handle, write_handle = ffi.new('HANDLE[1]'), ffi.new('HANDLE[1]')
+            if ffi.C.CreatePipe(read_handle, write_handle, security_attributes, 0) == 0 then
+                return nil
+            end
+            handles[#handles + 1], handles[#handles + 2] = read_handle[0], write_handle[0]
+            return read_handle[0], write_handle[0]
         end
         local input, writer = pipe()
-        if not input then return fail('Cannot create stdin pipe') end
-        local reader, output = pipe()
-        if not reader then return fail('Cannot create stdout pipe') end
-        local errreader, errwriter = pipe()
-        if not errreader then return fail('Cannot create stderr pipe') end
-        for _,h in ipairs({writer,reader,errreader}) do
-            if ffi.C.SetHandleInformation(h,1,0) == 0 then return fail('Cannot protect parent pipe') end
+        if not input then
+            return fail('Cannot create stdin pipe')
         end
-        for _,h in ipairs({input,output,errwriter}) do
-            local flags=ffi.new('DWORD[1]')
-            if ffi.C.GetHandleInformation(h,flags)==0 then return fail('Cannot inspect child pipe') end
-            if bit.band(flags[0],1)==0 then
-                for _,handle in ipairs(handles) do ffi.C.CloseHandle(handle) end
-                return nil,'Child pipe is not inheritable; cannot start SSH safely'
+        local reader, output = pipe()
+        if not reader then
+            return fail('Cannot create stdout pipe')
+        end
+        local errreader, errwriter = pipe()
+        if not errreader then
+            return fail('Cannot create stderr pipe')
+        end
+        for _, handle in ipairs({ writer, reader, errreader }) do
+            if ffi.C.SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) == 0 then
+                return fail('Cannot protect parent pipe')
             end
         end
-        local si,pi = ffi.new('STARTUPINFOW'),ffi.new('PROCESS_INFORMATION')
-        si.cb, si.dwFlags = ffi.sizeof(si), 0x100
-        si.hStdInput,si.hStdOutput,si.hStdError = input,output,errwriter
-        local quoted = {}; for i,s in ipairs(args) do quoted[i] = M.quote(s) end
-        if ffi.C.CreateProcessW(nil,wide(table.concat(quoted,' ')),nil,nil,1,0x08000000,nil,nil,si,pi) == 0 then
+        for _, handle in ipairs({ input, output, errwriter }) do
+            local flags = ffi.new('DWORD[1]')
+            if ffi.C.GetHandleInformation(handle, flags) == 0 then
+                return fail('Cannot inspect child pipe')
+            end
+            if bit.band(flags[0], HANDLE_FLAG_INHERIT) == 0 then
+                for _, handle in ipairs(handles) do
+                    ffi.C.CloseHandle(handle)
+                end
+                return nil, 'Child pipe is not inheritable; cannot start SSH safely'
+            end
+        end
+        local startup_info, process_info = ffi.new('STARTUPINFOW'), ffi.new('PROCESS_INFORMATION')
+        startup_info.cb, startup_info.dwFlags = ffi.sizeof(startup_info), STARTF_USESTDHANDLES
+        startup_info.hStdInput, startup_info.hStdOutput, startup_info.hStdError =
+            input, output, errwriter
+        local quoted = {}
+        for i, value in ipairs(args) do
+            quoted[i] = native.quote(value)
+        end
+        if
+            ffi.C.CreateProcessW(
+                nil,
+                wide(table.concat(quoted, ' ')),
+                nil,
+                nil,
+                1,
+                CREATE_NO_WINDOW,
+                nil,
+                nil,
+                startup_info,
+                process_info
+            ) == 0
+        then
             return fail('Cannot launch ' .. args[1] .. '; check installation and PATH')
         end
-        ffi.C.CloseHandle(input); ffi.C.CloseHandle(output); ffi.C.CloseHandle(errwriter)
-        ffi.C.CloseHandle(pi.hThread)
-        child.input,child.output,child.errors,child.process = writer,reader,errreader,pi.hProcess
+        ffi.C.CloseHandle(input)
+        ffi.C.CloseHandle(output)
+        ffi.C.CloseHandle(errwriter)
+        ffi.C.CloseHandle(process_info.hThread)
+        child.input, child.output, child.errors, child.process =
+            writer, reader, errreader, process_info.hProcess
     else
         -- Pipe closure must produce EPIPE, not terminate the monitoring UI.
-        ffi.C.signal(13, ffi.cast('void (*)(int)', 1))
+        ffi.C.signal(SIGPIPE, ffi.cast('void (*)(int)', 1))
         local pipes = {}
-        for i=1,3 do
-            local p = ffi.new('int[2]')
-            if ffi.C.pipe(p) ~= 0 then
-                local err = M.error()
-                for _,v in ipairs(pipes) do ffi.C.close(v[0]); ffi.C.close(v[1]) end
-                return nil,'Cannot create pipe: '..err
+        for i = 1, 3 do
+            local descriptors = ffi.new('int[2]')
+            if ffi.C.pipe(descriptors) ~= 0 then
+                local err = native.error()
+                for _, v in ipairs(pipes) do
+                    ffi.C.close(v[0])
+                    ffi.C.close(v[1])
+                end
+                return nil, 'Cannot create pipe: ' .. err
             end
-            pipes[i] = p
+            pipes[i] = descriptors
         end
-        local argv,buffers = ffi.new('char *[?]',#args+1),{}
-        for i,s in ipairs(args) do
-            buffers[i] = ffi.new('char[?]',#s+1,s); argv[i-1] = buffers[i]
+        local argv, buffers = ffi.new('char *[?]', #args + 1), {}
+        for i, value in ipairs(args) do
+            buffers[i] = ffi.new('char[?]', #value + 1, value)
+            argv[i - 1] = buffers[i]
         end
         local pid = ffi.C.fork()
         if pid == 0 then
-            ffi.C.dup2(pipes[1][0],0); ffi.C.dup2(pipes[2][1],1); ffi.C.dup2(pipes[3][1],2)
-            for _,p in ipairs(pipes) do ffi.C.close(p[0]); ffi.C.close(p[1]) end
-            ffi.C.execvp(argv[0],argv)
-            local msg = 'Cannot launch '..args[1]..': '..M.error()..'\n'
-            ffi.C.write(2,msg,#msg); ffi.C._exit(127)
+            ffi.C.dup2(pipes[1][0], 0)
+            ffi.C.dup2(pipes[2][1], 1)
+            ffi.C.dup2(pipes[3][1], 2)
+            for _, descriptors in ipairs(pipes) do
+                ffi.C.close(descriptors[0])
+                ffi.C.close(descriptors[1])
+            end
+            ffi.C.execvp(argv[0], argv)
+            local msg = 'Cannot launch ' .. args[1] .. ': ' .. native.error() .. '\n'
+            ffi.C.write(2, msg, #msg)
+            ffi.C._exit(127)
         end
         if pid < 0 then
-            local err = M.error()
-            for _,p in ipairs(pipes) do ffi.C.close(p[0]); ffi.C.close(p[1]) end
-            return nil,'Cannot fork process: '..err
+            local err = native.error()
+            for _, descriptors in ipairs(pipes) do
+                ffi.C.close(descriptors[0])
+                ffi.C.close(descriptors[1])
+            end
+            return nil, 'Cannot fork process: ' .. err
         end
-        ffi.C.close(pipes[1][0]); ffi.C.close(pipes[2][1]); ffi.C.close(pipes[3][1])
-        child.input,child.output,child.errors,child.pid = pipes[1][1],pipes[2][0],pipes[3][0],pid
-        for _,fd in ipairs({child.input,child.output,child.errors}) do
-            ffi.C.fcntl(fd,4,ffi.new('int',bit.bor(ffi.C.fcntl(fd,3),0x800)))
+        ffi.C.close(pipes[1][0])
+        ffi.C.close(pipes[2][1])
+        ffi.C.close(pipes[3][1])
+        child.input, child.output, child.errors, child.pid =
+            pipes[1][1], pipes[2][0], pipes[3][0], pid
+        for _, fd in ipairs({ child.input, child.output, child.errors }) do
+            ffi.C.fcntl(fd, F_SETFL, ffi.new('int', bit.bor(ffi.C.fcntl(fd, F_GETFL), O_NONBLOCK)))
         end
     end
     return child
@@ -189,138 +301,244 @@ end
 
 function Child:read(stream)
     local fd = stream == 'stderr' and self.errors or self.output
-    if fd == nil then return '' end
-    local b = ffi.new('char[8192]')
-    if M.windows then
-        local available,n = ffi.new('DWORD[1]'),ffi.new('DWORD[1]')
-        if ffi.C.PeekNamedPipe(fd,nil,0,nil,available,nil) == 0 or available[0] == 0 then return '' end
-        if ffi.C.ReadFile(fd,b,math.min(8192,tonumber(available[0])),n,nil) == 0 then return '' end
-        return ffi.string(b,n[0])
+    if fd == nil then
+        return ''
     end
-    local n = tonumber(ffi.C.read(fd,b,8192))
-    if n <= 0 then return '' end
-    return ffi.string(b,n)
+    local buffer = ffi.new('char[8192]')
+    if native.windows then
+        local available, count = ffi.new('DWORD[1]'), ffi.new('DWORD[1]')
+        if ffi.C.PeekNamedPipe(fd, nil, 0, nil, available, nil) == 0 or available[0] == 0 then
+            return ''
+        end
+        if ffi.C.ReadFile(fd, buffer, math.min(8192, tonumber(available[0])), count, nil) == 0 then
+            return ''
+        end
+        return ffi.string(buffer, count[0])
+    end
+    local count = tonumber(ffi.C.read(fd, buffer, 8192))
+    if count <= 0 then
+        return ''
+    end
+    return ffi.string(buffer, count)
 end
 
-function Child:write(s)
-    if not self.input then return nil,'Process input is closed' end
-    if M.windows then
-        local n=ffi.new('DWORD[1]')
-        if ffi.C.WriteFile(self.input,s,#s,n,nil) == 0 then return nil,M.error() end
-        if tonumber(n[0]) ~= #s then return nil,'Incomplete write to process input' end
+function Child:write(value)
+    if not self.input then
+        return nil, 'Process input is closed'
+    end
+    if native.windows then
+        local count = ffi.new('DWORD[1]')
+        if ffi.C.WriteFile(self.input, value, #value, count, nil) == 0 then
+            return nil, native.error()
+        end
+        if tonumber(count[0]) ~= #value then
+            return nil, 'Incomplete write to process input'
+        end
     else
         -- Never block the UI if the remote command reader stops consuming.
-        local p=ffi.new('struct pollfd[1]',{{self.input,4,0}})
-        if ffi.C.poll(p,1,0) < 1 or bit.band(p[0].revents,0x18) ~= 0 then return nil,'Process input is unavailable' end
-        local n=tonumber(ffi.C.write(self.input,s,#s))
-        if n ~= #s then return nil,'Cannot write process input: '..M.error() end
+        local descriptors = ffi.new('struct pollfd[1]', { { self.input, POLLOUT, 0 } })
+        if
+            ffi.C.poll(descriptors, 1, 0) < 1
+            or bit.band(descriptors[0].revents, POLL_ERROR_OR_HANGUP) ~= 0
+        then
+            return nil, 'Process input is unavailable'
+        end
+        local count = tonumber(ffi.C.write(self.input, value, #value))
+        if count ~= #value then
+            return nil, 'Cannot write process input: ' .. native.error()
+        end
     end
     return true
 end
 
 function Child:status()
-    if self.exit ~= nil then return self.exit end
-    if M.windows then
-        if ffi.C.WaitForSingleObject(self.process,0) ~= 0 then return nil end
-        local code=ffi.new('DWORD[1]')
-        if ffi.C.GetExitCodeProcess(self.process,code) ~= 0 then self.exit=tonumber(code[0]) end
+    if self.exit ~= nil then
+        return self.exit
+    end
+    if native.windows then
+        if ffi.C.WaitForSingleObject(self.process, 0) ~= 0 then
+            return nil
+        end
+        local code = ffi.new('DWORD[1]')
+        if ffi.C.GetExitCodeProcess(self.process, code) ~= 0 then
+            self.exit = tonumber(code[0])
+        end
     else
-        local status=ffi.new('int[1]')
-        if ffi.C.waitpid(self.pid,status,1) == self.pid then
-            self.exit = bit.band(status[0],127) == 0 and bit.rshift(status[0],8) or 128+bit.band(status[0],127)
+        local status = ffi.new('int[1]')
+        if ffi.C.waitpid(self.pid, status, WNOHANG) == self.pid then
+            self.exit = bit.band(status[0], 127) == 0 and bit.rshift(status[0], 8)
+                or 128 + bit.band(status[0], 127)
         end
     end
     return self.exit
 end
 
 function Child:close()
-    if self.closed then return end
-    self.closed=true
-    if M.windows then
-        if self:status() == nil then ffi.C.TerminateProcess(self.process,1); ffi.C.WaitForSingleObject(self.process,2000) end
-        for _,h in ipairs({self.input,self.output,self.errors,self.process}) do ffi.C.CloseHandle(h) end
-    else
-        if self:status() == nil then ffi.C.kill(self.pid,9); ffi.C.waitpid(self.pid,ffi.new('int[1]'),0) end
-        for _,fd in ipairs({self.input,self.output,self.errors}) do ffi.C.close(fd) end
+    if self.closed then
+        return
     end
-    self.input,self.output,self.errors=nil,nil,nil
+    self.closed = true
+    if native.windows then
+        if self:status() == nil then
+            ffi.C.TerminateProcess(self.process, 1)
+            ffi.C.WaitForSingleObject(self.process, 2000)
+        end
+        for _, handle in ipairs({ self.input, self.output, self.errors, self.process }) do
+            ffi.C.CloseHandle(handle)
+        end
+    else
+        if self:status() == nil then
+            ffi.C.kill(self.pid, SIGKILL)
+            ffi.C.waitpid(self.pid, ffi.new('int[1]'), 0)
+        end
+        for _, fd in ipairs({ self.input, self.output, self.errors }) do
+            ffi.C.close(fd)
+        end
+    end
+    self.input, self.output, self.errors = nil, nil, nil
 end
 
-M.term = {}
-local T=M.term
-function T.init()
-    if M.windows then
-        T.modes={}; T.cp={ffi.C.GetConsoleCP(),ffi.C.GetConsoleOutputCP()}
-        for _,id in ipairs({-10,-11,-12}) do
-            local h=ffi.C.GetStdHandle(ffi.cast('DWORD',id)); local mode=ffi.new('DWORD[1]')
-            if ffi.C.GetConsoleMode(h,mode) ~= 0 then
-                T.modes[#T.modes+1]={h,tonumber(mode[0])}
+-- Console modes, sizing, and nonblocking keyboard input.
+native.term = {}
+local terminal = native.term
+function terminal.init()
+    if native.windows then
+        terminal.modes = {}
+        terminal.cp = { ffi.C.GetConsoleCP(), ffi.C.GetConsoleOutputCP() }
+        for _, id in ipairs({ STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE }) do
+            local handle = ffi.C.GetStdHandle(ffi.cast('DWORD', id))
+            local mode = ffi.new('DWORD[1]')
+            if ffi.C.GetConsoleMode(handle, mode) ~= 0 then
+                terminal.modes[#terminal.modes + 1] = { handle, tonumber(mode[0]) }
                 -- _getch must not receive window/focus events.
-                local flags = id == -10 and bit.band(mode[0],bit.bnot(0x2+0x4+0x8)) or bit.bor(mode[0],4)
-                ffi.C.SetConsoleMode(h,flags)
-            elseif id == -10 then return nil,'Interactive mode requires a console; use --list for redirected output' end
+                local flags = id == STD_INPUT_HANDLE
+                        and bit.band(mode[0], bit.bnot(DISABLED_WINDOWS_INPUT_MODES))
+                    or bit.bor(mode[0], ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+                ffi.C.SetConsoleMode(handle, flags)
+            elseif id == STD_INPUT_HANDLE then
+                return nil, 'Interactive mode requires a console; use --list for redirected output'
+            end
         end
-        ffi.C.SetConsoleCP(65001); ffi.C.SetConsoleOutputCP(65001)
+        ffi.C.SetConsoleCP(UTF8_CODE_PAGE)
+        ffi.C.SetConsoleOutputCP(UTF8_CODE_PAGE)
     else
-        if ffi.C.isatty(0) == 0 or ffi.C.isatty(1) == 0 then return nil,'Interactive mode requires a terminal; use --list' end
-        T.saved=ffi.new('struct termios')
-        if ffi.C.tcgetattr(0,T.saved) ~= 0 then return nil,M.error() end
-        local raw=ffi.new('struct termios'); ffi.copy(raw,T.saved,ffi.sizeof(raw))
-        raw.c_lflag=bit.band(raw.c_lflag,bit.bnot(0x1+0x2+0x8))
-        raw.c_cc[5],raw.c_cc[6]=0,0
-        ffi.C.tcsetattr(0,0,raw)
+        if ffi.C.isatty(0) == 0 or ffi.C.isatty(1) == 0 then
+            return nil, 'Interactive mode requires a terminal; use --list'
+        end
+        terminal.saved = ffi.new('struct termios')
+        if ffi.C.tcgetattr(0, terminal.saved) ~= 0 then
+            return nil, native.error()
+        end
+        local raw = ffi.new('struct termios')
+        ffi.copy(raw, terminal.saved, ffi.sizeof(raw))
+        raw.c_lflag = bit.band(raw.c_lflag, bit.bnot(DISABLED_POSIX_LOCAL_MODES))
+        raw.c_cc[5], raw.c_cc[6] = 0, 0
+        ffi.C.tcsetattr(0, 0, raw)
     end
-    io.write('\27[?1049h\27[?25l\27[?7l'); io.flush(); T.active=true
+    io.write('\27[?1049h\27[?25l\27[?7l')
+    io.flush()
+    terminal.active = true
     return true
 end
 
-function T.restore()
-    if T.active then io.write('\27[0m\27[?7h\27[?25h\27[?1049l'); io.flush() end
-    if M.windows then
-        for _,v in ipairs(T.modes or {}) do ffi.C.SetConsoleMode(v[1],v[2]) end
-        if T.cp then ffi.C.SetConsoleCP(T.cp[1]); ffi.C.SetConsoleOutputCP(T.cp[2]) end
-    elseif T.saved then ffi.C.tcsetattr(0,0,T.saved) end
-    T.active=false
+function terminal.restore()
+    if terminal.active then
+        io.write('\27[0m\27[?7h\27[?25h\27[?1049l')
+        io.flush()
+    end
+    if native.windows then
+        for _, v in ipairs(terminal.modes or {}) do
+            ffi.C.SetConsoleMode(v[1], v[2])
+        end
+        if terminal.cp then
+            ffi.C.SetConsoleCP(terminal.cp[1])
+            ffi.C.SetConsoleOutputCP(terminal.cp[2])
+        end
+    elseif terminal.saved then
+        ffi.C.tcsetattr(0, 0, terminal.saved)
+    end
+    terminal.active = false
 end
 
-function T.size()
-    if M.windows then
-        local info=ffi.new('CONSOLE_SCREEN_BUFFER_INFO')
-        if ffi.C.GetConsoleScreenBufferInfo(ffi.C.GetStdHandle(ffi.cast('DWORD',-11)),info) ~= 0 then
-            return info.srWindow.Right-info.srWindow.Left+1, info.srWindow.Bottom-info.srWindow.Top+1
+function terminal.size()
+    if native.windows then
+        local info = ffi.new('CONSOLE_SCREEN_BUFFER_INFO')
+        if
+            ffi.C.GetConsoleScreenBufferInfo(
+                ffi.C.GetStdHandle(ffi.cast('DWORD', STD_OUTPUT_HANDLE)),
+                info
+            ) ~= 0
+        then
+            return info.srWindow.Right - info.srWindow.Left + 1,
+                info.srWindow.Bottom - info.srWindow.Top + 1
         end
     else
-        local ws=ffi.new('struct winsize')
-        if ffi.C.ioctl(1,0x5413,ws) == 0 and ws.ws_col > 0 then return tonumber(ws.ws_col),tonumber(ws.ws_row) end
-    end
-    return 100,30
-end
-
-function T.key()
-    if M.windows then
-        if M.crt._kbhit() == 0 then return nil end
-        local c=M.crt._getch()
-        if c==0 or c==224 then
-            local k=M.crt._getch()
-            return ({[72]='up',[80]='down',[73]='pgup',[81]='pgdown',[71]='home',[79]='end'})[k]
+        local window_size = ffi.new('struct winsize')
+        if ffi.C.ioctl(1, TIOCGWINSZ, window_size) == 0 and window_size.ws_col > 0 then
+            return tonumber(window_size.ws_col), tonumber(window_size.ws_row)
         end
-        return ({[3]='quit',[13]='enter',[27]='esc',[8]='backspace',[9]='tab'})[c] or string.char(c)
     end
-    T.pending=T.pending or ''
-    local p=ffi.new('struct pollfd[1]',{{0,1,0}})
-    if ffi.C.poll(p,1,0) > 0 then
-        local b=ffi.new('char[64]'); local n=tonumber(ffi.C.read(0,b,64))
-        if n > 0 then T.pending=T.pending..ffi.string(b,n) end
-    end
-    if #T.pending == 0 then return nil end
-    if T.pending:sub(1,2)=='\27[' then
-        local seq=T.pending:match('^\27%[[%d;]*[A-Za-z~]')
-        if not seq then return nil end
-        T.pending=T.pending:sub(#seq+1)
-        return ({['\27[A']='up',['\27[B']='down',['\27[5~']='pgup',['\27[6~']='pgdown',['\27[H']='home',['\27[F']='end'})[seq]
-    end
-    local c=T.pending:sub(1,1); T.pending=T.pending:sub(2)
-    return ({['\3']='quit',['\13']='enter',['\10']='enter',['\27']='esc',['\127']='backspace',['\8']='backspace',['\9']='tab'})[c] or c
+    return 100, 30
 end
 
-return M
+function terminal.key()
+    if native.windows then
+        if native.crt._kbhit() == 0 then
+            return nil
+        end
+        local key_value = native.crt._getch()
+        if key_value == 0 or key_value == 224 then
+            local scan_code = native.crt._getch()
+            return ({
+                [72] = 'up',
+                [80] = 'down',
+                [73] = 'pgup',
+                [81] = 'pgdown',
+                [71] = 'home',
+                [79] = 'end',
+            })[scan_code]
+        end
+        return ({ [3] = 'quit', [13] = 'enter', [27] = 'esc', [8] = 'backspace', [9] = 'tab' })[key_value]
+            or string.char(key_value)
+    end
+    terminal.pending = terminal.pending or ''
+    local descriptors = ffi.new('struct pollfd[1]', { { 0, POLLIN, 0 } })
+    if ffi.C.poll(descriptors, 1, 0) > 0 then
+        local buffer = ffi.new('char[64]')
+        local count = tonumber(ffi.C.read(0, buffer, 64))
+        if count > 0 then
+            terminal.pending = terminal.pending .. ffi.string(buffer, count)
+        end
+    end
+    if #terminal.pending == 0 then
+        return nil
+    end
+    if terminal.pending:sub(1, 2) == '\27[' then
+        local escape_sequence = terminal.pending:match('^\27%[[%d;]*[A-Za-z~]')
+        if not escape_sequence then
+            return nil
+        end
+        terminal.pending = terminal.pending:sub(#escape_sequence + 1)
+        return ({
+            ['\27[A'] = 'up',
+            ['\27[B'] = 'down',
+            ['\27[5~'] = 'pgup',
+            ['\27[6~'] = 'pgdown',
+            ['\27[H'] = 'home',
+            ['\27[F'] = 'end',
+        })[escape_sequence]
+    end
+    local key_value = terminal.pending:sub(1, 1)
+    terminal.pending = terminal.pending:sub(2)
+    return ({
+        ['\3'] = 'quit',
+        ['\13'] = 'enter',
+        ['\10'] = 'enter',
+        ['\27'] = 'esc',
+        ['\127'] = 'backspace',
+        ['\8'] = 'backspace',
+        ['\9'] = 'tab',
+    })[key_value] or key_value
+end
+
+return native
