@@ -1647,6 +1647,10 @@ function App.refresh_right(force_network)
     else
         App.connected = true
         App.conn_error = nil
+        if force_network then
+            App.status_msg = "Connected to " .. get_ssh_target(App.host_cfg) .. "."
+            App.status_color = C.bright_green
+        end
         App.right.items = items
         if App.right.cursor > #App.right.items then App.right.cursor = math.max(1, #App.right.items) end
     end
