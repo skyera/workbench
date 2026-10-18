@@ -25,6 +25,12 @@ class SelfTestRegressions(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("ALL TESTS PASSED", result.stdout)
 
+    def test_fnet_self_test_runs(self):
+        result = subprocess.run([LUAJIT, str(ROOT / "bin/fnet.lua"), "--test"],
+                                capture_output=True, text=True, encoding="utf-8", timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("0 failed", result.stdout)
+
     def test_rbrowse_forced_ffi_availability_and_engine_cycling(self):
         # Test both platform branches without requiring a Windows host or
         # installing external image conversion utilities.

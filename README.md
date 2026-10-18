@@ -70,6 +70,7 @@ The [bin/](bin) directory includes utilities for:
 - Connecting to hosts, copying files, inspecting remote processes, and opening tunnels (`fssh`, `fscp`, `fremote`, `fssh_tunnel`).
 - Working with Git and source indexes (`fco`, `flog`, `fbr`, `dotag`).
 - Managing shell history, processes, clipboard access, and remote mounts (`fhist`, `fkill`, `osc52-yank`, `rsshfs`).
+- Inspecting interfaces, DNS records, latency, and open ports (`fnet`).
 
 Many tools have platform-specific implementations in shell, batch, Lua, PowerShell, or Python. Check the selected script for its dependencies and options.
 
@@ -104,6 +105,23 @@ disabled. `r` refreshes a live session or reconnects a failed session; `q` exits
 
 Deploy `fremote.lua`, `fremote_native.lua`, and `fremote_collector.py` together
 with the platform launcher. Existing deploy scripts copy these files from `bin`.
+
+### Network diagnostics
+
+`fnet` inspects adapters, resolves names, pings hosts, and scans TCP ports without
+external binaries. Windows uses the ICMP API; Linux uses unprivileged ICMP, which
+needs `cap_net_raw` or root. Use `--tcp` to measure handshakes when ICMP is blocked.
+
+```sh
+fnet ifaces
+fnet dns example.com --reverse
+fnet ping example.com -c 4
+fnet scan 192.168.1.10 --ports 22,80,443 --open-only
+fnet check example.com
+```
+
+Add `--json` for machine-readable output, and run `fnet --test` for the self-tests.
+Windows adapter listing reports IPv4 only; DNS, ping, and scanning handle IPv6.
 
 ## Running tests
 
