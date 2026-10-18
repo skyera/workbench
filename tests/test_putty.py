@@ -14,7 +14,7 @@ import unittest
 # ------------------------------------------------------------------------------
 ROOT = Path(__file__).resolve().parents[1]
 LUAJIT = shutil.which("luajit")
-SOURCE = ROOT / "bin" / "putty.lua"
+SOURCE = ROOT / "bin" / "fputty.lua"
 
 
 @unittest.skipUnless(LUAJIT, "requires LuaJIT")
@@ -702,7 +702,7 @@ assert(sessions[1].port == "2222")
     @unittest.skipUnless(os.name == "nt", "requires Windows batch launchers")
     def test_windows_launchers_preserve_failure_and_success_status(self):
         launchers = [
-            ("putty.bat", ["colors", "preview", "review-no-such-theme"], ["--help"]),
+            ("fputty.bat", ["colors", "preview", "review-no-such-theme"], ["--help"]),
             ("putty_colors.bat", ["preview", "review-no-such-theme"], ["--help"]),
             ("putty_sessions.bat", ["--unknown"], ["--help"]),
         ]

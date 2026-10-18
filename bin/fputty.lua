@@ -1,27 +1,27 @@
 #!/usr/bin/env luajit
 --[[
-  putty.lua - High-Performance PuTTY Session & Color Scheme Manager (LuaJIT FFI)
+  fputty.lua - High-Performance PuTTY Session & Color Scheme Manager (LuaJIT FFI)
   Combines session inspection, export (JSON, OpenSSH config), and 650+ color theme management
   with sub-millisecond FZF live preview and direct Windows Registry modification.
 
   Usage:
-    putty.lua sessions [OPTIONS] [FILTER]
-    putty.lua colors [SUBCOMMAND] [THEME] [OPTIONS]
-    putty.lua --help
+    fputty.lua sessions [OPTIONS] [FILTER]
+    fputty.lua colors [SUBCOMMAND] [THEME] [OPTIONS]
+    fputty.lua --help
 
   Session Commands:
-    putty.lua sessions                  List all saved PuTTY sessions in aligned table
-    putty.lua sessions --json           Export sessions as JSON array
-    putty.lua sessions --ssh-config     Export sessions to OpenSSH ~/.ssh/config format
-    putty.lua sessions <FILTER>         Filter sessions by name/host
+    fputty.lua sessions                  List all saved PuTTY sessions in aligned table
+    fputty.lua sessions --json           Export sessions as JSON array
+    fputty.lua sessions --ssh-config     Export sessions to OpenSSH ~/.ssh/config format
+    fputty.lua sessions <FILTER>         Filter sessions by name/host
 
   Color Commands:
-    putty.lua colors                    Interactive FZF theme browser with live TrueColor preview
-    putty.lua colors list               List all available preset & .reg themes
-    putty.lua colors preview <THEME>    Render 24-bit TrueColor swatches in terminal
-    putty.lua colors apply <THEME>      Apply theme to session in Registry (default: "Default Settings")
-    putty.lua colors apply <THEME> -a   Apply theme to ALL saved sessions
-    putty.lua colors export <THEME>     Export theme to Windows Registry .reg patch file
+    fputty.lua colors                    Interactive FZF theme browser with live TrueColor preview
+    fputty.lua colors list               List all available preset & .reg themes
+    fputty.lua colors preview <THEME>    Render 24-bit TrueColor swatches in terminal
+    fputty.lua colors apply <THEME>      Apply theme to session in Registry (default: "Default Settings")
+    fputty.lua colors apply <THEME> -a   Apply theme to ALL saved sessions
+    fputty.lua colors export <THEME>     Export theme to Windows Registry .reg patch file
 ]]
 
 local ffi = require("ffi")
@@ -746,7 +746,7 @@ end
 -- Subcommand: SESSIONS
 --------------------------------------------------------------------------------
 local function render_ssh_config(sessions)
-    local lines = { "# Generated from PuTTY Saved Sessions by putty.lua", "" }
+    local lines = { "# Generated from PuTTY Saved Sessions by fputty.lua", "" }
     for _, session in ipairs(sessions) do
         if session.name ~= "Default Settings" and session.host and session.host ~= "" then
             local fields = {
@@ -788,12 +788,12 @@ local function cmd_sessions(args)
         elseif a == "--ssh-config" then
             as_ssh = true
         elseif a == "-h" or a == "--help" then
-            print([[putty.lua sessions - View & Export PuTTY Sessions
+            print([[fputty.lua sessions - View & Export PuTTY Sessions
 Usage:
-  putty.lua sessions                  Aligned table view
-  putty.lua sessions <FILTER>         Filter sessions by name or host
-  putty.lua sessions --json           Export as JSON
-  putty.lua sessions --ssh-config     Export as OpenSSH config
+  fputty.lua sessions                  Aligned table view
+  fputty.lua sessions <FILTER>         Filter sessions by name or host
+  fputty.lua sessions --json           Export as JSON
+  fputty.lua sessions --ssh-config     Export as OpenSSH config
 ]])
             return
         elseif not a:match("^-") then
@@ -802,7 +802,7 @@ Usage:
             end
             filter = a:lower()
         else
-            return report_error("Unknown sessions option '" .. a .. "'. Run 'putty.lua sessions --help'.")
+            return report_error("Unknown sessions option '" .. a .. "'. Run 'fputty.lua sessions --help'.")
         end
     end
     if as_json and as_ssh then
@@ -882,7 +882,7 @@ local function cmd_colors(args)
     local sub = args[1]
 
     if sub == "-h" or sub == "--help" then
-        print([[Usage: putty.lua colors [list | preview THEME | apply THEME | export THEME]
+        print([[Usage: fputty.lua colors [list | preview THEME | apply THEME | export THEME]
   apply THEME [-s SESSION | --all]
   export THEME [-s SESSION] [-o FILE]
   preview THEME [--raw]
@@ -917,7 +917,7 @@ local function cmd_colors(args)
             end
         end
         if not t_key then
-            io.stderr:write("Usage: putty.lua colors preview <THEME> [--raw]\n")
+            io.stderr:write("Usage: fputty.lua colors preview <THEME> [--raw]\n")
             return false
         end
         local t = themes[t_key]
@@ -932,7 +932,7 @@ local function cmd_colors(args)
             end
         end
         if not t then
-            io.stderr:write(string.format("Error: Theme '%s' not found. Run 'putty.lua colors list' to view.\n", t_key))
+            io.stderr:write(string.format("Error: Theme '%s' not found. Run 'fputty.lua colors list' to view.\n", t_key))
             return false
         end
         render_preview(t_key, t, raw)
@@ -963,7 +963,7 @@ local function cmd_colors(args)
         end
 
         if not t_key then
-            io.stderr:write("Usage: putty.lua colors apply <THEME> [-s SESSION] [-a / --all]\n")
+            io.stderr:write("Usage: fputty.lua colors apply <THEME> [-s SESSION] [-a / --all]\n")
             return false
         end
 
@@ -1046,7 +1046,7 @@ local function cmd_colors(args)
         end
 
         if not t_key then
-            io.stderr:write("Usage: putty.lua colors export <THEME> [-s SESSION] [-o FILE]\n")
+            io.stderr:write("Usage: fputty.lua colors export <THEME> [-s SESSION] [-o FILE]\n")
             return false
         end
 
@@ -1077,7 +1077,7 @@ local function cmd_colors(args)
     end
 
     if sub then
-        return report_error("Unknown colors subcommand '" .. sub .. "'. Run 'putty.lua colors --help'.")
+        return report_error("Unknown colors subcommand '" .. sub .. "'. Run 'fputty.lua colors --help'.")
     end
 
     -- Default: Interactive FZF theme selector
@@ -1144,10 +1144,10 @@ local function main(args)
         end
         result = cmd_colors(sub_args)
     elseif cmd == "-h" or cmd == "--help" or cmd == "help" then
-        print([[putty.lua - PuTTY Session & Color Scheme Manager (LuaJIT FFI)
+        print([[fputty.lua - PuTTY Session & Color Scheme Manager (LuaJIT FFI)
 Usage:
-  putty.lua sessions [OPTIONS] [FILTER]
-  putty.lua colors [SUBCOMMAND] [THEME] [OPTIONS]
+  fputty.lua sessions [OPTIONS] [FILTER]
+  fputty.lua colors [SUBCOMMAND] [THEME] [OPTIONS]
 
 Commands:
   sessions                  List and export saved PuTTY sessions
@@ -1156,7 +1156,7 @@ Commands:
     elseif cmd == nil then
         result = cmd_colors({})
     else
-        result = report_error("Unknown command '" .. cmd .. "'. Run 'putty.lua --help'.")
+        result = report_error("Unknown command '" .. cmd .. "'. Run 'fputty.lua --help'.")
     end
     if result == false then
         os.exit(1)

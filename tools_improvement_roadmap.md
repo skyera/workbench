@@ -26,7 +26,7 @@ These older batch, shell, and Python scripts have already been superseded by mod
 | :--- | :--- | :--- | :--- |
 | **[`gbd.bat`](bin/gbd.bat)** & **[`gdbf.bat`](bin/gdbf.bat)** | Retired | [`fbr.bat`](bin/fbr.bat) / [`fbr.lua`](bin/fbr.lua) | Removed in favor of native [`fbr`](bin/fbr.lua) branch manager. |
 | **[`gcb.bat`](bin/gcb.bat)** & **[`gcbf.bat`](bin/gcbf.bat)** | Retired | [`fco.bat`](bin/fco.bat) / [`fco.lua`](bin/fco.lua) | Removed in favor of native [`fco`](bin/fco.lua) checkout selector. |
-| **[`putty_colors.py`](bin/putty_colors.py)** & **[`putty_sessions.py`](bin/putty_sessions.py)** | Retired | [`putty.lua`](bin/putty.lua) (Win32 Registry FFI) | Removed in favor of native Win32 FFI [`putty.lua`](bin/putty.lua). |
+| **[`putty_colors.py`](bin/putty_colors.py)** & **[`putty_sessions.py`](bin/putty_sessions.py)** | Retired | [`fputty.lua`](bin/fputty.lua) (Win32 Registry FFI) | Removed in favor of native Win32 FFI [`fputty.lua`](bin/fputty.lua). |
 | **[`sync_folder.ps1`](bin/sync_folder.ps1)** | PowerShell script (~1s cold start) | None yet | Rewrite into **`sync_folder.lua`** using native Win32 FFI and Robocopy streaming. |
 
 ---
