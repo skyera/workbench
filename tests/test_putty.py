@@ -376,6 +376,51 @@ assert(cmd_sessions({ "--ssh-config" }) == false)
         self.assertIn('HostName for session "invalid"', result.stderr)
         self.assertIn("control characters", result.stderr)
 
+    def test_home_themes_are_discovered_without_appdata(self):
+        result = self.lua(r'''
+get_repo_dir = function()
+    return "/fixture/repo"
+end
+os.getenv = function(name)
+    if name == "HOME" then
+        return "/fixture/home"
+    end
+end
+local home_directory = "/fixture/home/.config/putty/themes"
+local home_checked = false
+dir_exists = function(path)
+    if path == home_directory then
+        home_checked = true
+        return true
+    end
+    return false
+end
+io.popen = function()
+    return {
+        lines = function()
+            local yielded = false
+            return function()
+                if not yielded then
+                    yielded = true
+                    return home_directory .. "/review-theme.reg"
+                end
+            end
+        end,
+        close = function()
+            return true
+        end
+    }
+end
+parse_reg_file = function(path)
+    assert(path == home_directory .. "/review-theme.reg")
+    return PRESET_THEMES.dracula.colors
+end
+local themes = load_all_themes()
+assert(home_checked)
+assert(themes["review-theme"].path == home_directory .. "/review-theme.reg")
+''')
+        self.assert_lua_passed(result)
+
 
 if __name__ == "__main__":
     unittest.main()

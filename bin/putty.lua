@@ -397,11 +397,15 @@ local function load_all_themes()
     end
 
     local base_dir = get_repo_dir()
-    local candidates = {
-        base_dir .. "/.config/putty/themes",
-        os.getenv("APPDATA") and (os.getenv("APPDATA"):gsub("\\", "/") .. "/putty/themes") or nil,
-        os.getenv("HOME") and (os.getenv("HOME") .. "/.config/putty/themes") or nil,
-    }
+    local candidates = { base_dir .. "/.config/putty/themes" }
+    local appdata = os.getenv("APPDATA")
+    if appdata and appdata ~= "" then
+        table.insert(candidates, appdata:gsub("\\", "/") .. "/putty/themes")
+    end
+    local home = os.getenv("HOME")
+    if home and home ~= "" then
+        table.insert(candidates, home .. "/.config/putty/themes")
+    end
 
     for _, cdir in ipairs(candidates) do
         if cdir and dir_exists(cdir) then
