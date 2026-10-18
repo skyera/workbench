@@ -679,8 +679,8 @@ local function build_connection_command(selected_host, override_user, extra_args
     local key = selected_host.key or ""
     local source = selected_host.source or ""
 
-    -- PuTTY mode
-    if use_putty or (source == "putty" and IS_WINDOWS) then
+    -- PuTTY mode (only when explicitly requested via --putty)
+    if use_putty then
         local putty_bin = "putty"
         local p_cmd = { putty_bin, "-load", name }
         if user ~= "" and user ~= config_user then
@@ -818,12 +818,16 @@ local function main(args)
         -- 7. Test PuTTY command formatting
         local putty_host = { name = "pi5-session", hostname = "pi5.local", user = "pi", port = "22", source = "putty" }
         local c5, is_p = build_connection_command(putty_host, "", {}, true)
-        assert(is_p == true, "Should identify PuTTY mode")
+        assert(is_p == true, "Should identify PuTTY mode when use_putty is true")
         assert(table.concat(c5, " ") == "putty -load pi5-session", "PuTTY command failed: " .. table.concat(c5, " "))
+
+        local c5_def, is_p_def = build_connection_command(putty_host, "", {}, false)
+        assert(is_p_def == false, "Default for putty host should be in-terminal OpenSSH")
+        assert(table.concat(c5_def, " ") == "ssh pi@pi5.local", "Default command for putty host should be ssh: " .. table.concat(c5_def, " "))
 
         local c6 = build_connection_command(putty_host, "root", {}, true)
         assert(table.concat(c6, " ") == "putty -load pi5-session -l root", "PuTTY user override failed: " .. table.concat(c6, " "))
-        print("  [PASS] build_connection_command(putty): formats -load and -l overrides")
+        print("  [PASS] build_connection_command(putty): formats -load and -l overrides, defaults to OpenSSH")
 
         -- 8. Test dry-run execution
         local dry_ran = false
