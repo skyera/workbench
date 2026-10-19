@@ -7,6 +7,8 @@
     - Region capture in physical pixels (--region X,Y,W,H).
     - Interactive region selection (--select) over a frozen, dimmed desktop with a live
       size readout; Esc or right-click cancels (Windows only).
+    - Annotation editor (--edit) that opens the capture with a rectangle tool, palette,
+      line width, undo/redo, and save/copy actions (Windows only).
     - Window capture by title or process substring (--window TEXT), using PrintWindow
       so occluded windows are rendered, with a screen-blit fallback when that fails.
     - PNG encoding in-process: zlib when a zlib library is available, otherwise valid
@@ -30,7 +32,12 @@
     --out PATH           Output file (default: shot-YYYYmmdd-HHMMSS.png); a path ending
                          in a separator writes the default name inside that directory.
     --clip               Also copy the image to the system clipboard.
+    --no-clip            In --edit, do not copy on Enter or Save.
     --no-file            Do not write a file; requires --clip.
+    --edit               Open the annotation editor before saving (Windows only).
+    --tool rect          Annotation tool (phase 1 only supports rect).
+    --color NAME|#RRGGBB Annotation color (default red, #E53935).
+    --width N            Annotation line width in image pixels (default 4).
     --no-compress        Store uncompressed deflate blocks even when zlib is available.
     --json               Print a machine-readable summary.
     -h, --help           Show this help message.
@@ -113,6 +120,14 @@ if IS_WINDOWS then
         } BITMAPINFO;
 
         typedef int (*WNDENUMPROC)(HWND, LPARAM);
+        typedef void* HMONITOR;
+
+        typedef struct {
+            DWORD cbSize;
+            RECT rcMonitor;
+            RECT rcWork;
+            DWORD dwFlags;
+        } MONITORINFO;
 
         HDC GetDC(HWND hWnd);
         int ReleaseDC(HWND hWnd, HDC hDC);
@@ -126,8 +141,13 @@ if IS_WINDOWS then
         int GetDIBits(HDC hdc, HBITMAP hbm, UINT start, UINT cLines, void* lpvBits,
                       BITMAPINFO* lpbmi, UINT usage);
         int GetSystemMetrics(int nIndex);
+        short GetKeyState(int nVirtKey);
         BOOL PrintWindow(HWND hwnd, HDC hdcBlt, UINT nFlags);
         BOOL GetWindowRect(HWND hWnd, RECT* lpRect);
+        BOOL GetClientRect(HWND hWnd, RECT* lpRect);
+        BOOL AdjustWindowRect(RECT* lpRect, DWORD dwStyle, BOOL bMenu);
+        HMONITOR MonitorFromRect(const RECT* lprc, DWORD dwFlags);
+        BOOL GetMonitorInfoW(HMONITOR hMonitor, MONITORINFO* lpmi);
         BOOL IsWindowVisible(HWND hWnd);
         BOOL IsIconic(HWND hWnd);
         int GetWindowTextW(HWND hWnd, wchar_t* lpString, int nMaxCount);
@@ -266,6 +286,10 @@ if IS_WINDOWS then
         BOOL AlphaBlend(HDC hdcDest, int xoriginDest, int yoriginDest, int wDest, int hDest,
                         HDC hdcSrc, int xoriginSrc, int yoriginSrc, int wSrc, int hSrc,
                         BLENDFUNCTION ftn);
+        int SetStretchBltMode(HDC hdc, int mode);
+        BOOL StretchBlt(HDC hdcDest, int xDest, int yDest, int wDest, int hDest,
+                        HDC hdcSrc, int xSrc, int ySrc, int wSrc, int hSrc,
+                        DWORD rop);
     ]]
 else
     ffi.cdef[[
@@ -355,6 +379,7 @@ local SM_CXVIRTUALSCREEN = 78
 local SM_CYVIRTUALSCREEN = 79
 
 local WS_POPUP = 0x80000000
+local WS_OVERLAPPEDWINDOW = 0x00CF0000
 local WS_EX_TOPMOST = 0x00000008
 local WS_EX_TOOLWINDOW = 0x00000080
 local WS_EX_LAYERED = 0x00080000
@@ -362,11 +387,16 @@ local LWA_ALPHA = 0x00000002
 local SW_SHOW = 5
 local NULL_BRUSH = 5
 local DEFAULT_GUI_FONT = 17
+local COLORONCOLOR = 3
+local MONITOR_DEFAULTTONEAREST = 2
 local LOGPIXELSY = 90
+local IDC_ARROW = 32512
 local IDC_CROSS = 32515
 local ERROR_CLASS_ALREADY_EXISTS = 1410
 
 local WM_DESTROY = 0x0002
+local WM_SIZE = 0x0005
+local WM_CLOSE = 0x0010
 local WM_PAINT = 0x000F
 local WM_ERASEBKGND = 0x0014
 local WM_SETCURSOR = 0x0020
@@ -375,13 +405,27 @@ local WM_MOUSEMOVE = 0x0200
 local WM_LBUTTONDOWN = 0x0201
 local WM_LBUTTONUP = 0x0202
 local WM_RBUTTONUP = 0x0205
+local VK_RETURN = 0x0D
 local VK_ESCAPE = 0x1B
+local VK_CONTROL = 0x11
+local VK_1 = 0x31
+local VK_6 = 0x36
+local VK_R = 0x52
+local VK_C = 0x43
+local VK_S = 0x53
+local VK_Y = 0x59
+local VK_Z = 0x5A
+local VK_OEM_4 = 0xDB
+local VK_OEM_6 = 0xDD
+local VK_ADD = 0x6B
+local VK_SUBTRACT = 0x6D
 
 local DT_LEFT = 0x00000000
 local DT_CENTER = 0x00000001
 local DT_VCENTER = 0x00000004
 local DT_SINGLELINE = 0x00000020
 local DT_CALCRECT = 0x00000400
+local DT_END_ELLIPSIS = 0x00008000
 
 local ZPIXMAP = 2
 local LSB_FIRST = 0
@@ -406,9 +450,20 @@ Capture:
 Output:
   --out PATH           Output file, or a directory ending in / or \.
   --clip               Also copy the image to the system clipboard.
+  --no-clip            In --edit, do not copy on Enter or Save.
   --no-file            Do not write a file; requires --clip.
   --no-compress        Use stored deflate blocks instead of zlib compression.
   --json               Print a machine-readable summary.
+
+Editor (--edit, Windows only):
+  --tool rect          Annotation tool; phase 1 supports rectangles only.
+  --color NAME|#RRGGBB Annotation color (default red, #E53935).
+  --width N            Line width in image pixels (default 4).
+
+  The editor opens with the capture fitted to the monitor. Drag to draw a
+  rectangle, 1-6 pick a color, [ and ] change width, Ctrl+Z/Ctrl+Y undo and
+  redo, C copies without closing, Enter saves and copies, and Esc discards
+  (a second Esc confirms when shapes exist).
 
 Other:
   -h, --help           Show this help message.
@@ -419,6 +474,7 @@ Examples:
   fshot --region 0,0,1280,720 --out tmp/shot.png
   fshot --window firefox --clip
   fshot --select --clip
+  fshot --select --edit
   fshot --delay 1500 --window "Save As"
 ]]
 
@@ -1153,6 +1209,11 @@ end
 -- Windows Region Selector
 --------------------------------------------------------------------------------
 
+-- Module-level anchor for the active WNDPROC callback. RegisterClassW stores
+-- only a raw pointer, and LuaJIT may collect a callback cdata once its local
+-- is no longer referenced, which would panic on the next delivered message.
+local active_window_proc
+
 local function win_select_region()
     local bounds, bounds_error = win_screen_bounds()
     if not bounds then
@@ -1548,6 +1609,7 @@ local function win_select_region()
     local class_name = utf8_to_wide("FShotRegionSelect")
     local window_title = utf8_to_wide("fshot region select")
     local wnd_proc_pointer = ffi.cast("WNDPROC", wnd_proc)
+    active_window_proc = wnd_proc_pointer
 
     local window_class = ffi.new("WNDCLASSW")
     window_class.style = 0x0003 -- CS_HREDRAW | CS_VREDRAW
@@ -1628,6 +1690,1121 @@ local function win_select_region()
         y = bounds.y + selection.y,
         source = "select",
     }
+end
+
+--------------------------------------------------------------------------------
+-- Windows Annotation Editor
+--------------------------------------------------------------------------------
+
+-- Clipboard and output helpers live with the command-line code below; the
+-- forward declarations keep them visible to the editor's nested closures.
+local win_copy_to_clipboard, resolve_output_path, write_binary_file
+
+local EDITOR_PALETTE = {
+    { name = "red", hex = "#E53935" },
+    { name = "orange", hex = "#FB8C00" },
+    { name = "yellow", hex = "#FDD835" },
+    { name = "green", hex = "#43A047" },
+    { name = "blue", hex = "#1E88E5" },
+    { name = "black", hex = "#000000" },
+}
+
+local EDITOR_WIDTHS = { 2, 4, 6, 8, 12 }
+
+-- Grouped so the editor's nested window procedures stay well under LuaJIT's
+-- 60-upvalue limit; each message/key constant would otherwise cost one each.
+local EDITOR_KEYS = {
+    WM_PAINT = WM_PAINT,
+    WM_ERASEBKGND = WM_ERASEBKGND,
+    WM_SIZE = WM_SIZE,
+    WM_SETCURSOR = WM_SETCURSOR,
+    WM_LBUTTONDOWN = WM_LBUTTONDOWN,
+    WM_MOUSEMOVE = WM_MOUSEMOVE,
+    WM_LBUTTONUP = WM_LBUTTONUP,
+    WM_RBUTTONUP = WM_RBUTTONUP,
+    WM_KEYDOWN = WM_KEYDOWN,
+    WM_CLOSE = WM_CLOSE,
+    WM_DESTROY = WM_DESTROY,
+    VK_ESCAPE = VK_ESCAPE,
+    VK_RETURN = VK_RETURN,
+    VK_CONTROL = VK_CONTROL,
+    VK_1 = VK_1,
+    VK_6 = VK_6,
+    VK_R = VK_R,
+    VK_C = VK_C,
+    VK_S = VK_S,
+    VK_Y = VK_Y,
+    VK_Z = VK_Z,
+    VK_OEM_4 = VK_OEM_4,
+    VK_OEM_6 = VK_OEM_6,
+    VK_ADD = VK_ADD,
+    VK_SUBTRACT = VK_SUBTRACT,
+    DT_LEFT = DT_LEFT,
+    DT_CENTER = DT_CENTER,
+    DT_VCENTER = DT_VCENTER,
+    DT_SINGLELINE = DT_SINGLELINE,
+    DT_END_ELLIPSIS = DT_END_ELLIPSIS,
+}
+
+local COLOR_NAMES = {
+    red = "#E53935",
+    orange = "#FB8C00",
+    yellow = "#FDD835",
+    green = "#43A047",
+    blue = "#1E88E5",
+    black = "#000000",
+    white = "#FFFFFF",
+}
+
+-- Parse "#RRGGBB" or a palette name into a Win32 COLORREF (0x00BBGGRR).
+local function parse_color(text)
+    if not text or text == "" then
+        return nil, "--color requires #RRGGBB or a color name"
+    end
+
+    local value = COLOR_NAMES[text:lower()] or text
+    local red, green, blue = value:match("^#(%x%x)(%x%x)(%x%x)$")
+    if not red then
+        return nil, string.format(
+            "invalid color %q: use #RRGGBB or one of red, orange, yellow, green, blue, black, white",
+            text)
+    end
+
+    return tonumber(red, 16) + tonumber(green, 16) * 256 + tonumber(blue, 16) * 65536
+end
+
+local function color_to_hex(color)
+    local red = color % 256
+    local green = math.floor(color / 256) % 256
+    local blue = math.floor(color / 65536) % 256
+    return string.format("#%02X%02X%02X", red, green, blue)
+end
+
+for _, entry in ipairs(EDITOR_PALETTE) do
+    entry.colorref = parse_color(entry.hex)
+end
+
+-- Largest scale that fits the image without ever upscaling past 1:1.
+local function fit_scale(image_width, image_height, available_width, available_height)
+    if image_width <= 0 or image_height <= 0
+        or available_width <= 0 or available_height <= 0 then
+        return 1
+    end
+
+    return math.min(1, available_width / image_width, available_height / image_height)
+end
+
+local function win_edit_image(image, options)
+    if not IS_WINDOWS then
+        return nil, "the annotation editor is only implemented on Windows"
+    end
+
+    local image_width = image.width
+    local image_height = image.height
+    local color_index = 1
+    local width_index = 2
+    for index, entry in ipairs(EDITOR_PALETTE) do
+        if entry.colorref == options.editor_color then
+            color_index = index
+            break
+        end
+    end
+    for index, width in ipairs(EDITOR_WIDTHS) do
+        if width == options.editor_width then
+            width_index = index
+            break
+        end
+    end
+
+    local screen_dc = user32.GetDC(nil)
+    if screen_dc == nil then
+        return nil, "GetDC(NULL) failed: " .. win_error_message()
+    end
+
+    local dpi = tonumber(gdi32.GetDeviceCaps(screen_dc, LOGPIXELSY))
+    if dpi <= 0 then
+        dpi = 96
+    end
+    local ui = dpi / 96
+    local toolbar_height = math.max(34, math.floor(38 * ui))
+    local status_height = math.max(22, math.floor(26 * ui))
+
+    local image_bitmap, image_dc, previous_image
+    local font, owns_font
+    local background_brush, toolbar_brush, status_brush, button_brush, active_brush
+    local ring_brush, image_border_brush
+    local swatch_brushes = {}
+
+    local function release_resources()
+        if image_dc ~= nil and previous_image ~= nil then
+            gdi32.SelectObject(image_dc, previous_image)
+        end
+        if image_dc ~= nil then
+            gdi32.DeleteDC(image_dc)
+        end
+        if image_bitmap ~= nil then
+            gdi32.DeleteObject(image_bitmap)
+        end
+        for _, brush in ipairs(swatch_brushes) do
+            gdi32.DeleteObject(brush)
+        end
+        if background_brush ~= nil then
+            gdi32.DeleteObject(background_brush)
+        end
+        if toolbar_brush ~= nil then
+            gdi32.DeleteObject(toolbar_brush)
+        end
+        if status_brush ~= nil then
+            gdi32.DeleteObject(status_brush)
+        end
+        if button_brush ~= nil then
+            gdi32.DeleteObject(button_brush)
+        end
+        if active_brush ~= nil then
+            gdi32.DeleteObject(active_brush)
+        end
+        if ring_brush ~= nil then
+            gdi32.DeleteObject(ring_brush)
+        end
+        if image_border_brush ~= nil then
+            gdi32.DeleteObject(image_border_brush)
+        end
+        if owns_font and font ~= nil then
+            gdi32.DeleteObject(font)
+        end
+        user32.ReleaseDC(nil, screen_dc)
+    end
+
+    local image_info = ffi.new("BITMAPINFO")
+    image_info.bmiHeader.biSize = ffi.sizeof("BITMAPINFOHEADER")
+    image_info.bmiHeader.biWidth = image_width
+    image_info.bmiHeader.biHeight = -image_height
+    image_info.bmiHeader.biPlanes = 1
+    image_info.bmiHeader.biBitCount = 32
+    image_info.bmiHeader.biCompression = BI_RGB
+
+    local image_bits = ffi.new("void*[1]")
+    image_bitmap = gdi32.CreateDIBSection(screen_dc, image_info, DIB_RGB_COLORS,
+        image_bits, nil, 0)
+    if image_bitmap == nil then
+        local reason = win_error_message()
+        release_resources()
+        return nil, "cannot create the editor bitmap: " .. reason
+    end
+    ffi.copy(image_bits[0], image.pixels, image_width * image_height * 4)
+
+    image_dc = gdi32.CreateCompatibleDC(screen_dc)
+    if image_dc == nil then
+        local reason = win_error_message()
+        release_resources()
+        return nil, "CreateCompatibleDC failed for the editor image: " .. reason
+    end
+    previous_image = gdi32.SelectObject(image_dc, image_bitmap)
+
+    local font_face = utf8_to_wide("Segoe UI")
+    font = gdi32.CreateFontW(-math.max(12, math.floor(15 * ui)), 0, 0, 0, 400,
+        0, 0, 0, 1, 0, 0, 4, 0, font_face)
+    if font ~= nil then
+        owns_font = true
+    else
+        font = gdi32.GetStockObject(DEFAULT_GUI_FONT)
+    end
+
+    background_brush = gdi32.CreateSolidBrush(0x00202020)
+    toolbar_brush = gdi32.CreateSolidBrush(0x00342F2F)
+    status_brush = gdi32.CreateSolidBrush(0x002A2525)
+    button_brush = gdi32.CreateSolidBrush(0x004A4343)
+    active_brush = gdi32.CreateSolidBrush(0x006E5A5A)
+    ring_brush = gdi32.CreateSolidBrush(0x00FFFFFF)
+    image_border_brush = gdi32.CreateSolidBrush(0x00787878)
+    for index, entry in ipairs(EDITOR_PALETTE) do
+        swatch_brushes[index] = gdi32.CreateSolidBrush(entry.colorref)
+    end
+
+    -- Place the editor on the monitor that owned the capture.
+    local monitor_rect = ffi.new("RECT")
+    monitor_rect.left = image.x or 0
+    monitor_rect.top = image.y or 0
+    monitor_rect.right = monitor_rect.left + image_width
+    monitor_rect.bottom = monitor_rect.top + image_height
+
+    local monitor_info = ffi.new("MONITORINFO")
+    monitor_info.cbSize = ffi.sizeof("MONITORINFO")
+    local monitor = user32.MonitorFromRect(monitor_rect, MONITOR_DEFAULTTONEAREST)
+
+    local work = {
+        x = 0,
+        y = 0,
+        width = user32.GetSystemMetrics(0),
+        height = user32.GetSystemMetrics(1),
+    }
+    if monitor ~= nil and user32.GetMonitorInfoW(monitor, monitor_info) ~= 0 then
+        work.x = monitor_info.rcWork.left
+        work.y = monitor_info.rcWork.top
+        work.width = monitor_info.rcWork.right - monitor_info.rcWork.left
+        work.height = monitor_info.rcWork.bottom - monitor_info.rcWork.top
+    end
+
+    local margin_x = math.floor(24 * ui)
+    local margin_y = math.floor(20 * ui)
+
+    -- Reserve room for the title bar and borders so the fitted window stays
+    -- inside the work area instead of hanging off the bottom edge.
+    local frame_rect = ffi.new("RECT")
+    frame_rect.left = 0
+    frame_rect.top = 0
+    frame_rect.right = 1000
+    frame_rect.bottom = 1000
+    user32.AdjustWindowRect(frame_rect, WS_OVERLAPPEDWINDOW, 0)
+    local frame_width = frame_rect.right - frame_rect.left - 1000
+    local frame_height = frame_rect.bottom - frame_rect.top - 1000
+
+    local available_width = math.max(1, work.width - 2 * margin_x - frame_width)
+    local available_height = math.max(1,
+        work.height - toolbar_height - status_height - 2 * margin_y - frame_height)
+
+    local initial_scale = fit_scale(image_width, image_height,
+        available_width, available_height)
+    local initial_display_width = math.max(1, math.floor(image_width * initial_scale + 0.5))
+    local initial_display_height = math.max(1, math.floor(image_height * initial_scale + 0.5))
+    local initial_client_width = math.max(initial_display_width + 2 * margin_x,
+        math.floor(660 * ui))
+    local initial_client_height = toolbar_height + initial_display_height + status_height
+        + 2 * margin_y
+
+    local window_rect = ffi.new("RECT")
+    window_rect.left = 0
+    window_rect.top = 0
+    window_rect.right = initial_client_width
+    window_rect.bottom = initial_client_height
+    user32.AdjustWindowRect(window_rect, WS_OVERLAPPEDWINDOW, 0)
+    local window_width = window_rect.right - window_rect.left
+    local window_height = window_rect.bottom - window_rect.top
+    local window_x = work.x + math.floor((work.width - window_width) / 2)
+    local window_y = work.y + math.floor((work.height - window_height) / 2)
+    window_x = math.max(work.x, math.min(window_x, work.x + work.width - window_width))
+    window_y = math.max(work.y, math.min(window_y, work.y + work.height - window_height))
+
+    local state = {
+        client_width = initial_client_width,
+        client_height = initial_client_height,
+        scale = initial_scale,
+        display_width = initial_display_width,
+        display_height = initial_display_height,
+        ox = 0,
+        oy = 0,
+        annotations = {},
+        undo_stack = {},
+        redo_stack = {},
+        buttons = {},
+        dragging = false,
+        start_x = 0,
+        start_y = 0,
+        current_x = 0,
+        current_y = 0,
+        last_x = 0,
+        last_y = 0,
+        color_index = color_index,
+        color = options.editor_color,
+        width_index = width_index,
+        width_px = options.editor_width,
+        discard_armed = false,
+        status = string.format(
+            "Rect  %s  %d px   |   drag to draw   |   Ctrl+Z undo   |   Enter save+copy   |   Esc discard",
+            color_to_hex(options.editor_color), options.editor_width),
+        status_is_error = false,
+        result = nil,
+        fatal = nil,
+        destroyed = false,
+        back_bitmap = nil,
+        back_dc = nil,
+        previous_back = nil,
+    }
+
+    local hwnd
+
+    local function set_status(text, is_error)
+        state.status = tostring(text):gsub("%s+", " ")
+        state.status_is_error = is_error or false
+        if hwnd ~= nil and not state.destroyed then
+            user32.InvalidateRect(hwnd, nil, 0)
+        end
+    end
+
+    local function copy_annotations()
+        local copied = {}
+        for index, annotation in ipairs(state.annotations) do
+            copied[index] = {
+                x = annotation.x,
+                y = annotation.y,
+                width = annotation.width,
+                height = annotation.height,
+                color = annotation.color,
+                line_width = annotation.line_width,
+            }
+        end
+        return copied
+    end
+
+    local function undo()
+        if #state.undo_stack == 0 then
+            set_status("Nothing to undo")
+            return
+        end
+        table.insert(state.redo_stack, copy_annotations())
+        state.annotations = table.remove(state.undo_stack)
+        set_status(string.format("Undo  (%d shape%s)", #state.annotations,
+            #state.annotations == 1 and "" or "s"))
+    end
+
+    local function redo()
+        if #state.redo_stack == 0 then
+            set_status("Nothing to redo")
+            return
+        end
+        table.insert(state.undo_stack, copy_annotations())
+        state.annotations = table.remove(state.redo_stack)
+        set_status(string.format("Redo  (%d shape%s)", #state.annotations,
+            #state.annotations == 1 and "" or "s"))
+    end
+
+    local function adjust_width(delta)
+        state.width_index = math.max(1, math.min(#EDITOR_WIDTHS,
+            state.width_index + delta))
+        state.width_px = EDITOR_WIDTHS[state.width_index]
+        set_status(string.format("Line width  %d px", state.width_px))
+    end
+
+    local function to_rect(rectangle)
+        local rect = ffi.new("RECT")
+        rect.left = rectangle.left
+        rect.top = rectangle.top
+        rect.right = rectangle.right
+        rect.bottom = rectangle.bottom
+        return rect
+    end
+
+    local function draw_text(dc, text, rect, color, format)
+        gdi32.SetBkMode(dc, 1) -- TRANSPARENT
+        gdi32.SetTextColor(dc, color)
+        gdi32.SelectObject(dc, font)
+        user32.DrawTextW(dc, utf8_to_wide(text), -1, rect, format)
+    end
+
+    local function draw_annotation(dc, annotation, origin_x, origin_y, scale)
+        local left = origin_x + annotation.x * scale
+        local top = origin_y + annotation.y * scale
+        local right = origin_x + (annotation.x + annotation.width) * scale
+        local bottom = origin_y + (annotation.y + annotation.height) * scale
+        local pen_width = math.max(1, math.floor(annotation.line_width * scale + 0.5))
+
+        local pen = gdi32.CreatePen(0, pen_width, annotation.color)
+        if pen == nil then
+            return
+        end
+        local old_pen = gdi32.SelectObject(dc, pen)
+        local old_brush = gdi32.SelectObject(dc, gdi32.GetStockObject(NULL_BRUSH))
+        gdi32.Rectangle(dc, math.floor(left + 0.5), math.floor(top + 0.5),
+            math.floor(right + 0.5), math.floor(bottom + 0.5))
+        gdi32.SelectObject(dc, old_pen)
+        gdi32.SelectObject(dc, old_brush)
+        gdi32.DeleteObject(pen)
+    end
+
+    local function update_layout()
+        local client_width = math.max(1, state.client_width)
+        local client_height = math.max(1, state.client_height)
+        local area_top = toolbar_height
+        local area_height = math.max(1, client_height - toolbar_height - status_height)
+
+        state.scale = fit_scale(image_width, image_height,
+            math.max(1, client_width - 2 * margin_x),
+            math.max(1, area_height - 2 * margin_y))
+        state.display_width = math.max(1, math.floor(image_width * state.scale + 0.5))
+        state.display_height = math.max(1, math.floor(image_height * state.scale + 0.5))
+        state.ox = math.floor((client_width - state.display_width) / 2)
+        state.oy = area_top + math.floor((area_height - state.display_height) / 2)
+
+        state.buttons = {}
+        local cursor_x = math.floor(10 * ui)
+        local cursor_y = math.floor(7 * ui)
+        local button_height = math.max(18, toolbar_height - 2 * cursor_y)
+
+        local function push_button(id, label, width)
+            table.insert(state.buttons, {
+                id = id,
+                label = label,
+                rect = {
+                    left = cursor_x,
+                    top = cursor_y,
+                    right = cursor_x + width,
+                    bottom = cursor_y + button_height,
+                },
+            })
+            cursor_x = cursor_x + width + math.floor(6 * ui)
+        end
+
+        push_button("tool_rect", "Rect", math.floor(58 * ui))
+
+        local swatch_size = math.max(12, button_height - math.floor(6 * ui))
+        local swatch_pad = math.floor(3 * ui)
+        for index = 1, #EDITOR_PALETTE do
+            table.insert(state.buttons, {
+                id = "color",
+                index = index,
+                rect = {
+                    left = cursor_x,
+                    top = cursor_y + swatch_pad,
+                    right = cursor_x + swatch_size,
+                    bottom = cursor_y + swatch_pad + swatch_size,
+                },
+            })
+            cursor_x = cursor_x + swatch_size + math.floor(5 * ui)
+        end
+
+        cursor_x = cursor_x + math.floor(8 * ui)
+        push_button("width_down", "-", math.floor(26 * ui))
+        push_button("width_up", "+", math.floor(26 * ui))
+        push_button("undo", "Undo", math.floor(54 * ui))
+        push_button("copy", "Copy", math.floor(54 * ui))
+        push_button("save", "Save", math.floor(54 * ui))
+    end
+
+    local function release_back_buffer()
+        if state.back_dc ~= nil and state.previous_back ~= nil then
+            gdi32.SelectObject(state.back_dc, state.previous_back)
+        end
+        if state.back_dc ~= nil then
+            gdi32.DeleteDC(state.back_dc)
+            state.back_dc = nil
+        end
+        if state.back_bitmap ~= nil then
+            gdi32.DeleteObject(state.back_bitmap)
+            state.back_bitmap = nil
+        end
+    end
+
+    local function create_back_buffer()
+        release_back_buffer()
+        local width = math.max(1, state.client_width)
+        local height = math.max(1, state.client_height)
+
+        local back_info = ffi.new("BITMAPINFO")
+        back_info.bmiHeader.biSize = ffi.sizeof("BITMAPINFOHEADER")
+        back_info.bmiHeader.biWidth = width
+        back_info.bmiHeader.biHeight = -height
+        back_info.bmiHeader.biPlanes = 1
+        back_info.bmiHeader.biBitCount = 32
+        back_info.bmiHeader.biCompression = BI_RGB
+
+        state.back_bitmap = gdi32.CreateDIBSection(screen_dc, back_info,
+            DIB_RGB_COLORS, ffi.new("void*[1]"), nil, 0)
+        if state.back_bitmap == nil then
+            state.fatal = "cannot create the editor frame buffer: " .. win_error_message()
+            return false
+        end
+
+        state.back_dc = gdi32.CreateCompatibleDC(screen_dc)
+        if state.back_dc == nil then
+            state.fatal = "CreateCompatibleDC failed for the editor frame buffer: "
+                .. win_error_message()
+            return false
+        end
+        state.previous_back = gdi32.SelectObject(state.back_dc, state.back_bitmap)
+        return true
+    end
+
+    local function draw_swatch_ring(dc, button)
+        local rect = to_rect(button.rect)
+        user32.FrameRect(dc, rect, ring_brush)
+    end
+
+    local function draw_toolbar(dc)
+        local bar = ffi.new("RECT")
+        bar.left = 0
+        bar.top = 0
+        bar.right = state.client_width
+        bar.bottom = toolbar_height
+        user32.FillRect(dc, bar, toolbar_brush)
+
+        for _, button in ipairs(state.buttons) do
+            local rect = to_rect(button.rect)
+            if button.id == "color" then
+                user32.FillRect(dc, rect, swatch_brushes[button.index])
+                if button.index == state.color_index then
+                    draw_swatch_ring(dc, button)
+                end
+            else
+                local active = button.id == "tool_rect"
+                user32.FillRect(dc, rect, active and active_brush or button_brush)
+                draw_text(dc, button.label, rect,
+                    active and 0x00FFFFFF or 0x00D8D8D8,
+                    bit.bor(EDITOR_KEYS.DT_CENTER, EDITOR_KEYS.DT_VCENTER,
+                        EDITOR_KEYS.DT_SINGLELINE))
+            end
+        end
+    end
+
+    local function draw_status(dc)
+        local bar = ffi.new("RECT")
+        bar.left = 0
+        bar.top = state.client_height - status_height
+        bar.right = state.client_width
+        bar.bottom = state.client_height
+        user32.FillRect(dc, bar, status_brush)
+
+        local text_rect = ffi.new("RECT")
+        text_rect.left = math.floor(10 * ui)
+        text_rect.top = bar.top
+        text_rect.right = state.client_width - math.floor(10 * ui)
+        text_rect.bottom = bar.bottom
+        draw_text(dc, state.status, text_rect,
+            state.status_is_error and 0x008080FF or 0x00E2E2E2,
+            bit.bor(EDITOR_KEYS.DT_LEFT, EDITOR_KEYS.DT_VCENTER,
+                EDITOR_KEYS.DT_SINGLELINE, EDITOR_KEYS.DT_END_ELLIPSIS))
+    end
+
+    local function compose()
+        local dc = state.back_dc
+        if dc == nil then
+            return
+        end
+
+        local full = ffi.new("RECT")
+        full.left = 0
+        full.top = 0
+        full.right = state.client_width
+        full.bottom = state.client_height
+        user32.FillRect(dc, full, background_brush)
+
+        gdi32.SetStretchBltMode(dc, COLORONCOLOR)
+        if state.scale >= 0.999 then
+            gdi32.BitBlt(dc, state.ox, state.oy, state.display_width, state.display_height,
+                image_dc, 0, 0, SRCCOPY)
+        else
+            gdi32.StretchBlt(dc, state.ox, state.oy, state.display_width,
+                state.display_height, image_dc, 0, 0, image_width, image_height, SRCCOPY)
+        end
+
+        local image_rect = ffi.new("RECT")
+        image_rect.left = state.ox
+        image_rect.top = state.oy
+        image_rect.right = state.ox + state.display_width
+        image_rect.bottom = state.oy + state.display_height
+        user32.FrameRect(dc, image_rect, image_border_brush)
+
+        for _, annotation in ipairs(state.annotations) do
+            draw_annotation(dc, annotation, state.ox, state.oy, state.scale)
+        end
+
+        if state.dragging then
+            local rectangle = normalize_selection(state.start_x, state.start_y,
+                state.current_x, state.current_y)
+            draw_annotation(dc, {
+                x = rectangle.x,
+                y = rectangle.y,
+                width = rectangle.width,
+                height = rectangle.height,
+                color = state.color,
+                line_width = state.width_px,
+            }, state.ox, state.oy, state.scale)
+        end
+
+        draw_toolbar(dc)
+        draw_status(dc)
+    end
+
+    local function paint(paint_hwnd)
+        local paint_struct = ffi.new("PAINTSTRUCT")
+        local dc = user32.BeginPaint(paint_hwnd, paint_struct)
+        if state.back_dc ~= nil then
+            compose()
+            gdi32.BitBlt(dc, 0, 0, state.client_width, state.client_height,
+                state.back_dc, 0, 0, SRCCOPY)
+        end
+        user32.EndPaint(paint_hwnd, paint_struct)
+    end
+
+    local function flatten_image()
+        local flat_info = ffi.new("BITMAPINFO")
+        flat_info.bmiHeader.biSize = ffi.sizeof("BITMAPINFOHEADER")
+        flat_info.bmiHeader.biWidth = image_width
+        flat_info.bmiHeader.biHeight = -image_height
+        flat_info.bmiHeader.biPlanes = 1
+        flat_info.bmiHeader.biBitCount = 32
+        flat_info.bmiHeader.biCompression = BI_RGB
+
+        local flat_bits = ffi.new("void*[1]")
+        local flat_bitmap = gdi32.CreateDIBSection(screen_dc, flat_info, DIB_RGB_COLORS,
+            flat_bits, nil, 0)
+        if flat_bitmap == nil then
+            return nil, "cannot create the flattened image: " .. win_error_message()
+        end
+        ffi.copy(flat_bits[0], image.pixels, image_width * image_height * 4)
+
+        local flat_dc = gdi32.CreateCompatibleDC(screen_dc)
+        if flat_dc == nil then
+            local reason = win_error_message()
+            gdi32.DeleteObject(flat_bitmap)
+            return nil, "CreateCompatibleDC failed for the flattened image: " .. reason
+        end
+        local previous = gdi32.SelectObject(flat_dc, flat_bitmap)
+
+        for _, annotation in ipairs(state.annotations) do
+            draw_annotation(flat_dc, annotation, 0, 0, 1)
+        end
+
+        gdi32.SelectObject(flat_dc, previous)
+        local pixels = ffi.new("uint8_t[?]", image_width * image_height * 4)
+        local rows = gdi32.GetDIBits(flat_dc, flat_bitmap, 0, image_height, pixels,
+            flat_info, DIB_RGB_COLORS)
+        gdi32.DeleteDC(flat_dc)
+        gdi32.DeleteObject(flat_bitmap)
+
+        if rows ~= image_height then
+            return nil, string.format("GetDIBits returned %d of %d rows", rows, image_height)
+        end
+        return pixels
+    end
+
+    local function encode_annotated()
+        local pixels, flatten_error = flatten_image()
+        if not pixels then
+            return nil, flatten_error
+        end
+
+        local png, size_or_error, compressed = encode_png({
+            width = image_width,
+            height = image_height,
+            pixels = pixels,
+        }, options.compress)
+        if not png then
+            return nil, "PNG encoding failed: " .. tostring(size_or_error)
+        end
+
+        return png, size_or_error, compressed, pixels
+    end
+
+    local function copy_current()
+        local png, png_size, _compressed, pixels = encode_annotated()
+        if not png then
+            set_status(png_size, true)
+            return false
+        end
+
+        local copied, clipboard_error, warnings = win_copy_to_clipboard({
+            width = image_width,
+            height = image_height,
+            pixels = pixels,
+        }, png, png_size)
+        if not copied then
+            io.stderr:write("fshot: " .. tostring(clipboard_error) .. "\n")
+            set_status(clipboard_error, true)
+            return false
+        end
+
+        for _, warning in ipairs(warnings or {}) do
+            io.stderr:write("fshot: warning: " .. warning .. "\n")
+        end
+        set_status(string.format("Copied %dx%d to clipboard", image_width, image_height))
+        return true
+    end
+
+    local function accept()
+        local started = now_ms()
+        local png, png_size, compressed, pixels = encode_annotated()
+        if not png then
+            set_status(png_size, true)
+            return
+        end
+
+        local result = nil
+        if options.write_file then
+            local output_path = resolve_output_path(options.output)
+            local written, write_error = write_binary_file(output_path, png, png_size)
+            if not written then
+                io.stderr:write("fshot: " .. write_error .. "\n")
+                set_status(write_error, true)
+                return
+            end
+            result = {
+                path = output_path,
+                copied = false,
+                bytes = png_size,
+                compressed = compressed,
+                elapsed_ms = 0,
+            }
+        end
+
+        local copied = false
+        if options.clipboard then
+            local clipboard_ok, clipboard_error, warnings = win_copy_to_clipboard({
+                width = image_width,
+                height = image_height,
+                pixels = pixels,
+            }, png, png_size)
+            if not clipboard_ok then
+                io.stderr:write("fshot: " .. tostring(clipboard_error) .. "\n")
+                if result then
+                    -- The file is already on disk; keep the editor open so the
+                    -- user can retry, and close with a successful file result.
+                    result.elapsed_ms = now_ms() - started
+                    state.result = result
+                    set_status(
+                        "Clipboard failed; the file was saved. Esc closes the editor.",
+                        true)
+                else
+                    set_status(clipboard_error, true)
+                end
+                return
+            end
+
+            for _, warning in ipairs(warnings or {}) do
+                io.stderr:write("fshot: warning: " .. warning .. "\n")
+            end
+            copied = true
+        end
+
+        if result == nil then
+            result = {
+                path = nil,
+                copied = false,
+                bytes = png_size,
+                compressed = compressed,
+                elapsed_ms = 0,
+            }
+        end
+        result.copied = copied
+        result.elapsed_ms = now_ms() - started
+        state.result = result
+        user32.DestroyWindow(hwnd)
+    end
+
+    local function request_close()
+        if #state.annotations > 0 and not state.discard_armed then
+            state.discard_armed = true
+            set_status(string.format(
+                "Press Esc again to discard %d annotation%s without saving",
+                #state.annotations, #state.annotations == 1 and "" or "s"))
+            return
+        end
+        user32.DestroyWindow(hwnd)
+    end
+
+    local function handle_toolbar_click(x, y)
+        for _, button in ipairs(state.buttons) do
+            local rect = button.rect
+            if x >= rect.left and x < rect.right and y >= rect.top and y < rect.bottom then
+                state.discard_armed = false
+                if button.id == "color" then
+                    state.color_index = button.index
+                    state.color = EDITOR_PALETTE[button.index].colorref
+                    set_status(string.format("Color  %s", EDITOR_PALETTE[button.index].hex))
+                elseif button.id == "width_down" then
+                    adjust_width(-1)
+                elseif button.id == "width_up" then
+                    adjust_width(1)
+                elseif button.id == "undo" then
+                    undo()
+                elseif button.id == "copy" then
+                    copy_current()
+                elseif button.id == "save" then
+                    accept()
+                end
+                return true
+            end
+        end
+        return false
+    end
+
+    local function mouse_x(lparam)
+        local packed = tonumber(lparam) or 0
+        local value = bit.band(packed, 0xFFFF)
+        if value >= 32768 then
+            value = value - 65536
+        end
+        return value
+    end
+
+    local function mouse_y(lparam)
+        local packed = tonumber(lparam) or 0
+        local value = bit.band(bit.rshift(packed, 16), 0xFFFF)
+        if value >= 32768 then
+            value = value - 65536
+        end
+        return value
+    end
+
+    local function client_to_image(x, y)
+        local image_x = (x - state.ox) / state.scale
+        local image_y = (y - state.oy) / state.scale
+        image_x = math.max(0, math.min(image_width, image_x))
+        image_y = math.max(0, math.min(image_height, image_y))
+        return image_x, image_y
+    end
+
+    local function over_image(x, y)
+        return x >= state.ox and x < state.ox + state.display_width
+            and y >= state.oy and y < state.oy + state.display_height
+    end
+
+    local function handle_message(message_hwnd, message, wparam, lparam)
+        if message == EDITOR_KEYS.WM_PAINT then
+            paint(message_hwnd)
+            return 0
+        elseif message == EDITOR_KEYS.WM_ERASEBKGND then
+            return 1
+        elseif message == EDITOR_KEYS.WM_SIZE then
+            local client_rect = ffi.new("RECT")
+            if user32.GetClientRect(message_hwnd, client_rect) ~= 0 then
+                state.client_width = math.max(1, client_rect.right - client_rect.left)
+                state.client_height = math.max(1, client_rect.bottom - client_rect.top)
+                create_back_buffer()
+                update_layout()
+                user32.InvalidateRect(message_hwnd, nil, 0)
+            end
+            return 0
+        elseif message == EDITOR_KEYS.WM_SETCURSOR then
+            local cursor = over_image(state.last_x, state.last_y)
+            user32.SetCursor(cursor and cross_cursor or arrow_cursor)
+            return 1
+        elseif message == EDITOR_KEYS.WM_LBUTTONDOWN then
+            local x = mouse_x(lparam)
+            local y = mouse_y(lparam)
+            state.last_x, state.last_y = x, y
+            if y < toolbar_height then
+                handle_toolbar_click(x, y)
+                return 0
+            end
+            if y >= state.client_height - status_height then
+                return 0
+            end
+            if not over_image(x, y) then
+                return 0
+            end
+
+            state.discard_armed = false
+            state.dragging = true
+            state.start_x, state.start_y = client_to_image(x, y)
+            state.current_x, state.current_y = state.start_x, state.start_y
+            user32.SetCapture(message_hwnd)
+            user32.InvalidateRect(message_hwnd, nil, 0)
+            return 0
+        elseif message == EDITOR_KEYS.WM_MOUSEMOVE then
+            local x = mouse_x(lparam)
+            local y = mouse_y(lparam)
+            state.last_x, state.last_y = x, y
+            if state.dragging then
+                local next_x, next_y = client_to_image(x, y)
+                if next_x ~= state.current_x or next_y ~= state.current_y then
+                    state.current_x, state.current_y = next_x, next_y
+                    user32.InvalidateRect(message_hwnd, nil, 0)
+                end
+            elseif over_image(x, y) then
+                user32.SetCursor(cross_cursor)
+            else
+                user32.SetCursor(arrow_cursor)
+            end
+            return 0
+        elseif message == EDITOR_KEYS.WM_LBUTTONUP then
+            if state.dragging then
+                state.dragging = false
+                user32.ReleaseCapture()
+                state.current_x, state.current_y = client_to_image(mouse_x(lparam), mouse_y(lparam))
+
+                local rectangle = normalize_selection(state.start_x, state.start_y,
+                    state.current_x, state.current_y)
+                if rectangle.width >= 2 and rectangle.height >= 2 then
+                    table.insert(state.undo_stack, copy_annotations())
+                    state.redo_stack = {}
+                    table.insert(state.annotations, {
+                        x = rectangle.x,
+                        y = rectangle.y,
+                        width = rectangle.width,
+                        height = rectangle.height,
+                        color = state.color,
+                        line_width = state.width_px,
+                    })
+                    set_status(string.format("Rect  %dx%d  %s  %d px",
+                        rectangle.width, rectangle.height,
+                        color_to_hex(state.color), state.width_px))
+                else
+                    set_status("Shape too small; drag at least 2x2 image pixels", true)
+                end
+
+                user32.InvalidateRect(message_hwnd, nil, 0)
+            end
+            return 0
+        elseif message == EDITOR_KEYS.WM_RBUTTONUP then
+            if state.dragging then
+                state.dragging = false
+                user32.ReleaseCapture()
+                set_status("Shape cancelled")
+                user32.InvalidateRect(message_hwnd, nil, 0)
+            end
+            return 0
+        elseif message == EDITOR_KEYS.WM_KEYDOWN then
+            local key = tonumber(wparam)
+            if key == EDITOR_KEYS.VK_ESCAPE then
+                if state.dragging then
+                    state.dragging = false
+                    user32.ReleaseCapture()
+                    set_status("Shape cancelled")
+                    user32.InvalidateRect(message_hwnd, nil, 0)
+                    return 0
+                end
+                request_close()
+                return 0
+            end
+
+            state.discard_armed = false
+            local control = bit.band(user32.GetKeyState(EDITOR_KEYS.VK_CONTROL), 0x8000) ~= 0
+
+            if key == EDITOR_KEYS.VK_RETURN then
+                accept()
+            elseif key == EDITOR_KEYS.VK_Z and control then
+                undo()
+            elseif key == EDITOR_KEYS.VK_Y and control then
+                redo()
+            elseif key == EDITOR_KEYS.VK_C and not control then
+                copy_current()
+            elseif key == EDITOR_KEYS.VK_S and control then
+                accept()
+            elseif key == EDITOR_KEYS.VK_OEM_4 or key == EDITOR_KEYS.VK_SUBTRACT then
+                adjust_width(-1)
+            elseif key == EDITOR_KEYS.VK_OEM_6 or key == EDITOR_KEYS.VK_ADD then
+                adjust_width(1)
+            elseif key >= EDITOR_KEYS.VK_1 and key <= EDITOR_KEYS.VK_6 then
+                state.color_index = key - EDITOR_KEYS.VK_1 + 1
+                state.color = EDITOR_PALETTE[state.color_index].colorref
+                set_status(string.format("Color  %s", EDITOR_PALETTE[state.color_index].hex))
+            elseif key == EDITOR_KEYS.VK_R then
+                set_status("Tool  Rect")
+            end
+
+            user32.InvalidateRect(message_hwnd, nil, 0)
+            return 0
+        elseif message == EDITOR_KEYS.WM_CLOSE then
+            request_close()
+            return 0
+        elseif message == EDITOR_KEYS.WM_DESTROY then
+            state.destroyed = true
+            user32.PostQuitMessage(0)
+            return 0
+        end
+
+        return user32.DefWindowProcW(message_hwnd, message, wparam, lparam)
+    end
+
+    local function wnd_proc(message_hwnd, message, wparam, lparam)
+        local ok, result = pcall(handle_message, message_hwnd, message, wparam, lparam)
+        if ok then
+            return result
+        end
+
+        -- Never let a Lua error escape a Win32 callback. Report it and close so
+        -- the caller can print the real reason instead of hanging.
+        state.fatal = "editor error: " .. tostring(result)
+        if not state.destroyed then
+            user32.DestroyWindow(message_hwnd)
+        end
+        return 0
+    end
+
+    local class_name = utf8_to_wide("FShotAnnotationEditor")
+    local window_title = utf8_to_wide(string.format("fshot editor - %dx%d",
+        image_width, image_height))
+    local cross_cursor = user32.LoadCursorW(nil, ffi.cast("const wchar_t*", IDC_CROSS))
+    local arrow_cursor = user32.LoadCursorW(nil, ffi.cast("const wchar_t*", IDC_ARROW))
+
+    -- Anchor the callback for the whole message loop (see active_window_proc).
+    local wnd_proc_pointer = ffi.cast("WNDPROC", wnd_proc)
+    active_window_proc = wnd_proc_pointer
+    local window_class = ffi.new("WNDCLASSW")
+    window_class.style = 0x0003 -- CS_HREDRAW | CS_VREDRAW
+    window_class.lpfnWndProc = wnd_proc_pointer
+    window_class.hCursor = arrow_cursor
+    window_class.hbrBackground = background_brush
+    window_class.lpszClassName = class_name
+
+    local atom = user32.RegisterClassW(window_class)
+    if atom == 0 then
+        local code = tonumber(kernel32.GetLastError())
+        if code ~= ERROR_CLASS_ALREADY_EXISTS then
+            release_resources()
+            return nil, "RegisterClassW failed: " .. win_error_message(code)
+        end
+    end
+
+    hwnd = user32.CreateWindowExW(
+        bit.bor(WS_EX_TOPMOST, WS_EX_TOOLWINDOW, WS_EX_LAYERED),
+        class_name, window_title, WS_OVERLAPPEDWINDOW,
+        window_x, window_y, window_width, window_height,
+        nil, nil, nil, nil)
+    if hwnd == nil then
+        local reason = win_error_message()
+        release_resources()
+        return nil, "CreateWindowExW failed: " .. reason
+    end
+
+    local client_rect = ffi.new("RECT")
+    user32.GetClientRect(hwnd, client_rect)
+    state.client_width = math.max(1, client_rect.right - client_rect.left)
+    state.client_height = math.max(1, client_rect.bottom - client_rect.top)
+    if not create_back_buffer() then
+        local reason = state.fatal
+        user32.DestroyWindow(hwnd)
+        release_resources()
+        return nil, reason
+    end
+    update_layout()
+
+    -- Same reveal discipline as the selector: compose the first frame while the
+    -- layered window is fully transparent, then fade it in.
+    local layered = user32.SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA) ~= 0
+    user32.ShowWindow(hwnd, SW_SHOW)
+    pcall(function()
+        user32.SetForegroundWindow(hwnd)
+    end)
+    user32.InvalidateRect(hwnd, nil, 0)
+    user32.UpdateWindow(hwnd)
+    if layered then
+        user32.SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA)
+    end
+
+    local loop_error = nil
+    local message = ffi.new("MSG")
+    while true do
+        local result = user32.GetMessageW(message, nil, 0, 0)
+        if result == 0 then
+            break
+        end
+        if result == -1 then
+            loop_error = "window message loop failed: " .. win_error_message()
+            break
+        end
+        user32.TranslateMessage(message)
+        user32.DispatchMessageW(message)
+    end
+
+    if not state.destroyed then
+        user32.DestroyWindow(hwnd)
+    end
+
+    release_back_buffer()
+    release_resources()
+
+    if state.fatal then
+        return nil, state.fatal
+    end
+    if loop_error then
+        return nil, loop_error
+    end
+    if not state.result then
+        return nil, "edit cancelled"
+    end
+
+    return state.result
 end
 
 --------------------------------------------------------------------------------
@@ -1991,7 +3168,7 @@ local function win_global_from_bytes(data, length)
     return memory
 end
 
-local function win_copy_to_clipboard(image, png, png_size)
+function win_copy_to_clipboard(image, png, png_size)
     local stride = image.width * 4
     local dib_size = ffi.sizeof("BITMAPINFOHEADER") + stride * image.height
     local dib_memory = kernel32.GlobalAlloc(GMEM_MOVEABLE, dib_size)
@@ -2180,9 +3357,14 @@ local function parse_options(arguments)
         delay_ms = 0,
         output = nil,
         clipboard = false,
+        clipboard_set = false,
         write_file = true,
         json = false,
         compress = true,
+        edit = false,
+        tool = "rect",
+        editor_color = EDITOR_PALETTE[1].colorref,
+        editor_width = EDITOR_WIDTHS[2],
         list_windows = false,
         test = false,
         help = false,
@@ -2240,6 +3422,38 @@ local function parse_options(arguments)
             options.output = arguments[index]
         elseif argument == "--clip" then
             options.clipboard = true
+            options.clipboard_set = true
+        elseif argument == "--no-clip" then
+            options.clipboard = false
+            options.clipboard_set = true
+        elseif argument == "--edit" then
+            options.edit = true
+        elseif argument == "--tool" then
+            index = index + 1
+            if not arguments[index] then
+                return nil, "--tool requires a name (phase 1: rect)"
+            end
+            if arguments[index] ~= "rect" then
+                return nil, string.format(
+                    "unsupported --tool %q: phase 1 implements rectangles only",
+                    arguments[index])
+            end
+            options.tool = arguments[index]
+        elseif argument == "--color" then
+            index = index + 1
+            local editor_color, color_error = parse_color(arguments[index])
+            if not editor_color then
+                return nil, color_error
+            end
+            options.editor_color = editor_color
+        elseif argument == "--width" then
+            index = index + 1
+            local width = tonumber(arguments[index])
+            if not width or width < 1 or width > 64 or width ~= math.floor(width) then
+                return nil, string.format("invalid --width %q: expected 1-64 pixels",
+                    tostring(arguments[index]))
+            end
+            options.editor_width = width
         elseif argument == "--no-file" then
             options.write_file = false
         elseif argument == "--json" then
@@ -2255,13 +3469,24 @@ local function parse_options(arguments)
         index = index + 1
     end
 
+    -- The editor saves and copies on accept by default (Greenshot behavior);
+    -- --no-clip opts out and --no-file keeps only the clipboard copy.
+    if options.edit and not options.clipboard_set then
+        options.clipboard = true
+    end
+
+    if options.edit and not IS_WINDOWS then
+        return nil, "--edit is only implemented on Windows"
+    end
+
     if not options.write_file and options.output then
         return nil, "cannot combine --out with --no-file"
     end
 
     if not options.write_file and not options.clipboard
         and not options.test and not options.help and not options.list_windows then
-        return nil, "--no-file requires --clip, otherwise the capture would be discarded"
+        return nil, "--no-file requires --clip (or --edit without --no-clip), "
+            .. "otherwise the capture would be discarded"
     end
 
     return options
@@ -2283,7 +3508,7 @@ local function default_output_path()
     end
 end
 
-local function resolve_output_path(requested)
+function resolve_output_path(requested)
     if not requested then
         return default_output_path()
     end
@@ -2308,7 +3533,7 @@ local function describe_write_error(path, raw_error)
     return string.format("cannot write %q: %s", path, message)
 end
 
-local function write_binary_file(path, data, size)
+function write_binary_file(path, data, size)
     local file, open_error = io.open(path, "wb")
     if not file then
         return false, describe_write_error(path, open_error)
@@ -2416,6 +3641,25 @@ local function run_tests()
     local single_pixel = normalize_selection(7, 9, 7, 9)
     check("normalize_selection reports a single-pixel drag as 1x1",
         single_pixel.width == 1 and single_pixel.height == 1)
+
+    local red_colorref = parse_color("#E53935")
+    check("parse_color decodes #RRGGBB into COLORREF", red_colorref == 0x003539E5,
+        string.format("got 0x%08X", red_colorref or 0))
+    check("parse_color accepts palette names case-insensitively",
+        parse_color("RED") == red_colorref)
+
+    local bad_color, bad_color_error = parse_color("chartreuse")
+    check("parse_color rejects unknown names with guidance",
+        bad_color == nil and tostring(bad_color_error):find("#RRGGBB", 1, true) ~= nil,
+        tostring(bad_color_error))
+
+    check("color_to_hex round-trips a COLORREF",
+        color_to_hex(red_colorref) == "#E53935", color_to_hex(red_colorref))
+
+    check("fit_scale never upscales a small image", fit_scale(200, 100, 400, 400) == 1)
+    check("fit_scale fits by width", fit_scale(400, 200, 200, 200) == 0.5)
+    check("fit_scale fits by height", fit_scale(400, 400, 200, 100) == 0.25)
+    check("fit_scale guards zero-sized inputs", fit_scale(0, 0, 100, 100) == 1)
 
     local crop_source = ffi.new("uint8_t[?]", 4 * 3 * 4)
     for row = 0, 2 do
@@ -2671,6 +3915,33 @@ local function main(arguments)
 
     for _, warning in ipairs(image.warnings or {}) do
         io.stderr:write("fshot: warning: " .. warning .. "\n")
+    end
+
+    if options.edit then
+        local result, edit_error = win_edit_image(image, options)
+        if not result then
+            io.stderr:write("fshot: " .. tostring(edit_error) .. "\n")
+            return 1
+        end
+
+        if options.json then
+            print(json_summary(image, result.path, result.bytes, result.compressed,
+                result.elapsed_ms, result.copied))
+        else
+            local compression = result.compressed and "zlib" or "stored"
+            local summary = string.format("%dx%d  %s  %s  %d ms",
+                image.width, image.height, format_bytes(result.bytes), compression,
+                result.elapsed_ms)
+            if result.path and result.copied then
+                print(string.format("%s  %s  (also copied to clipboard)",
+                    result.path, summary))
+            elseif result.path then
+                print(string.format("%s  %s", result.path, summary))
+            else
+                print(string.format("copied to clipboard  %s", summary))
+            end
+        end
+        return 0
     end
 
     local png, png_size_or_error, compressed = encode_png(image, options.compress)
