@@ -2548,6 +2548,12 @@ local function win_edit_image(image, options)
             and y >= state.oy and y < state.oy + state.display_height
     end
 
+    -- Load the cursors before the window procedure that references them;
+    -- a later local would resolve to a nil global inside the closure and hide
+    -- the pointer with SetCursor(NULL).
+    local cross_cursor = user32.LoadCursorW(nil, ffi.cast("const wchar_t*", IDC_CROSS))
+    local arrow_cursor = user32.LoadCursorW(nil, ffi.cast("const wchar_t*", IDC_ARROW))
+
     local function handle_message(message_hwnd, message, wparam, lparam)
         if message == EDITOR_KEYS.WM_PAINT then
             paint(message_hwnd)
@@ -2587,6 +2593,7 @@ local function win_edit_image(image, options)
             state.dragging = true
             state.start_x, state.start_y = client_to_image(x, y)
             state.current_x, state.current_y = state.start_x, state.start_y
+            user32.SetCursor(cross_cursor)
             user32.SetCapture(message_hwnd)
             user32.InvalidateRect(message_hwnd, nil, 0)
             return 0
@@ -2595,6 +2602,7 @@ local function win_edit_image(image, options)
             local y = mouse_y(lparam)
             state.last_x, state.last_y = x, y
             if state.dragging then
+                user32.SetCursor(cross_cursor)
                 local next_x, next_y = client_to_image(x, y)
                 if next_x ~= state.current_x or next_y ~= state.current_y then
                     state.current_x, state.current_y = next_x, next_y
@@ -2714,8 +2722,6 @@ local function win_edit_image(image, options)
     local class_name = utf8_to_wide("FShotAnnotationEditor")
     local window_title = utf8_to_wide(string.format("fshot editor - %dx%d",
         image_width, image_height))
-    local cross_cursor = user32.LoadCursorW(nil, ffi.cast("const wchar_t*", IDC_CROSS))
-    local arrow_cursor = user32.LoadCursorW(nil, ffi.cast("const wchar_t*", IDC_ARROW))
 
     -- Anchor the callback for the whole message loop (see active_window_proc).
     local wnd_proc_pointer = ffi.cast("WNDPROC", wnd_proc)
