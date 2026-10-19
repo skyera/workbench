@@ -31,6 +31,12 @@ class SelfTestRegressions(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("0 failed", result.stdout)
 
+    def test_fshot_self_test_encoder(self):
+        result = subprocess.run([LUAJIT, str(ROOT / "bin/fshot.lua"), "--test"],
+                                capture_output=True, text=True, encoding="utf-8", timeout=120)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("0 failed", result.stdout)
+
     def test_rfe_forced_ffi_availability_and_engine_cycling(self):
         # Test both platform branches without requiring a Windows host or
         # installing external image conversion utilities.
