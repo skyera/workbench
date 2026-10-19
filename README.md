@@ -71,7 +71,7 @@ The [bin/](bin) directory includes utilities for:
 - Working with Git and source indexes (`fco`, `flog`, `fbr`, `dotag`).
 - Managing shell history, processes, clipboard access, and remote mounts (`fhist`, `fkill`, `osc52-yank`, `rsshfs`).
 - Inspecting interfaces, DNS records, latency, and open ports (`fnet`).
-- Capturing the screen or a window to PNG, with optional clipboard copy (`fshot`).
+- Capturing the screen, a window, or a dragged region to PNG, with optional clipboard copy (`fshot`).
 
 Many tools have platform-specific implementations in shell, batch, Lua, PowerShell, or Python. Check the selected script for its dependencies and options.
 

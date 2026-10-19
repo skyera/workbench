@@ -5,6 +5,8 @@
   Features:
     - Full virtual desktop capture across monitors, including negative coordinates.
     - Region capture in physical pixels (--region X,Y,W,H).
+    - Interactive region selection (--select) over a frozen, dimmed desktop with a live
+      size readout; Esc or right-click cancels (Windows only).
     - Window capture by title or process substring (--window TEXT), using PrintWindow
       so occluded windows are rendered, with a screen-blit fallback when that fails.
     - PNG encoding in-process: zlib when a zlib library is available, otherwise valid
@@ -14,7 +16,7 @@
     - Built-in self-test suite (--test) that validates the PNG encoder without a display.
 
   Usage:
-    fshot [--full | --region X,Y,W,H | --window TEXT] [options]
+    fshot [--full | --region X,Y,W,H | --window TEXT | --select] [options]
     fshot --list-windows
     fshot --test
 
@@ -164,6 +166,107 @@ if IS_WINDOWS then
                                 int cchWideChar, char* lpMultiByteStr, int cbMultiByte,
                                 const char* lpDefaultChar, BOOL* lpUsedDefaultChar);
     ]]
+
+    ffi.cdef[[
+        typedef unsigned short ATOM;
+        typedef void* HINSTANCE;
+        typedef void* HICON;
+        typedef void* HCURSOR;
+        typedef void* HBRUSH;
+        typedef void* HFONT;
+        typedef void* HPEN;
+        typedef void* HMENU;
+        typedef uintptr_t WPARAM;
+
+        typedef struct {
+            LONG x;
+            LONG y;
+        } POINT;
+
+        typedef LRESULT (*WNDPROC)(HWND, UINT, WPARAM, LPARAM);
+
+        typedef struct {
+            UINT style;
+            WNDPROC lpfnWndProc;
+            int cbClsExtra;
+            int cbWndExtra;
+            HINSTANCE hInstance;
+            HICON hIcon;
+            HCURSOR hCursor;
+            HBRUSH hbrBackground;
+            const wchar_t* lpszMenuName;
+            const wchar_t* lpszClassName;
+        } WNDCLASSW;
+
+        typedef struct {
+            HWND hwnd;
+            UINT message;
+            WPARAM wParam;
+            LPARAM lParam;
+            DWORD time;
+            POINT pt;
+        } MSG;
+
+        typedef struct {
+            HDC hdc;
+            BOOL fErase;
+            RECT rcPaint;
+            BOOL fRestore;
+            BOOL fIncUpdate;
+            BYTE rgbReserved[32];
+        } PAINTSTRUCT;
+
+        typedef struct {
+            BYTE BlendOp;
+            BYTE BlendFlags;
+            BYTE SourceConstantAlpha;
+            BYTE AlphaFormat;
+        } BLENDFUNCTION;
+
+        ATOM RegisterClassW(const WNDCLASSW* lpWndClass);
+        HWND CreateWindowExW(DWORD dwExStyle, const wchar_t* lpClassName,
+                             const wchar_t* lpWindowName, DWORD dwStyle, int X, int Y,
+                             int nWidth, int nHeight, HWND hWndParent, HMENU hMenu,
+                             HINSTANCE hInstance, void* lpParam);
+        LRESULT DefWindowProcW(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam);
+        BOOL DestroyWindow(HWND hWnd);
+        BOOL ShowWindow(HWND hWnd, int nCmdShow);
+        BOOL UpdateWindow(HWND hWnd);
+        BOOL SetForegroundWindow(HWND hWnd);
+        BOOL SetLayeredWindowAttributes(HWND hWnd, DWORD colorKey, BYTE alpha,
+                                        DWORD flags);
+        BOOL GetMessageW(MSG* lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax);
+        BOOL TranslateMessage(const MSG* lpMsg);
+        LRESULT DispatchMessageW(const MSG* lpMsg);
+        void PostQuitMessage(int nExitCode);
+        HWND SetCapture(HWND hWnd);
+        BOOL ReleaseCapture(void);
+        HCURSOR SetCursor(HCURSOR hCursor);
+        HCURSOR LoadCursorW(HINSTANCE hInstance, const wchar_t* lpCursorName);
+        HDC BeginPaint(HWND hWnd, PAINTSTRUCT* lpPaint);
+        BOOL EndPaint(HWND hWnd, const PAINTSTRUCT* lpPaint);
+        BOOL InvalidateRect(HWND hWnd, const RECT* lpRect, BOOL bErase);
+        int GetDeviceCaps(HDC hdc, int index);
+
+        HBRUSH CreateSolidBrush(DWORD color);
+        HPEN CreatePen(int iStyle, int cWidth, DWORD color);
+        HGDIOBJ GetStockObject(int i);
+        int FillRect(HDC hDC, const RECT* lprc, HBRUSH hbr);
+        int FrameRect(HDC hDC, const RECT* lprc, HBRUSH hbr);
+        int Rectangle(HDC hdc, int left, int top, int right, int bottom);
+        int SetBkMode(HDC hdc, int mode);
+        DWORD SetTextColor(HDC hdc, DWORD color);
+        HFONT CreateFontW(int cHeight, int cWidth, int cEscapement, int cOrientation,
+                          int cWeight, DWORD bItalic, DWORD bUnderline, DWORD bStrikeOut,
+                          DWORD iCharSet, DWORD iOutPrecision, DWORD iClipPrecision,
+                          DWORD iQuality, DWORD iPitchAndFamily, const wchar_t* pszFaceName);
+        int DrawTextW(HDC hdc, const wchar_t* lpchText, int cchText, RECT* lprc, UINT format);
+        HBITMAP CreateDIBSection(HDC hdc, const BITMAPINFO* pbmi, UINT usage,
+                                 void** ppvBits, HANDLE hSection, DWORD offset);
+        BOOL AlphaBlend(HDC hdcDest, int xoriginDest, int yoriginDest, int wDest, int hDest,
+                        HDC hdcSrc, int xoriginSrc, int yoriginSrc, int wSrc, int hSrc,
+                        BLENDFUNCTION ftn);
+    ]]
 else
     ffi.cdef[[
         typedef struct _XDisplay Display;
@@ -219,13 +322,14 @@ end
 
 local zlib = load_first_library({ "z", "zlib1", "zlib" })
 
-local user32, gdi32, kernel32, dwmapi, x11
+local user32, gdi32, kernel32, dwmapi, msimg32, x11
 
 if IS_WINDOWS then
     user32 = ffi.load("user32")
     gdi32 = ffi.load("gdi32")
     kernel32 = ffi.load("kernel32")
     dwmapi = load_first_library({ "dwmapi" })
+    msimg32 = load_first_library({ "msimg32" })
 elseif IS_LINUX then
     x11 = load_first_library({ "X11" })
 end
@@ -250,6 +354,35 @@ local SM_YVIRTUALSCREEN = 77
 local SM_CXVIRTUALSCREEN = 78
 local SM_CYVIRTUALSCREEN = 79
 
+local WS_POPUP = 0x80000000
+local WS_EX_TOPMOST = 0x00000008
+local WS_EX_TOOLWINDOW = 0x00000080
+local WS_EX_LAYERED = 0x00080000
+local LWA_ALPHA = 0x00000002
+local SW_SHOW = 5
+local NULL_BRUSH = 5
+local DEFAULT_GUI_FONT = 17
+local LOGPIXELSY = 90
+local IDC_CROSS = 32515
+local ERROR_CLASS_ALREADY_EXISTS = 1410
+
+local WM_DESTROY = 0x0002
+local WM_PAINT = 0x000F
+local WM_ERASEBKGND = 0x0014
+local WM_SETCURSOR = 0x0020
+local WM_KEYDOWN = 0x0100
+local WM_MOUSEMOVE = 0x0200
+local WM_LBUTTONDOWN = 0x0201
+local WM_LBUTTONUP = 0x0202
+local WM_RBUTTONUP = 0x0205
+local VK_ESCAPE = 0x1B
+
+local DT_LEFT = 0x00000000
+local DT_CENTER = 0x00000001
+local DT_VCENTER = 0x00000004
+local DT_SINGLELINE = 0x00000020
+local DT_CALCRECT = 0x00000400
+
 local ZPIXMAP = 2
 local LSB_FIRST = 0
 
@@ -258,7 +391,7 @@ local DEFLATE_BLOCK_MAX = 65535
 
 local USAGE = [[
 Usage:
-  fshot [--full | --region X,Y,W,H | --window TEXT] [options]
+  fshot [--full | --region X,Y,W,H | --window TEXT | --select] [options]
   fshot --list-windows
   fshot --test
 
@@ -266,6 +399,7 @@ Capture:
   --full               Capture the whole virtual desktop (default).
   --region X,Y,W,H     Capture a rectangle in physical pixels (negative origins allowed).
   --window TEXT        Capture the best visible window matching TEXT (Windows only).
+  --select, -s         Drag a rectangle to capture it (Windows only).
   --list-windows       List visible top-level windows (Windows only).
   --delay MS           Wait before capturing, so menus can be opened.
 
@@ -284,6 +418,7 @@ Examples:
   fshot
   fshot --region 0,0,1280,720 --out tmp/shot.png
   fshot --window firefox --clip
+  fshot --select --clip
   fshot --delay 1500 --window "Save As"
 ]]
 
@@ -326,6 +461,32 @@ local function format_bytes(size)
         return string.format("%.1f KB", size / 1024)
     end
     return string.format("%d B", size)
+end
+
+local function normalize_selection(anchor_x, anchor_y, cursor_x, cursor_y)
+    local left = math.min(anchor_x, cursor_x)
+    local top = math.min(anchor_y, cursor_y)
+    local right = math.max(anchor_x, cursor_x)
+    local bottom = math.max(anchor_y, cursor_y)
+
+    return {
+        x = left,
+        y = top,
+        width = right - left + 1,
+        height = bottom - top + 1,
+    }
+end
+
+local function crop_bgra(pixels, source_width, rectangle)
+    local row_size = rectangle.width * 4
+    local cropped = ffi.new("uint8_t[?]", row_size * rectangle.height)
+
+    for row = 0, rectangle.height - 1 do
+        local source = ((rectangle.y + row) * source_width + rectangle.x) * 4
+        ffi.copy(cropped + row * row_size, pixels + source, row_size)
+    end
+
+    return cropped
 end
 
 local function read_u32_be(buffer, offset)
@@ -989,6 +1150,487 @@ local function win_capture_window(window)
 end
 
 --------------------------------------------------------------------------------
+-- Windows Region Selector
+--------------------------------------------------------------------------------
+
+local function win_select_region()
+    local bounds, bounds_error = win_screen_bounds()
+    if not bounds then
+        return nil, bounds_error
+    end
+
+    local frozen, capture_error = win_capture_rect(bounds.x, bounds.y,
+        bounds.width, bounds.height)
+    if not frozen then
+        return nil, capture_error
+    end
+
+    local width = bounds.width
+    local height = bounds.height
+
+    local screen_dc = user32.GetDC(nil)
+    if screen_dc == nil then
+        return nil, "GetDC(NULL) failed: " .. win_error_message()
+    end
+
+    local frozen_bitmap, frozen_dc, previous_frozen
+    local back_bitmap, back_dc, previous_back
+    local dim_bitmap, dim_dc
+    local border_pen, handle_brush, handle_frame_brush, label_brush, hint_brush
+    local font, owns_font
+
+    local function release_gdi()
+        if back_dc ~= nil and previous_back ~= nil then
+            gdi32.SelectObject(back_dc, previous_back)
+        end
+        if back_dc ~= nil then
+            gdi32.DeleteDC(back_dc)
+        end
+        if back_bitmap ~= nil then
+            gdi32.DeleteObject(back_bitmap)
+        end
+        if frozen_dc ~= nil and previous_frozen ~= nil then
+            gdi32.SelectObject(frozen_dc, previous_frozen)
+        end
+        if dim_dc ~= nil then
+            gdi32.DeleteDC(dim_dc)
+        end
+        if dim_bitmap ~= nil then
+            gdi32.DeleteObject(dim_bitmap)
+        end
+        if frozen_dc ~= nil then
+            gdi32.DeleteDC(frozen_dc)
+        end
+        if frozen_bitmap ~= nil then
+            gdi32.DeleteObject(frozen_bitmap)
+        end
+        if border_pen ~= nil then
+            gdi32.DeleteObject(border_pen)
+        end
+        if handle_brush ~= nil then
+            gdi32.DeleteObject(handle_brush)
+        end
+        if handle_frame_brush ~= nil then
+            gdi32.DeleteObject(handle_frame_brush)
+        end
+        if label_brush ~= nil then
+            gdi32.DeleteObject(label_brush)
+        end
+        if hint_brush ~= nil then
+            gdi32.DeleteObject(hint_brush)
+        end
+        if owns_font and font ~= nil then
+            gdi32.DeleteObject(font)
+        end
+        user32.ReleaseDC(nil, screen_dc)
+    end
+
+    local section_info = ffi.new("BITMAPINFO")
+    section_info.bmiHeader.biSize = ffi.sizeof("BITMAPINFOHEADER")
+    section_info.bmiHeader.biWidth = width
+    section_info.bmiHeader.biHeight = -height
+    section_info.bmiHeader.biPlanes = 1
+    section_info.bmiHeader.biBitCount = 32
+    section_info.bmiHeader.biCompression = BI_RGB
+
+    local section_bits = ffi.new("void*[1]")
+    frozen_bitmap = gdi32.CreateDIBSection(screen_dc, section_info, DIB_RGB_COLORS,
+        section_bits, nil, 0)
+    if frozen_bitmap == nil then
+        local reason = win_error_message()
+        release_gdi()
+        return nil, "cannot create the frozen-frame bitmap: " .. reason
+    end
+    ffi.copy(section_bits[0], frozen.pixels, width * height * 4)
+
+    frozen_dc = gdi32.CreateCompatibleDC(screen_dc)
+    if frozen_dc == nil then
+        local reason = win_error_message()
+        release_gdi()
+        return nil, "CreateCompatibleDC failed for the frozen frame: " .. reason
+    end
+    previous_frozen = gdi32.SelectObject(frozen_dc, frozen_bitmap)
+
+    -- Offscreen frame buffer: every repaint composes a complete frame here and
+    -- then presents it with a single BitBlt, so dragging never shows a partial
+    -- dim/selection state.
+    back_bitmap = gdi32.CreateDIBSection(screen_dc, section_info, DIB_RGB_COLORS,
+        ffi.new("void*[1]"), nil, 0)
+    if back_bitmap == nil then
+        local reason = win_error_message()
+        release_gdi()
+        return nil, "cannot create the offscreen frame buffer: " .. reason
+    end
+    back_dc = gdi32.CreateCompatibleDC(screen_dc)
+    if back_dc == nil then
+        local reason = win_error_message()
+        release_gdi()
+        return nil, "CreateCompatibleDC failed for the frame buffer: " .. reason
+    end
+    previous_back = gdi32.SelectObject(back_dc, back_bitmap)
+
+    local dim_info = ffi.new("BITMAPINFO")
+    dim_info.bmiHeader.biSize = ffi.sizeof("BITMAPINFOHEADER")
+    dim_info.bmiHeader.biWidth = 1
+    dim_info.bmiHeader.biHeight = -1
+    dim_info.bmiHeader.biPlanes = 1
+    dim_info.bmiHeader.biBitCount = 32
+    dim_info.bmiHeader.biCompression = BI_RGB
+
+    local dim_bits = ffi.new("void*[1]")
+    dim_bitmap = gdi32.CreateDIBSection(screen_dc, dim_info, DIB_RGB_COLORS,
+        dim_bits, nil, 0)
+    if dim_bitmap ~= nil then
+        local dim_pixel = ffi.cast("uint8_t*", dim_bits[0])
+        dim_pixel[0] = 0 -- blue
+        dim_pixel[1] = 0 -- green
+        dim_pixel[2] = 0 -- red
+        dim_pixel[3] = 110
+
+        dim_dc = gdi32.CreateCompatibleDC(screen_dc)
+        if dim_dc ~= nil then
+            gdi32.SelectObject(dim_dc, dim_bitmap)
+        end
+    end
+
+    local dpi = tonumber(gdi32.GetDeviceCaps(screen_dc, LOGPIXELSY))
+    if dpi <= 0 then
+        dpi = 96
+    end
+    local scale = dpi / 96
+
+    local font_face = utf8_to_wide("Segoe UI")
+    font = gdi32.CreateFontW(-math.max(12, math.floor(15 * scale)), 0, 0, 0, 400,
+        0, 0, 0, 1, 0, 0, 4, 0, font_face)
+    if font ~= nil then
+        owns_font = true
+    else
+        font = gdi32.GetStockObject(DEFAULT_GUI_FONT)
+    end
+
+    border_pen = gdi32.CreatePen(0, math.max(1, math.floor(2 * scale)), 0x0000A0FF)
+    handle_brush = gdi32.CreateSolidBrush(0x00FFFFFF)
+    handle_frame_brush = gdi32.CreateSolidBrush(0x00000000)
+    label_brush = gdi32.CreateSolidBrush(0x00141414)
+    hint_brush = gdi32.CreateSolidBrush(0x001C1C1C)
+
+    local handle_size = math.max(4, math.floor(6 * scale))
+    local hint_height = math.max(24, math.floor(30 * scale))
+    local cross_cursor = user32.LoadCursorW(nil, ffi.cast("const wchar_t*", IDC_CROSS))
+
+    local state = {
+        width = width,
+        height = height,
+        dragging = false,
+        anchor_x = 0,
+        anchor_y = 0,
+        cursor_x = 0,
+        cursor_y = 0,
+        selection = nil,
+        cancel_reason = nil,
+        destroyed = false,
+    }
+
+    local function mouse_point(lparam)
+        local packed = tonumber(lparam) or 0
+        local x = bit.band(packed, 0xFFFF)
+        local y = bit.band(bit.rshift(packed, 16), 0xFFFF)
+        if x >= 32768 then
+            x = x - 65536
+        end
+        if y >= 32768 then
+            y = y - 65536
+        end
+        x = math.max(0, math.min(width - 1, x))
+        y = math.max(0, math.min(height - 1, y))
+        return x, y
+    end
+
+    local function draw_handles(dc, rectangle)
+        local positions = {
+            { rectangle.x, rectangle.y },
+            { rectangle.x + rectangle.width - handle_size, rectangle.y },
+            { rectangle.x, rectangle.y + rectangle.height - handle_size },
+            { rectangle.x + rectangle.width - handle_size,
+              rectangle.y + rectangle.height - handle_size },
+        }
+
+        for _, position in ipairs(positions) do
+            local handle_rect = ffi.new("RECT")
+            handle_rect.left = position[1]
+            handle_rect.top = position[2]
+            handle_rect.right = position[1] + handle_size
+            handle_rect.bottom = position[2] + handle_size
+            user32.FillRect(dc, handle_rect, handle_brush)
+            user32.FrameRect(dc, handle_rect, handle_frame_brush)
+        end
+    end
+
+    local function compose()
+        local dc = back_dc
+        gdi32.BitBlt(dc, 0, 0, width, height, frozen_dc, 0, 0, SRCCOPY)
+
+        local rectangle
+        if state.dragging then
+            rectangle = normalize_selection(state.anchor_x, state.anchor_y,
+                state.cursor_x, state.cursor_y)
+        elseif state.selection then
+            rectangle = state.selection
+        end
+
+        if rectangle then
+            if msimg32 and dim_dc then
+                local blend = ffi.new("BLENDFUNCTION")
+                blend.BlendOp = 0
+                blend.BlendFlags = 0
+                blend.SourceConstantAlpha = 255
+                blend.AlphaFormat = 1
+                msimg32.AlphaBlend(dc, 0, 0, width, height, dim_dc, 0, 0, 1, 1, blend)
+            end
+
+            -- Keep the selected area at full brightness.
+            gdi32.BitBlt(dc, rectangle.x, rectangle.y, rectangle.width, rectangle.height,
+                frozen_dc, rectangle.x, rectangle.y, SRCCOPY)
+
+            local old_pen = gdi32.SelectObject(dc, border_pen)
+            local old_brush = gdi32.SelectObject(dc, gdi32.GetStockObject(NULL_BRUSH))
+            gdi32.Rectangle(dc, rectangle.x, rectangle.y,
+                rectangle.x + rectangle.width, rectangle.y + rectangle.height)
+            gdi32.SelectObject(dc, old_pen)
+            gdi32.SelectObject(dc, old_brush)
+
+            draw_handles(dc, rectangle)
+
+            local label = utf8_to_wide(string.format("%d x %d",
+                rectangle.width, rectangle.height))
+            local measure = ffi.new("RECT")
+            user32.DrawTextW(dc, label, -1, measure,
+                bit.bor(DT_CALCRECT, DT_SINGLELINE, DT_LEFT))
+
+            local text_width = measure.right - measure.left
+            local text_height = measure.bottom - measure.top
+            local padding = math.max(4, math.floor(6 * scale))
+            local label_left = rectangle.x
+            local label_top = rectangle.y - text_height - padding * 2 - 2
+            if label_top < hint_height then
+                label_top = rectangle.y + 2
+            end
+            if label_left + text_width + padding * 2 > width then
+                label_left = width - text_width - padding * 2
+            end
+            if label_left < 0 then
+                label_left = 0
+            end
+
+            local label_rect = ffi.new("RECT")
+            label_rect.left = label_left
+            label_rect.top = label_top
+            label_rect.right = label_left + text_width + padding * 2
+            label_rect.bottom = label_top + text_height + padding * 2
+            user32.FillRect(dc, label_rect, label_brush)
+
+            gdi32.SetBkMode(dc, 1) -- TRANSPARENT
+            gdi32.SetTextColor(dc, 0x00FFFFFF)
+            gdi32.SelectObject(dc, font)
+            local text_rect = ffi.new("RECT")
+            text_rect.left = label_rect.left + padding
+            text_rect.top = label_rect.top + padding
+            text_rect.right = label_rect.right - padding
+            text_rect.bottom = label_rect.bottom - padding
+            user32.DrawTextW(dc, label, -1, text_rect,
+                bit.bor(DT_LEFT, DT_SINGLELINE, DT_VCENTER))
+        end
+
+        local hint_rect = ffi.new("RECT")
+        hint_rect.left = 0
+        hint_rect.top = 0
+        hint_rect.right = width
+        hint_rect.bottom = hint_height
+        user32.FillRect(dc, hint_rect, hint_brush)
+
+        gdi32.SetBkMode(dc, 1)
+        gdi32.SetTextColor(dc, 0x00FFFFFF)
+        gdi32.SelectObject(dc, font)
+        local hint = utf8_to_wide(
+            "Left-drag to select      Esc or right-click to cancel")
+        user32.DrawTextW(dc, hint, -1, hint_rect,
+            bit.bor(DT_CENTER, DT_VCENTER, DT_SINGLELINE))
+    end
+
+    local function paint(hwnd)
+        local paint_struct = ffi.new("PAINTSTRUCT")
+        local dc = user32.BeginPaint(hwnd, paint_struct)
+        compose()
+        gdi32.BitBlt(dc, 0, 0, width, height, back_dc, 0, 0, SRCCOPY)
+        user32.EndPaint(hwnd, paint_struct)
+    end
+
+    local function handle_message(hwnd, message, wparam, lparam)
+        if message == WM_PAINT then
+            paint(hwnd)
+            return 0
+        elseif message == WM_ERASEBKGND then
+            return 1
+        elseif message == WM_SETCURSOR then
+            if cross_cursor ~= nil then
+                user32.SetCursor(cross_cursor)
+            end
+            return 1
+        elseif message == WM_LBUTTONDOWN then
+            state.dragging = true
+            state.anchor_x, state.anchor_y = mouse_point(lparam)
+            state.cursor_x, state.cursor_y = state.anchor_x, state.anchor_y
+            user32.SetCapture(hwnd)
+            user32.InvalidateRect(hwnd, nil, 0)
+            return 0
+        elseif message == WM_MOUSEMOVE then
+            if state.dragging then
+                local next_x, next_y = mouse_point(lparam)
+                if next_x ~= state.cursor_x or next_y ~= state.cursor_y then
+                    state.cursor_x, state.cursor_y = next_x, next_y
+                    user32.InvalidateRect(hwnd, nil, 0)
+                end
+            end
+            return 0
+        elseif message == WM_LBUTTONUP then
+            if state.dragging then
+                state.dragging = false
+                user32.ReleaseCapture()
+                state.cursor_x, state.cursor_y = mouse_point(lparam)
+
+                local rectangle = normalize_selection(state.anchor_x, state.anchor_y,
+                    state.cursor_x, state.cursor_y)
+                if rectangle.width >= 2 and rectangle.height >= 2 then
+                    state.selection = rectangle
+                else
+                    state.cancel_reason = string.format(
+                        "selection is too small (%dx%d); drag at least 2x2 pixels",
+                        rectangle.width, rectangle.height)
+                end
+
+                user32.DestroyWindow(hwnd)
+            end
+            return 0
+        elseif message == WM_RBUTTONUP then
+            state.cancel_reason = "selection cancelled"
+            user32.DestroyWindow(hwnd)
+            return 0
+        elseif message == WM_KEYDOWN then
+            if tonumber(wparam) == VK_ESCAPE then
+                state.cancel_reason = "selection cancelled"
+                user32.DestroyWindow(hwnd)
+                return 0
+            end
+        elseif message == WM_DESTROY then
+            state.destroyed = true
+            user32.PostQuitMessage(0)
+            return 0
+        end
+
+        return user32.DefWindowProcW(hwnd, message, wparam, lparam)
+    end
+
+    local function wnd_proc(hwnd, message, wparam, lparam)
+        local ok, result = pcall(handle_message, hwnd, message, wparam, lparam)
+        if ok then
+            return result
+        end
+
+        -- Never let a Lua error escape a Win32 callback: report it through the
+        -- normal cancellation path so the user sees why the selection ended.
+        state.cancel_reason = "selector error: " .. tostring(result)
+        if not state.destroyed then
+            user32.DestroyWindow(hwnd)
+        end
+        return 0
+    end
+
+    local class_name = utf8_to_wide("FShotRegionSelect")
+    local window_title = utf8_to_wide("fshot region select")
+    local wnd_proc_pointer = ffi.cast("WNDPROC", wnd_proc)
+
+    local window_class = ffi.new("WNDCLASSW")
+    window_class.style = 0x0003 -- CS_HREDRAW | CS_VREDRAW
+    window_class.lpfnWndProc = wnd_proc_pointer
+    window_class.hCursor = cross_cursor
+    window_class.hbrBackground = hint_brush
+    window_class.lpszClassName = class_name
+
+    local atom = user32.RegisterClassW(window_class)
+    if atom == 0 then
+        local code = tonumber(kernel32.GetLastError())
+        if code ~= ERROR_CLASS_ALREADY_EXISTS then
+            release_gdi()
+            return nil, "RegisterClassW failed: " .. win_error_message(code)
+        end
+    end
+
+    local hwnd = user32.CreateWindowExW(
+        bit.bor(WS_EX_TOPMOST, WS_EX_TOOLWINDOW, WS_EX_LAYERED),
+        class_name, window_title, WS_POPUP, bounds.x, bounds.y, width, height,
+        nil, nil, nil, nil)
+    if hwnd == nil then
+        local reason = win_error_message()
+        release_gdi()
+        return nil, "CreateWindowExW failed: " .. reason
+    end
+
+    -- Start fully transparent: paint the complete first frame while hidden from
+    -- the compositor, then reveal it in one step. Without this, the window shows
+    -- an unpainted surface for a frame before WM_PAINT runs.
+    local layered = user32.SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA) ~= 0
+
+    user32.ShowWindow(hwnd, SW_SHOW)
+    pcall(function()
+        user32.SetForegroundWindow(hwnd)
+    end)
+
+    -- Force the first composed frame while the window is still transparent.
+    user32.InvalidateRect(hwnd, nil, 0)
+    user32.UpdateWindow(hwnd)
+
+    if layered then
+        user32.SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA)
+    end
+
+    local loop_error = nil
+    local message = ffi.new("MSG")
+    while true do
+        local result = user32.GetMessageW(message, nil, 0, 0)
+        if result == 0 then
+            break
+        end
+        if result == -1 then
+            loop_error = "window message loop failed: " .. win_error_message()
+            break
+        end
+        user32.TranslateMessage(message)
+        user32.DispatchMessageW(message)
+    end
+
+    if not state.destroyed then
+        user32.DestroyWindow(hwnd)
+    end
+
+    local selection = state.selection
+    local cancel_reason = state.cancel_reason
+    release_gdi()
+
+    if not selection then
+        return nil, loop_error or cancel_reason or "selection cancelled"
+    end
+
+    return {
+        width = selection.width,
+        height = selection.height,
+        pixels = crop_bgra(frozen.pixels, width, selection),
+        x = bounds.x + selection.x,
+        y = bounds.y + selection.y,
+        source = "select",
+    }
+end
+
+--------------------------------------------------------------------------------
 -- X11 Capture
 --------------------------------------------------------------------------------
 
@@ -1222,6 +1864,14 @@ local function platform_capture_window(window)
     end
     return nil, "window capture is only implemented on Windows; "
         .. "use --region with the window geometry instead"
+end
+
+local function platform_select_region()
+    if IS_WINDOWS then
+        return win_select_region()
+    end
+    return nil, "interactive region selection is only implemented on Windows; "
+        .. "use --region X,Y,W,H instead"
 end
 
 --------------------------------------------------------------------------------
@@ -1570,6 +2220,10 @@ local function parse_options(arguments)
             options.target = "window"
             options.window_query = arguments[index]
             options.region = nil
+        elseif argument == "--select" or argument == "-s" then
+            options.target = "select"
+            options.region = nil
+            options.window_query = nil
         elseif argument == "--delay" then
             index = index + 1
             local delay = tonumber(arguments[index])
@@ -1744,6 +2398,44 @@ local function run_tests()
         check("native and pure Lua adler32 agree over 4096 bytes",
             adler32_lua(mixed, 4096) == native_adler)
     end
+
+    local forward = normalize_selection(100, 120, 299, 249)
+    check("normalize_selection handles a forward drag",
+        forward.x == 100 and forward.y == 120 and forward.width == 200
+            and forward.height == 130,
+        string.format("got %d,%d %dx%d", forward.x, forward.y,
+            forward.width, forward.height))
+
+    local reverse = normalize_selection(299, 249, 100, 120)
+    check("normalize_selection handles a reverse drag",
+        reverse.x == 100 and reverse.y == 120 and reverse.width == 200
+            and reverse.height == 130,
+        string.format("got %d,%d %dx%d", reverse.x, reverse.y,
+            reverse.width, reverse.height))
+
+    local single_pixel = normalize_selection(7, 9, 7, 9)
+    check("normalize_selection reports a single-pixel drag as 1x1",
+        single_pixel.width == 1 and single_pixel.height == 1)
+
+    local crop_source = ffi.new("uint8_t[?]", 4 * 3 * 4)
+    for row = 0, 2 do
+        for column = 0, 3 do
+            local offset = (row * 4 + column) * 4
+            crop_source[offset] = row * 10 + column
+            crop_source[offset + 1] = row * 10 + column + 1
+            crop_source[offset + 2] = row * 10 + column + 2
+            crop_source[offset + 3] = 255
+        end
+    end
+    local cropped = crop_bgra(crop_source, 4, { x = 1, y = 1, width = 2, height = 2 })
+    check("crop_bgra extracts the requested rectangle",
+        cropped[0] == 11 and cropped[1] == 12 and cropped[2] == 13
+            and cropped[4] == 12 and cropped[5] == 13 and cropped[6] == 14
+            and cropped[8] == 21 and cropped[9] == 22 and cropped[10] == 23,
+        string.format("got %d,%d,%d / %d,%d,%d / %d,%d,%d",
+            cropped[0], cropped[1], cropped[2],
+            cropped[4], cropped[5], cropped[6],
+            cropped[8], cropped[9], cropped[10]))
 
     local region, region_error = parse_region("10,20,30,40")
     check("parse_region accepts 10,20,30,40",
@@ -1958,6 +2650,10 @@ local function main(arguments)
     elseif options.target == "region" then
         image, capture_error = capture_region(options.region.x, options.region.y,
             options.region.width, options.region.height)
+    elseif options.target == "select" then
+        image, capture_error = platform_select_region()
+        -- Dragging is user time, not capture latency; time the work after release.
+        started_at = now_ms()
     else
         local bounds, bounds_error = platform_screen_bounds()
         if not bounds then
