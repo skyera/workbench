@@ -8,8 +8,9 @@
     - Interactive capture (--select) over a frozen, dimmed desktop: drag a region or
       click the highlighted window under the cursor; Esc or right-click cancels.
     - Annotation editor (--edit) with rectangle, ellipse, arrow, text, highlight,
-      pixelating redaction, and crop tools, palette, line width, undo/redo, and
-      save/copy actions.
+      pixelating redaction, crop, and move tools, palette, line width, undo/redo,
+      and save/copy actions. Move selects a shape to drag, resize, delete, or
+      nudge with the arrow keys.
     - Window capture by title or process substring (--window TEXT), or of the
       foreground window (--active-window), using PrintWindow so occluded windows are
       rendered, with a screen-blit fallback when that fails.
@@ -51,7 +52,7 @@
     --no-file            Do not write a file; requires --clip or --stdout.
     --edit               Open the annotation editor before saving (Windows only).
     --tool NAME          Annotation tool: rect, oval, arrow, text, highlight,
-                         redact, or crop.
+                         redact, crop, or move.
     --color NAME|#RRGGBB Annotation color (default red, #E53935).
     --width N            Annotation line width in image pixels (default 4).
     --no-compress        Store uncompressed deflate blocks even when zlib is available.
@@ -520,7 +521,7 @@ Configuration:
 
 Editor (--edit, Windows only):
   --tool NAME          Annotation tool: rect, oval, arrow, text, highlight,
-                       redact, or crop.
+                       redact, crop, or move.
   --color NAME|#RRGGBB Annotation color (default red, #E53935).
   --width N            Line width in image pixels (default 4).
 
@@ -530,7 +531,9 @@ Editor (--edit, Windows only):
   Enter saves and copies, and Esc discards (a second Esc confirms when shapes
   exist). Redact pixelates the region so text underneath cannot be recovered.
   Text places a label: click, type, then Enter commits it; Esc drops it. Crop
-  dims everything outside the dragged region and saves only that region.
+  dims everything outside the dragged region and saves only that region. Move
+  selects the shape under the cursor: drag it or a corner handle, press Delete
+  to remove it, or nudge it with the arrow keys (Shift for 10 px).
 
 Other:
   -h, --help           Show this help message.
@@ -2140,6 +2143,7 @@ local EDITOR_TOOLS = {
     { id = "highlight", label = "Mark", width = 46 },
     { id = "redact", label = "Redact", width = 54 },
     { id = "crop", label = "Crop", width = 44 },
+    { id = "move", label = "Move", width = 46 },
 }
 
 local EDITOR_TOOL_IDS = {}
@@ -2265,6 +2269,142 @@ function editor_support.crop_pixels(pixels, width, height, left, top,
     return cropped
 end
 
+-- Bounds used for hit testing. Labels are measured approximately because the
+-- exact GDI extent only exists while a device context is around.
+function editor_support.hit_box(annotation)
+    if annotation.tool == "text" then
+        local height = editor_support.text_height(annotation.line_width or 4)
+        local columns = math.max(2, #(annotation.text or ""))
+        return annotation.x1, annotation.y1,
+            annotation.x1 + math.floor(columns * height * 0.6),
+            annotation.y1 + height
+    end
+    return annotation_bounds(annotation)
+end
+
+function editor_support.contains(annotation, x, y, tolerance)
+    local left, top, right, bottom = editor_support.hit_box(annotation)
+    return x >= left - tolerance and x <= right + tolerance
+        and y >= top - tolerance and y <= bottom + tolerance
+end
+
+-- Handles only exist for box tools; arrows and labels are moved, not resized.
+function editor_support.handle_at(annotation, x, y, tolerance)
+    if annotation.tool == "text" or annotation.tool == "arrow" then
+        return nil
+    end
+
+    local left, top, right, bottom = annotation_bounds(annotation)
+    local corners = {
+        { "nw", left, top },
+        { "ne", right, top },
+        { "sw", left, bottom },
+        { "se", right, bottom },
+    }
+    for _, corner in ipairs(corners) do
+        if math.abs(x - corner[2]) <= tolerance and math.abs(y - corner[3]) <= tolerance then
+            return corner[1]
+        end
+    end
+    return nil
+end
+
+function editor_support.hit_test(annotations, x, y, tolerance)
+    for index = #annotations, 1, -1 do
+        local annotation = annotations[index]
+        local handle = editor_support.handle_at(annotation, x, y, tolerance)
+        if handle ~= nil then
+            return annotation, handle
+        end
+        if editor_support.contains(annotation, x, y, tolerance) then
+            return annotation, nil
+        end
+    end
+    return nil, nil
+end
+
+-- Clamp a translation so the shape stays inside the image; labels only have an
+-- anchor to keep in bounds.
+function editor_support.translate(annotation, dx, dy, width, height)
+    if annotation.tool == "text" then
+        local next_x = math.max(0, math.min(width, annotation.x1 + dx))
+        local next_y = math.max(0, math.min(height, annotation.y1 + dy))
+        if next_x == annotation.x1 and next_y == annotation.y1 then
+            return false
+        end
+        annotation.x1, annotation.y1 = next_x, next_y
+        return true
+    end
+
+    local left, top, right, bottom = annotation_bounds(annotation)
+    if right - left <= width then
+        if left + dx < 0 then
+            dx = -left
+        elseif right + dx > width then
+            dx = width - right
+        end
+    end
+    if bottom - top <= height then
+        if top + dy < 0 then
+            dy = -top
+        elseif bottom + dy > height then
+            dy = height - bottom
+        end
+    end
+    if dx == 0 and dy == 0 then
+        return false
+    end
+
+    annotation.x1 = annotation.x1 + dx
+    annotation.y1 = annotation.y1 + dy
+    annotation.x2 = annotation.x2 + dx
+    annotation.y2 = annotation.y2 + dy
+    return true
+end
+
+-- Resize from one corner. The opposite edges stay put and the box never gets
+-- smaller than two pixels, so a handle can be dragged past its neighbor.
+function editor_support.resize(annotation, corner, x, y, width, height)
+    local left, top, right, bottom = annotation_bounds(annotation)
+    x = math.max(0, math.min(width, x))
+    y = math.max(0, math.min(height, y))
+
+    if corner == "nw" then
+        left, top = x, y
+    elseif corner == "ne" then
+        right, top = x, y
+    elseif corner == "sw" then
+        left, bottom = x, y
+    else
+        right, bottom = x, y
+    end
+
+    if right - left < 2 then
+        if corner == "nw" or corner == "sw" then
+            left = math.max(0, right - 2)
+        else
+            right = math.min(width, left + 2)
+        end
+    end
+    if bottom - top < 2 then
+        if corner == "nw" or corner == "ne" then
+            top = math.max(0, bottom - 2)
+        else
+            bottom = math.min(height, top + 2)
+        end
+    end
+
+    if left == math.min(annotation.x1, annotation.x2)
+        and top == math.min(annotation.y1, annotation.y2)
+        and right == math.max(annotation.x1, annotation.x2)
+        and bottom == math.max(annotation.y1, annotation.y2) then
+        return false
+    end
+
+    annotation.x1, annotation.y1, annotation.x2, annotation.y2 = left, top, right, bottom
+    return true
+end
+
 -- Endpoints of the two barbs for an arrow whose tip is (x2, y2).
 local function arrow_head_points(x1, y1, x2, y2, head_length)
     local delta_x = x2 - x1
@@ -2363,6 +2503,15 @@ local EDITOR_KEYS = {
     DT_SINGLELINE = DT_SINGLELINE,
     DT_NOCLIP = 0x00000100,
     DT_END_ELLIPSIS = DT_END_ELLIPSIS,
+    VK_DELETE = 0x2E,
+    VK_LEFT = 0x25,
+    VK_UP = 0x26,
+    VK_RIGHT = 0x27,
+    VK_DOWN = 0x28,
+    VK_SHIFT = 0x10,
+    IDC_SIZEALL = 32646,
+    IDC_SIZENWSE = 32642,
+    IDC_SIZENESW = 32643,
 }
 
 local COLOR_NAMES = {
@@ -2722,6 +2871,9 @@ local function win_edit_image(image, options)
         width_index = width_index,
         width_px = options.editor_width,
         text_edit = nil,
+        selection = nil,
+        hover = nil,
+        gesture = nil,
         discard_armed = false,
         status = string.format(
             "%s  %s  %d px   |   drag to draw   |   T tool   |   Ctrl+Z undo   |   Enter save+copy   |   Esc discard",
@@ -2770,6 +2922,10 @@ local function win_edit_image(image, options)
         end
         table.insert(state.redo_stack, copy_annotations())
         state.annotations = table.remove(state.undo_stack)
+        -- Undo replaces the annotation tables, so any selection would dangle.
+        state.selection = nil
+        state.hover = nil
+        state.gesture = nil
         set_status(string.format("Undo  (%d shape%s)", #state.annotations,
             #state.annotations == 1 and "" or "s"))
     end
@@ -2781,6 +2937,9 @@ local function win_edit_image(image, options)
         end
         table.insert(state.undo_stack, copy_annotations())
         state.annotations = table.remove(state.redo_stack)
+        state.selection = nil
+        state.hover = nil
+        state.gesture = nil
         set_status(string.format("Redo  (%d shape%s)", #state.annotations,
             #state.annotations == 1 and "" or "s"))
     end
@@ -2798,6 +2957,10 @@ local function win_edit_image(image, options)
         end
 
         state.tool = tool_id
+        state.hover = nil
+        if tool_id ~= "move" then
+            state.gesture = nil
+        end
         set_status(string.format("Tool  %s", tool_label(tool_id)))
     end
 
@@ -3135,6 +3298,172 @@ local function win_edit_image(image, options)
         gdi32.DeleteObject(pen)
     end
 
+    -- Selection, moving, resizing, and deletion for the Move tool. Grouped in one
+    -- table to stay clear of the window procedure's upvalue budget.
+    local move_tool = {}
+
+    function move_tool.tolerance()
+        return math.max(2, 5 / math.max(state.scale, 0.05))
+    end
+
+    function move_tool.reset()
+        state.selection = nil
+        state.hover = nil
+        state.gesture = nil
+    end
+
+    function move_tool.hit(x, y)
+        return editor_support.hit_test(state.annotations, x, y, move_tool.tolerance())
+    end
+
+    function move_tool.begin(x, y)
+        local annotation, handle = move_tool.hit(x, y)
+        if annotation == nil then
+            state.selection = nil
+            set_status("Move  click a shape to select it")
+            return false
+        end
+
+        state.selection = annotation
+        state.gesture = {
+            annotation = annotation,
+            handle = handle,
+            start_x = x,
+            start_y = y,
+            origin = {
+                x1 = annotation.x1,
+                y1 = annotation.y1,
+                x2 = annotation.x2,
+                y2 = annotation.y2,
+            },
+            snapshot = copy_annotations(),
+            changed = false,
+        }
+        set_status(string.format(
+            "%s  |  drag to move  |  Delete removes  |  arrows nudge",
+            tool_label(annotation.tool)))
+        return true
+    end
+
+    function move_tool.update(x, y)
+        local gesture = state.gesture
+        if gesture == nil then
+            return false
+        end
+
+        local annotation = gesture.annotation
+        local changed
+        if gesture.handle ~= nil then
+            changed = editor_support.resize(annotation, gesture.handle, x, y,
+                image_width, image_height)
+        else
+            annotation.x1, annotation.y1 = gesture.origin.x1, gesture.origin.y1
+            annotation.x2, annotation.y2 = gesture.origin.x2, gesture.origin.y2
+            changed = editor_support.translate(annotation, x - gesture.start_x,
+                y - gesture.start_y, image_width, image_height)
+        end
+
+        gesture.changed = gesture.changed or changed
+        return changed
+    end
+
+    function move_tool.finish()
+        local gesture = state.gesture
+        if gesture == nil then
+            return
+        end
+
+        state.gesture = nil
+        if gesture.changed then
+            table.insert(state.undo_stack, gesture.snapshot)
+            state.redo_stack = {}
+            set_status(string.format("%s  updated  |  Ctrl+Z undoes",
+                tool_label(gesture.annotation.tool)))
+        end
+    end
+
+    function move_tool.delete()
+        local selected = state.selection
+        if selected == nil then
+            set_status("Nothing selected; click a shape with the Move tool first", true)
+            return
+        end
+
+        for index, annotation in ipairs(state.annotations) do
+            if annotation == selected then
+                table.insert(state.undo_stack, copy_annotations())
+                state.redo_stack = {}
+                table.remove(state.annotations, index)
+                move_tool.reset()
+                set_status(string.format("Deleted %s  |  Ctrl+Z restores it",
+                    tool_label(selected.tool)))
+                return
+            end
+        end
+
+        move_tool.reset()
+    end
+
+    function move_tool.nudge(dx, dy)
+        local selected = state.selection
+        if selected == nil then
+            set_status("Nothing selected; click a shape with the Move tool first", true)
+            return
+        end
+
+        table.insert(state.undo_stack, copy_annotations())
+        state.redo_stack = {}
+        if editor_support.translate(selected, dx, dy, image_width, image_height) then
+            set_status(string.format("%s  nudged %d,%d", tool_label(selected.tool), dx, dy))
+        end
+    end
+
+    function move_tool.draw_frame(dc, annotation, with_handles)
+        local left, top, right, bottom = editor_support.hit_box(annotation)
+        local screen_left = math.floor(state.ox + left * state.scale + 0.5)
+        local screen_top = math.floor(state.oy + top * state.scale + 0.5)
+        local screen_right = math.floor(state.ox + right * state.scale + 0.5)
+        local screen_bottom = math.floor(state.oy + bottom * state.scale + 0.5)
+
+        local frame = ffi.new("RECT")
+        frame.left = screen_left - 1
+        frame.top = screen_top - 1
+        frame.right = screen_right + 1
+        frame.bottom = screen_bottom + 1
+        user32.FrameRect(dc, frame, ring_brush)
+
+        if not with_handles or annotation.tool == "text" or annotation.tool == "arrow" then
+            return
+        end
+
+        local handle_size = math.max(4, math.floor(5 * ui))
+        local points = {
+            { screen_left, screen_top },
+            { screen_right, screen_top },
+            { screen_left, screen_bottom },
+            { screen_right, screen_bottom },
+        }
+        for _, point in ipairs(points) do
+            local handle = ffi.new("RECT")
+            handle.left = point[1] - math.floor(handle_size / 2)
+            handle.top = point[2] - math.floor(handle_size / 2)
+            handle.right = handle.left + handle_size
+            handle.bottom = handle.top + handle_size
+            user32.FillRect(dc, handle, ring_brush)
+        end
+    end
+
+    function move_tool.draw(dc)
+        local selected = state.selection
+        local hovered = state.hover
+        if hovered ~= nil and hovered ~= selected then
+            move_tool.draw_frame(dc, hovered, false)
+        end
+        if selected ~= nil then
+            move_tool.draw_frame(dc, selected, true)
+        end
+    end
+
     local function update_layout()
         local client_width = math.max(1, state.client_width)
         local client_height = math.max(1, state.client_height)
@@ -3310,6 +3639,10 @@ local function win_edit_image(image, options)
                 color = state.text_edit.color,
                 line_width = state.text_edit.line_width,
             }, state.ox, state.oy, state.scale, "|")
+        end
+
+        if state.tool == "move" then
+            move_tool.draw(dc)
         end
 
         draw_toolbar(dc)
@@ -3619,6 +3952,35 @@ local function win_edit_image(image, options)
     -- the pointer with SetCursor(NULL).
     local cross_cursor = user32.LoadCursorW(nil, ffi.cast("const wchar_t*", IDC_CROSS))
     local arrow_cursor = user32.LoadCursorW(nil, ffi.cast("const wchar_t*", IDC_ARROW))
+    local size_all_cursor = user32.LoadCursorW(nil,
+        ffi.cast("const wchar_t*", EDITOR_KEYS.IDC_SIZEALL))
+    local nwse_cursor = user32.LoadCursorW(nil,
+        ffi.cast("const wchar_t*", EDITOR_KEYS.IDC_SIZENWSE))
+    local nesw_cursor = user32.LoadCursorW(nil,
+        ffi.cast("const wchar_t*", EDITOR_KEYS.IDC_SIZENESW))
+
+    -- The Move tool previews what a press would grab: handles first, then body.
+    local function cursor_for(x, y)
+        if not over_image(x, y) then
+            return arrow_cursor
+        end
+        if state.tool ~= "move" then
+            return cross_cursor
+        end
+
+        local image_x, image_y = client_to_image(x, y)
+        local annotation, handle = move_tool.hit(image_x, image_y)
+        if handle == "nw" or handle == "se" then
+            return nwse_cursor
+        end
+        if handle == "ne" or handle == "sw" then
+            return nesw_cursor
+        end
+        if annotation ~= nil then
+            return size_all_cursor
+        end
+        return arrow_cursor
+    end
 
     local function handle_message(message_hwnd, message, wparam, lparam)
         if message == EDITOR_KEYS.WM_PAINT then
@@ -3637,8 +3999,7 @@ local function win_edit_image(image, options)
             end
             return 0
         elseif message == EDITOR_KEYS.WM_SETCURSOR then
-            local cursor = over_image(state.last_x, state.last_y)
-            user32.SetCursor(cursor and cross_cursor or arrow_cursor)
+            user32.SetCursor(cursor_for(state.last_x, state.last_y))
             return 1
         elseif message == EDITOR_KEYS.WM_LBUTTONDOWN then
             local x = mouse_x(lparam)
@@ -3652,6 +4013,16 @@ local function win_edit_image(image, options)
                 return 0
             end
             if not over_image(x, y) then
+                return 0
+            end
+
+            if state.tool == "move" then
+                state.discard_armed = false
+                local image_x, image_y = client_to_image(x, y)
+                if move_tool.begin(image_x, image_y) then
+                    user32.SetCapture(message_hwnd)
+                end
+                user32.InvalidateRect(message_hwnd, nil, 0)
                 return 0
             end
 
@@ -3674,13 +4045,27 @@ local function win_edit_image(image, options)
             local x = mouse_x(lparam)
             local y = mouse_y(lparam)
             state.last_x, state.last_y = x, y
-            if state.dragging then
+            if state.gesture ~= nil then
+                local image_x, image_y = client_to_image(x, y)
+                if move_tool.update(image_x, image_y) then
+                    user32.InvalidateRect(message_hwnd, nil, 0)
+                end
+                user32.SetCursor(cursor_for(x, y))
+            elseif state.dragging then
                 user32.SetCursor(cross_cursor)
                 local next_x, next_y = client_to_image(x, y)
                 if next_x ~= state.current_x or next_y ~= state.current_y then
                     state.current_x, state.current_y = next_x, next_y
                     user32.InvalidateRect(message_hwnd, nil, 0)
                 end
+            elseif state.tool == "move" then
+                local image_x, image_y = client_to_image(x, y)
+                local annotation = move_tool.hit(image_x, image_y)
+                if annotation ~= state.hover then
+                    state.hover = annotation
+                    user32.InvalidateRect(message_hwnd, nil, 0)
+                end
+                user32.SetCursor(cursor_for(x, y))
             elseif over_image(x, y) then
                 user32.SetCursor(cross_cursor)
             else
@@ -3688,6 +4073,15 @@ local function win_edit_image(image, options)
             end
             return 0
         elseif message == EDITOR_KEYS.WM_LBUTTONUP then
+            if state.gesture ~= nil then
+                local image_x, image_y = client_to_image(mouse_x(lparam), mouse_y(lparam))
+                move_tool.update(image_x, image_y)
+                move_tool.finish()
+                user32.ReleaseCapture()
+                user32.InvalidateRect(message_hwnd, nil, 0)
+                return 0
+            end
+
             if state.dragging then
                 state.dragging = false
                 user32.ReleaseCapture()
@@ -3791,6 +4185,23 @@ local function win_edit_image(image, options)
                 set_tool("rect")
             elseif key == EDITOR_KEYS.VK_E then
                 set_tool("ellipse")
+            elseif key == EDITOR_KEYS.VK_DELETE then
+                move_tool.delete()
+            elseif key == EDITOR_KEYS.VK_LEFT or key == EDITOR_KEYS.VK_RIGHT
+                or key == EDITOR_KEYS.VK_UP or key == EDITOR_KEYS.VK_DOWN then
+                local shift = bit.band(user32.GetKeyState(EDITOR_KEYS.VK_SHIFT), 0x8000) ~= 0
+                local step = shift and 10 or 1
+                local dx, dy = 0, 0
+                if key == EDITOR_KEYS.VK_LEFT then
+                    dx = -step
+                elseif key == EDITOR_KEYS.VK_RIGHT then
+                    dx = step
+                elseif key == EDITOR_KEYS.VK_UP then
+                    dy = -step
+                else
+                    dy = step
+                end
+                move_tool.nudge(dx, dy)
             end
 
             user32.InvalidateRect(message_hwnd, nil, 0)
@@ -5285,14 +5696,15 @@ local function run_tests()
                 ~= nil,
         tostring(unknown_tool_error))
 
-    for _, tool_id in ipairs({ "ellipse", "text", "crop" }) do
+    for _, tool_id in ipairs({ "ellipse", "text", "crop", "move" }) do
         local tool_options, tool_error = parse_options({ "--tool", tool_id }, {})
         check(string.format("parse_options accepts --tool %s", tool_id),
             tool_options ~= nil and tool_options.tool == tool_id, tool_error)
     end
 
     check("tool_names lists every toolbar tool in order",
-        editor_support.tool_names() == "rect, ellipse, arrow, text, highlight, redact, crop",
+        editor_support.tool_names()
+            == "rect, ellipse, arrow, text, highlight, redact, crop, move",
         editor_support.tool_names())
 
     check("text_height scales with the line width and clamps",
@@ -5352,6 +5764,86 @@ local function run_tests()
         check("crop_pixels rejects a region outside the image",
             outside == nil and tostring(outside_error):find("outside", 1, true) ~= nil,
             tostring(outside_error))
+    end
+
+    do
+        local first = { tool = "rect", x1 = 0, y1 = 0, x2 = 10, y2 = 10 }
+        local second = { tool = "ellipse", x1 = 5, y1 = 5, x2 = 20, y2 = 20 }
+        local annotations = { first, second }
+
+        local topmost = editor_support.hit_test(annotations, 7, 7, 0)
+        check("hit_test prefers the topmost shape", topmost == second,
+            tostring(topmost and topmost.tool))
+
+        local miss, miss_handle = editor_support.hit_test(annotations, 50, 50, 0)
+        check("hit_test finds nothing outside every shape",
+            miss == nil and miss_handle == nil)
+
+        local corner_hit, corner_handle = editor_support.hit_test(annotations, 20, 20, 2)
+        check("hit_test grabs a corner handle before the body",
+            corner_hit == second and corner_handle == "se",
+            tostring(corner_handle))
+
+        check("handle_at reports each corner",
+            editor_support.handle_at(first, 0, 0, 1) == "nw"
+                and editor_support.handle_at(first, 10, 0, 1) == "ne"
+                and editor_support.handle_at(first, 0, 10, 1) == "sw"
+                and editor_support.handle_at(first, 10, 10, 1) == "se")
+
+        check("handle_at ignores arrows and labels",
+            editor_support.handle_at(
+                { tool = "arrow", x1 = 0, y1 = 0, x2 = 10, y2 = 10 }, 10, 10, 2) == nil
+                and editor_support.handle_at(
+                    { tool = "text", x1 = 3, y1 = 3, x2 = 3, y2 = 3, text = "hi",
+                      line_width = 4 }, 3, 3, 2) == nil)
+
+        local label_left, label_top, label_right, label_bottom =
+            editor_support.hit_box({ tool = "text", x1 = 3, y1 = 3, x2 = 3, y2 = 3,
+                text = "hi", line_width = 4 })
+        check("hit_box covers a label height for its text",
+            label_left == 3 and label_top == 3
+                and label_right > label_left and label_bottom - label_top == 20,
+            string.format("%d,%d %d,%d", label_left, label_top, label_right,
+                label_bottom))
+    end
+
+    do
+        local shape = { tool = "rect", x1 = 10, y1 = 10, x2 = 30, y2 = 20 }
+        local moved = editor_support.translate(shape, 5, 5, 100, 100)
+        check("translate moves both corners",
+            moved and shape.x1 == 15 and shape.y1 == 15 and shape.x2 == 35
+                and shape.y2 == 25,
+            string.format("%d,%d %d,%d", shape.x1, shape.y1, shape.x2, shape.y2))
+
+        local clamped = editor_support.translate(shape, -100, 0, 100, 100)
+        check("translate clamps at the image edge",
+            clamped and shape.x1 == 0 and shape.x2 == 20,
+            string.format("%d..%d", shape.x1, shape.x2))
+
+        check("translate reports no change when already clamped",
+            editor_support.translate(shape, -5, 0, 100, 100) == false)
+
+        local label = { tool = "text", x1 = 10, y1 = 10, x2 = 10, y2 = 10,
+            text = "note", line_width = 4 }
+        editor_support.translate(label, 4, 4, 50, 50)
+        check("translate moves only the label anchor",
+            label.x1 == 14 and label.y1 == 14 and label.x2 == 10 and label.y2 == 10,
+            string.format("%d,%d %d,%d", label.x1, label.y1, label.x2, label.y2))
+    end
+
+    do
+        local shape = { tool = "rect", x1 = 10, y1 = 10, x2 = 30, y2 = 30 }
+        local resized = editor_support.resize(shape, "nw", 0, 0, 100, 100)
+        check("resize drags the grabbed corner",
+            resized and shape.x1 == 0 and shape.y1 == 0 and shape.x2 == 30
+                and shape.y2 == 30,
+            string.format("%d,%d %d,%d", shape.x1, shape.y1, shape.x2, shape.y2))
+
+        local shrunk = editor_support.resize(shape, "se", 1, 1, 100, 100)
+        local width = math.abs(shape.x2 - shape.x1)
+        local height = math.abs(shape.y2 - shape.y1)
+        check("resize enforces a two-pixel minimum", shrunk and width == 2 and height == 2,
+            string.format("%d,%d %d,%d", shape.x1, shape.y1, shape.x2, shape.y2))
     end
 
     if IS_WINDOWS then
