@@ -990,27 +990,49 @@ end
 
 local function encode_png(image, allow_compression)
     if allow_compression and zlib then
-        -- Per-row filtering helps gradients and photographs but can lose to
-        -- unfiltered flat UI, so encode both and keep the smaller stream.
+        -- Per-row filtering wins on gradients and photographs but can lose to
+        -- unfiltered flat UI, so the stream is chosen by measurement. Ranking
+        -- a few row slices at the cheapest zlib level keeps that choice without
+        -- compressing both full streams, which doubled 4K encode time.
+        local function sample_size(scanlines, offset, size)
+            local bound = tonumber(zlib.compressBound(size))
+            local output = ffi.new("uint8_t[?]", bound)
+            local output_size = ffi.new("uLongf[1]", bound)
+            local source = ffi.cast("const uint8_t*", scanlines) + offset
+            if zlib.compress2(output, output_size, source, size, 1) ~= 0 then
+                return 0
+            end
+            return tonumber(output_size[0])
+        end
+
         local unfiltered = build_scanlines(image.width, image.height, image.pixels,
             PNG_FILTER_NONE)
         local adaptive = build_scanlines(image.width, image.height, image.pixels, "auto")
 
-        local unfiltered_idat, unfiltered_size = compress_with_zlib(unfiltered,
-            ffi.sizeof(unfiltered))
-        if not unfiltered_idat then
-            return nil, unfiltered_size
+        local sample_rows = math.min(32, image.height)
+        local row_size = image.width * 3 + 1
+        local sample_bytes = sample_rows * row_size
+        local unfiltered_total = 0
+        local adaptive_total = 0
+        for slice = 0, 2 do
+            local start_row = math.floor((image.height - sample_rows) * slice / 2)
+            local offset = start_row * row_size
+            unfiltered_total = unfiltered_total
+                + sample_size(unfiltered, offset, sample_bytes)
+            adaptive_total = adaptive_total
+                + sample_size(adaptive, offset, sample_bytes)
         end
 
-        local adaptive_idat, adaptive_size = compress_with_zlib(adaptive, ffi.sizeof(adaptive))
-        if not adaptive_idat then
-            return nil, adaptive_size
+        local chosen = unfiltered
+        if adaptive_total < unfiltered_total then
+            chosen = adaptive
         end
 
-        if adaptive_size < unfiltered_size then
-            return assemble_png(image, adaptive_idat, adaptive_size, true)
+        local idat, idat_size = compress_with_zlib(chosen, ffi.sizeof(chosen))
+        if not idat then
+            return nil, idat_size
         end
-        return assemble_png(image, unfiltered_idat, unfiltered_size, true)
+        return assemble_png(image, idat, idat_size, true)
     end
 
     local raw = build_scanlines(image.width, image.height, image.pixels, PNG_FILTER_NONE)
@@ -6571,6 +6593,66 @@ local function run_tests()
                 check("zlib IDAT decompresses to the expected size",
                     compressed_raw ~= nil, compressed_raw_error)
             end
+
+            -- The filter chooser measures slices, so both outcomes have to
+            -- decode back to the source: flat UI picks unfiltered, gradients
+            -- usually pick the adaptive stream.
+            local function round_trip(fill)
+                local width = 64
+                local height = 48
+                -- Source images are 32-bit BGRA, like a Windows DIB.
+                local sample = {
+                    width = width,
+                    height = height,
+                    pixels = ffi.new("uint8_t[?]", width * height * 4),
+                }
+                for index = 0, width * height - 1 do
+                    local r, g, b = fill(index)
+                    local offset = index * 4
+                    sample.pixels[offset] = b
+                    sample.pixels[offset + 1] = g
+                    sample.pixels[offset + 2] = r
+                    sample.pixels[offset + 3] = 255
+                end
+
+                local png, size = encode_png(sample, true)
+                local info, info_error = inspect_png(png or ffi.new("uint8_t[1]"), size or 0)
+                if not info then
+                    return false, info_error
+                end
+
+                local raw_pixels, raw_error = inflate_with_zlib(info.idat, info.idat_size,
+                    height * (1 + width * 3))
+                if not raw_pixels then
+                    return false, raw_error
+                end
+
+                local decoded, decode_error = decode_scanlines(raw_pixels, width, height)
+                if not decoded then
+                    return false, decode_error
+                end
+
+                for index = 1, #decoded do
+                    local r, g, b = fill(index - 1)
+                    local actual = decoded[index]
+                    if actual.r ~= r or actual.g ~= g or actual.b ~= b then
+                        return false, string.format("pixel %d is %d,%d,%d expected %d,%d,%d",
+                            index - 1, actual.r, actual.g, actual.b, r, g, b)
+                    end
+                end
+                return true
+            end
+
+            check("flat image round-trips through the filter chooser",
+                round_trip(function()
+                    return 40, 44, 52
+                end))
+            check("gradient image round-trips through the filter chooser",
+                round_trip(function(index)
+                    local x = index % 64
+                    local y = math.floor(index / 64)
+                    return (x * 4) % 256, (y * 4) % 256, (x + y) % 256
+                end))
         else
             skip("zlib-compressed PNG", "no zlib library found; stored blocks used instead")
         end
