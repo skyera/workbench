@@ -9,16 +9,21 @@
       size readout; Esc or right-click cancels (Windows only).
     - Annotation editor (--edit) that opens the capture with a rectangle tool, palette,
       line width, undo/redo, and save/copy actions (Windows only).
-    - Window capture by title or process substring (--window TEXT), using PrintWindow
-      so occluded windows are rendered, with a screen-blit fallback when that fails.
+    - Window capture by title or process substring (--window TEXT), or of the
+      foreground window (--active-window), using PrintWindow so occluded windows are
+      rendered, with a screen-blit fallback when that fails.
     - PNG encoding in-process: zlib when a zlib library is available, otherwise valid
       stored-deflate blocks, so there is never an external dependency.
     - Optional clipboard copy: native CF_DIB + "PNG" formats on Windows; wl-copy or
-      xclip on Linux when installed.
+      xclip on Linux when installed. --clip-path copies the saved path, or a
+      percent-encoded markdown image link, as Unicode text instead.
+    - Configurable output directory and filename template via
+      ~/.config/fshot/config.lua; FSHOT_DIR and --out override it.
     - Built-in self-test suite (--test) that validates the PNG encoder without a display.
 
   Usage:
-    fshot [--full | --region X,Y,W,H | --window TEXT | --select] [options]
+    fshot [--full | --region X,Y,W,H | --window TEXT | --active-window | --select]
+          [options]
     fshot --list-windows
     fshot --test
 
@@ -27,11 +32,15 @@
     --region X,Y,W,H     Capture a rectangle in physical pixels.
     --window TEXT        Capture the best visible window matching TEXT by title or
                          process name (Windows only).
+    --active-window, -a  Capture the foreground window (Windows only).
     --list-windows       Print visible top-level windows and exit (Windows only).
     --delay MS           Wait MS milliseconds before capturing (to open menus).
-    --out PATH           Output file (default: shot-YYYYmmdd-HHMMSS.png); a path ending
-                         in a separator writes the default name inside that directory.
+    --out PATH           Output file (default: shot-YYYYmmdd-HHMMSS.png inside the
+                         configured directory); a path ending in a separator writes
+                         the default name inside that directory.
     --clip               Also copy the image to the system clipboard.
+    --clip-path [MODE]   Also copy the saved path as text (plain), or as a
+                         percent-encoded markdown image link (md).
     --no-clip            In --edit, do not copy on Enter or Save.
     --no-file            Do not write a file; requires --clip.
     --edit               Open the annotation editor before saving (Windows only).
@@ -44,7 +53,7 @@
 
   Exit codes:
     0  Success
-    1  Capture, encode, write, or clipboard failure
+    1  Capture, config, encode, write, or clipboard failure
     2  Usage error
 
   Platform notes:
@@ -156,6 +165,10 @@ if IS_WINDOWS then
         BOOL EnumWindows(WNDENUMPROC lpEnumFunc, LPARAM lParam);
         BOOL SetProcessDPIAware(void);
         BOOL SetProcessDpiAwarenessContext(void* value);
+        HWND GetForegroundWindow(void);
+        DWORD GetFullPathNameW(const wchar_t* lpFileName, DWORD nBufferLength,
+                               wchar_t* lpBuffer, wchar_t** lpFilePart);
+        BOOL CreateDirectoryW(const wchar_t* lpPathName, void* lpSecurityAttributes);
 
         BOOL OpenClipboard(HWND hWndNewOwner);
         BOOL CloseClipboard(void);
@@ -331,6 +344,9 @@ else
         };
         int clock_gettime(int clock_id, struct timespec* tp);
         int usleep(unsigned int usec);
+        char* getcwd(char* buffer, size_t size);
+        int mkdir(const char* pathname, unsigned int mode);
+        char* strerror(int errnum);
     ]]
 end
 
@@ -368,7 +384,10 @@ local BI_RGB = 0
 local PW_RENDERFULLCONTENT = 2
 local DWMWA_EXTENDED_FRAME_BOUNDS = 9
 local CF_DIB = 8
+local CF_UNICODETEXT = 13
 local GMEM_MOVEABLE = 0x0002
+local ERROR_ALREADY_EXISTS = 183
+local EEXIST = 17
 local PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 local FORMAT_MESSAGE_FROM_SYSTEM = 0x00001000
 local CP_UTF8 = 65001
@@ -435,7 +454,7 @@ local DEFLATE_BLOCK_MAX = 65535
 
 local USAGE = [[
 Usage:
-  fshot [--full | --region X,Y,W,H | --window TEXT | --select] [options]
+  fshot [--full | --region X,Y,W,H | --window TEXT | --active-window | --select] [options]
   fshot --list-windows
   fshot --test
 
@@ -443,6 +462,7 @@ Capture:
   --full               Capture the whole virtual desktop (default).
   --region X,Y,W,H     Capture a rectangle in physical pixels (negative origins allowed).
   --window TEXT        Capture the best visible window matching TEXT (Windows only).
+  --active-window, -a  Capture the foreground window (Windows only).
   --select, -s         Drag a rectangle to capture it (Windows only).
   --list-windows       List visible top-level windows (Windows only).
   --delay MS           Wait before capturing, so menus can be opened.
@@ -450,10 +470,20 @@ Capture:
 Output:
   --out PATH           Output file, or a directory ending in / or \.
   --clip               Also copy the image to the system clipboard.
+  --clip-path [MODE]   Also copy the saved path as text; MODE is plain (default)
+                       or md for a percent-encoded markdown image link.
   --no-clip            In --edit, do not copy on Enter or Save.
   --no-file            Do not write a file; requires --clip.
   --no-compress        Use stored deflate blocks instead of zlib compression.
   --json               Print a machine-readable summary.
+
+Configuration:
+  ~/.config/fshot/config.lua may return a table with:
+    output_dir  default directory for new captures
+    filename    os.date format for the file stem (no path separators)
+  FSHOT_DIR overrides output_dir. Without any configuration, captures are
+  written to ~/Pictures/shots (created on demand); use --out . to save into
+  the current directory.
 
 Editor (--edit, Windows only):
   --tool rect          Annotation tool; phase 1 supports rectangles only.
@@ -473,9 +503,11 @@ Examples:
   fshot
   fshot --region 0,0,1280,720 --out tmp/shot.png
   fshot --window firefox --clip
+  fshot --active-window --clip-path
   fshot --select --clip
   fshot --select --edit
   fshot --delay 1500 --window "Save As"
+  fshot --out . --clip          # keep the old current-directory behavior
 ]]
 
 --------------------------------------------------------------------------------
@@ -584,6 +616,76 @@ local function utf8_to_wide(text)
     kernel32.MultiByteToWideChar(CP_UTF8, 0, text, #text, buffer, length)
     buffer[length] = 0
     return buffer
+end
+
+local function home_directory()
+    return os.getenv("HOME") or os.getenv("USERPROFILE") or "."
+end
+
+local function join_path(directory, name)
+    if directory == "" then
+        return name
+    end
+
+    -- Keep Windows paths looking native; elsewhere a forward slash is correct.
+    local separator = IS_WINDOWS and "\\" or "/"
+
+    local base = directory:gsub("[/\\]+$", "")
+    if IS_WINDOWS then
+        base = base:gsub("/", "\\")
+    end
+
+    return base .. separator .. name:gsub("[/\\]", separator)
+end
+
+-- Percent-encode the characters that would break a markdown link target.
+local function escape_markdown_target(path)
+    local normalized = path:gsub("\\", "/")
+    normalized = normalized:gsub("([%%%s%(%)])", function(character)
+        return string.format("%%%02X", character:byte())
+    end)
+    return "![](" .. normalized .. ")"
+end
+
+local function absolute_path(path)
+    if path == "" then
+        return path
+    end
+
+    if IS_WINDOWS then
+        local wide_path = utf8_to_wide(path)
+        if not wide_path then
+            return path
+        end
+
+        local capacity = 32768 -- Win32 extended-path limit.
+        local buffer = ffi.new("wchar_t[?]", capacity)
+        local length = kernel32.GetFullPathNameW(wide_path, capacity, buffer, nil)
+        if length == 0 or length >= capacity then
+            return path
+        end
+        return wide_to_utf8(buffer)
+    end
+
+    if path:sub(1, 1) == "/" then
+        return path
+    end
+
+    local buffer = ffi.new("char[?]", 4096)
+    if ffi.C.getcwd(buffer, 4096) == nil then
+        return path
+    end
+
+    return ffi.string(buffer) .. "/" .. path
+end
+
+local function format_clip_path(path, mode)
+    local absolute = absolute_path(path)
+    if mode == "md" then
+        return escape_markdown_target(absolute)
+    end
+
+    return absolute
 end
 
 --------------------------------------------------------------------------------
@@ -1205,6 +1307,36 @@ local function win_capture_window(window)
     }
 end
 
+-- Build the same window record win_capture_window() consumes, but for whatever
+-- window currently owns the foreground. Capture itself resolves the frame and
+-- handles minimized or unrenderable windows with its usual diagnostics.
+local function win_active_window()
+    local handle = user32.GetForegroundWindow()
+    if handle == nil then
+        return nil, "no foreground window: the desktop or a secure screen has focus"
+    end
+
+    local title_length = user32.GetWindowTextLengthW(handle)
+    local title_buffer = ffi.new("wchar_t[?]", title_length + 1)
+    if title_length > 0 then
+        user32.GetWindowTextW(handle, title_buffer, title_length + 1)
+    end
+
+    local title = wide_to_utf8(title_buffer)
+    if title == "" then
+        title = "(untitled window)"
+    end
+
+    return {
+        handle = handle,
+        id = string.format("0x%X", tonumber(ffi.cast("uintptr_t", handle))),
+        title = title,
+        process = win_window_process_name(handle),
+        width = 0,
+        height = 0,
+    }
+end
+
 --------------------------------------------------------------------------------
 -- Windows Region Selector
 --------------------------------------------------------------------------------
@@ -1698,7 +1830,7 @@ end
 
 -- Clipboard and output helpers live with the command-line code below; the
 -- forward declarations keep them visible to the editor's nested closures.
-local win_copy_to_clipboard, resolve_output_path, write_binary_file
+local win_copy_to_clipboard, resolve_output_path, write_binary_file, copy_saved_path
 
 local EDITOR_PALETTE = {
     { name = "red", hex = "#E53935" },
@@ -2419,8 +2551,16 @@ local function win_edit_image(image, options)
         end
 
         local result = nil
+        local output_path = nil
         if options.write_file then
-            local output_path = resolve_output_path(options.output)
+            local path_error
+            output_path, path_error = resolve_output_path(options.output, options)
+            if not output_path then
+                io.stderr:write("fshot: " .. path_error .. "\n")
+                set_status(path_error, true)
+                return
+            end
+
             local written, write_error = write_binary_file(output_path, png, png_size)
             if not written then
                 io.stderr:write("fshot: " .. write_error .. "\n")
@@ -2430,6 +2570,7 @@ local function win_edit_image(image, options)
             result = {
                 path = output_path,
                 copied = false,
+                path_copied = false,
                 bytes = png_size,
                 compressed = compressed,
                 elapsed_ms = 0,
@@ -2465,16 +2606,36 @@ local function win_edit_image(image, options)
             copied = true
         end
 
+        local path_copied = false
+        if options.clip_path then
+            local copied_path, path_copy_error = copy_saved_path(output_path, options.clip_path)
+            if not copied_path then
+                io.stderr:write("fshot: " .. tostring(path_copy_error) .. "\n")
+                if result then
+                    result.elapsed_ms = now_ms() - started
+                    state.result = result
+                    set_status("Path copy failed; the file was saved. Esc closes the editor.",
+                        true)
+                else
+                    set_status(path_copy_error, true)
+                end
+                return
+            end
+            path_copied = true
+        end
+
         if result == nil then
             result = {
                 path = nil,
                 copied = false,
+                path_copied = false,
                 bytes = png_size,
                 compressed = compressed,
                 elapsed_ms = 0,
             }
         end
         result.copied = copied
+        result.path_copied = path_copied
         result.elapsed_ms = now_ms() - started
         state.result = result
         user32.DestroyWindow(hwnd)
@@ -3049,6 +3210,14 @@ local function platform_capture_window(window)
         .. "use --region with the window geometry instead"
 end
 
+local function platform_active_window()
+    if IS_WINDOWS then
+        return win_active_window()
+    end
+    return nil, "--active-window is only implemented on Windows; "
+        .. "use --window TEXT or --region X,Y,W,H instead"
+end
+
 local function platform_select_region()
     if IS_WINDOWS then
         return win_select_region()
@@ -3174,6 +3343,21 @@ local function win_global_from_bytes(data, length)
     return memory
 end
 
+-- The clipboard is a single-owner resource; retry briefly when another process
+-- holds it, then explain which flag could be dropped instead of failing blind.
+local function win_open_clipboard(flag_name)
+    for attempt = 1, 5 do
+        if user32.OpenClipboard(nil) ~= 0 then
+            return true
+        end
+        sleep_ms(50)
+    end
+
+    return nil, "cannot open the clipboard after 5 attempts (" .. win_error_message()
+        .. ").\n  Another application is holding it; retry in a moment, "
+        .. "or drop " .. flag_name .. " to write a file only."
+end
+
 function win_copy_to_clipboard(image, png, png_size)
     local stride = image.width * 4
     local dib_size = ffi.sizeof("BITMAPINFOHEADER") + stride * image.height
@@ -3208,19 +3392,10 @@ function win_copy_to_clipboard(image, png, png_size)
     end
     kernel32.GlobalUnlock(dib_memory)
 
-    local opened = 0
-    for attempt = 1, 5 do
-        opened = user32.OpenClipboard(nil)
-        if opened ~= 0 then
-            break
-        end
-        sleep_ms(50)
-    end
-    if opened == 0 then
+    local opened, open_error = win_open_clipboard("--clip")
+    if not opened then
         kernel32.GlobalFree(dib_memory)
-        return nil, "cannot open the clipboard after 5 attempts (" .. win_error_message()
-            .. ").\n  Another application is holding it; retry in a moment, "
-            .. "or drop --clip to write a file only."
+        return nil, open_error
     end
 
     local warnings = {}
@@ -3260,6 +3435,43 @@ function win_copy_to_clipboard(image, png, png_size)
     return true, nil, warnings
 end
 
+function win_copy_text_to_clipboard(text)
+    local wide_text = utf8_to_wide(text)
+    if not wide_text then
+        return nil, "the text could not be converted to UTF-16"
+    end
+
+    -- ffi.sizeof includes the terminating NUL that utf8_to_wide appends.
+    local memory, memory_error = win_global_from_bytes(wide_text, ffi.sizeof(wide_text))
+    if not memory then
+        return nil, memory_error
+    end
+
+    local opened, open_error = win_open_clipboard("--clip-path")
+    if not opened then
+        kernel32.GlobalFree(memory)
+        return nil, open_error
+    end
+
+    if user32.EmptyClipboard() == 0 then
+        local reason = win_error_message()
+        user32.CloseClipboard()
+        kernel32.GlobalFree(memory)
+        return nil, "EmptyClipboard failed: " .. reason
+    end
+
+    if user32.SetClipboardData(CF_UNICODETEXT, memory) == nil then
+        local reason = win_error_message()
+        user32.CloseClipboard()
+        kernel32.GlobalFree(memory)
+        return nil, "SetClipboardData(CF_UNICODETEXT) failed: " .. reason
+    end
+
+    -- Ownership of memory now belongs to the clipboard; do not free it.
+    user32.CloseClipboard()
+    return true
+end
+
 local function execute_command(command)
     local first, second, third = os.execute(command)
     if first == 0 or first == true then
@@ -3279,37 +3491,45 @@ local function execute_command(command)
     return false, detail
 end
 
-local function linux_copy_to_clipboard(png, png_size)
+local LINUX_CLIPBOARD_TOOLS = {
+    {
+        name = "wl-copy",
+        probe = "command -v wl-copy >/dev/null 2>&1",
+        commands = {
+            image = "wl-copy --type image/png < %q",
+            text = "wl-copy < %q",
+        },
+    },
+    {
+        name = "xclip",
+        probe = "command -v xclip >/dev/null 2>&1",
+        commands = {
+            image = "xclip -selection clipboard -t image/png -i %q",
+            text = "xclip -selection clipboard < %q",
+        },
+    },
+}
+
+-- Both payload kinds go through a temporary file so the data never has to be
+-- escaped into a shell command line.
+local function linux_copy_to_clipboard(data, size, kind)
     local temporary_path = os.tmpname()
     local file, open_error = io.open(temporary_path, "wb")
     if not file then
         return nil, "cannot create a temporary file for the clipboard: "
             .. tostring(open_error)
     end
-    file:write(ffi.string(png, png_size))
+    file:write(ffi.string(data, size))
     file:close()
 
-    local commands = {
-        {
-            probe = "command -v wl-copy >/dev/null 2>&1",
-            copy = string.format("wl-copy --type image/png < %q", temporary_path),
-            name = "wl-copy",
-        },
-        {
-            probe = "command -v xclip >/dev/null 2>&1",
-            copy = string.format("xclip -selection clipboard -t image/png -i %q", temporary_path),
-            name = "xclip",
-        },
-    }
-
-    for _, command in ipairs(commands) do
-        local available = execute_command(command.probe)
-        if available then
-            local copied, failure = execute_command(command.copy)
+    for _, tool in ipairs(LINUX_CLIPBOARD_TOOLS) do
+        if execute_command(tool.probe) then
+            local copied, failure = execute_command(
+                string.format(tool.commands[kind], temporary_path))
             os.remove(temporary_path)
             if not copied then
                 return nil, string.format("%s failed (%s); install a working clipboard tool "
-                    .. "or write a file and copy it manually", command.name, tostring(failure))
+                    .. "or write a file and copy it manually", tool.name, tostring(failure))
             end
             return true, nil, {}
         end
@@ -3320,19 +3540,207 @@ local function linux_copy_to_clipboard(png, png_size)
         .. "or write a file and copy it manually."
 end
 
+local function copy_text_to_clipboard(text)
+    if IS_WINDOWS then
+        return win_copy_text_to_clipboard(text)
+    end
+    if IS_LINUX then
+        return linux_copy_to_clipboard(text, #text, "text")
+    end
+    return nil, "clipboard copy is only implemented for Windows and Linux"
+end
+
 local function platform_copy_clipboard(image, png, png_size)
     if IS_WINDOWS then
         return win_copy_to_clipboard(image, png, png_size)
     end
     if IS_LINUX then
-        return linux_copy_to_clipboard(png, png_size)
+        return linux_copy_to_clipboard(png, png_size, "image")
     end
     return nil, "clipboard copy is only implemented for Windows and Linux"
+end
+
+-- Copy the saved file path (or a markdown link to it) as clipboard text.
+function copy_saved_path(path, mode)
+    if not path or not mode then
+        return true
+    end
+
+    return copy_text_to_clipboard(format_clip_path(path, mode))
 end
 
 --------------------------------------------------------------------------------
 -- Command-Line Handling
 --------------------------------------------------------------------------------
+
+local DEFAULT_FILENAME_TEMPLATE = "shot-%Y%m%d-%H%M%S"
+local DEFAULT_OUTPUT_DIRECTORY = join_path(home_directory(), "Pictures/shots")
+
+local CONFIG_KEYS = {
+    output_dir = true,
+    filename = true,
+}
+
+local function config_file_path()
+    return join_path(home_directory(), ".config/fshot/config.lua")
+end
+
+local function validate_config(config, path)
+    if type(config) ~= "table" then
+        return nil, string.format("config %q must return a table", path)
+    end
+
+    for key in pairs(config) do
+        if not CONFIG_KEYS[key] then
+            return nil, string.format(
+                "invalid config %q: unknown key %q (valid keys: output_dir, filename)",
+                path, tostring(key))
+        end
+    end
+
+    if config.output_dir ~= nil
+        and (type(config.output_dir) ~= "string" or config.output_dir == "") then
+        return nil, string.format(
+            "invalid config %q: output_dir must be a non-empty string", path)
+    end
+
+    if config.filename ~= nil then
+        if type(config.filename) ~= "string" or config.filename == "" then
+            return nil, string.format(
+                "invalid config %q: filename must be a non-empty os.date format", path)
+        end
+
+        if config.filename:find("[/\\]") then
+            return nil, string.format(
+                "invalid config %q: filename %q must not contain path separators; "
+                .. "use output_dir for the directory", path, config.filename)
+        end
+
+        local renderable, render_error = pcall(os.date, config.filename)
+        if not renderable then
+            return nil, string.format(
+                "invalid config %q: filename %q is not a valid os.date format (%s)",
+                path, config.filename, tostring(render_error))
+        end
+    end
+
+    return config
+end
+
+local function arguments_skip_config(arguments)
+    for _, argument in ipairs(arguments) do
+        if argument == "-h" or argument == "--help" or argument == "--test"
+            or argument == "--list-windows" then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function load_config()
+    local path = config_file_path()
+    local handle = io.open(path, "rb")
+    if not handle then
+        return {}
+    end
+    handle:close()
+
+    local chunk, load_error = loadfile(path)
+    if not chunk then
+        return nil, string.format("cannot load config %q: %s", path, load_error)
+    end
+
+    local executed, result = pcall(chunk)
+    if not executed then
+        return nil, string.format("config %q raised an error: %s", path, tostring(result))
+    end
+
+    return validate_config(result, path)
+end
+
+local function create_single_directory(path)
+    if IS_WINDOWS then
+        local wide_path = utf8_to_wide(path)
+        if not wide_path then
+            return nil, "the path could not be converted to UTF-16"
+        end
+
+        if kernel32.CreateDirectoryW(wide_path, nil) ~= 0 then
+            return true
+        end
+
+        local code = tonumber(kernel32.GetLastError())
+        if code == ERROR_ALREADY_EXISTS then
+            return true
+        end
+
+        return nil, win_error_message(code)
+    end
+
+    if ffi.C.mkdir(path, 493) == 0 then -- 0755
+        return true
+    end
+
+    local code = ffi.errno()
+    if code == EEXIST then
+        return true
+    end
+
+    return nil, string.format("errno %d: %s", code, ffi.string(ffi.C.strerror(code)))
+end
+
+local function split_path_components(path)
+    local separator = IS_WINDOWS and "\\" or "/"
+    local normalized = path:gsub("[\\/]", separator)
+    local prefix = ""
+
+    if IS_WINDOWS then
+        local drive = normalized:match("^(%a:)")
+        if drive then
+            prefix = drive
+            normalized = normalized:sub(3)
+        end
+    end
+
+    if normalized:sub(1, 1) == separator then
+        prefix = prefix .. separator
+        normalized = normalized:sub(2)
+    end
+
+    local pattern_separator = (separator == "\\") and "\\\\" or separator
+    local components = {}
+    for component in normalized:gmatch("[^" .. pattern_separator .. "]+") do
+        table.insert(components, component)
+    end
+
+    return components, prefix, separator
+end
+
+-- Create every missing level of a directory path. Existing directories are
+-- success; the first real failure is reported with its native error text.
+local function ensure_directory(path)
+    if path == "" or path == "." then
+        return true
+    end
+
+    local components, prefix, separator = split_path_components(path)
+    local current = prefix
+
+    for _, component in ipairs(components) do
+        if component ~= "." then
+            local candidate = current .. component
+            local created, create_error = create_single_directory(candidate)
+            if not created then
+                return nil, string.format("cannot create %q: %s", candidate, create_error)
+            end
+
+            current = candidate .. separator
+        end
+    end
+
+    return true
+end
 
 local function parse_region(text)
     if not text:match("^%-?%d+,%-?%d+,%-?%d+,%-?%d+$") then
@@ -3355,15 +3763,21 @@ local function parse_region(text)
     return { x = values[1], y = values[2], width = width, height = height }
 end
 
-local function parse_options(arguments)
+local function parse_options(arguments, config)
+    config = config or {}
+
     local options = {
         target = "screen",
         region = nil,
         window_query = nil,
         delay_ms = 0,
         output = nil,
+        output_dir = os.getenv("FSHOT_DIR") or config.output_dir
+            or DEFAULT_OUTPUT_DIRECTORY,
+        filename_template = config.filename or DEFAULT_FILENAME_TEMPLATE,
         clipboard = false,
         clipboard_set = false,
+        clip_path = nil,
         write_file = true,
         json = false,
         compress = true,
@@ -3408,6 +3822,10 @@ local function parse_options(arguments)
             options.target = "window"
             options.window_query = arguments[index]
             options.region = nil
+        elseif argument == "--active-window" or argument == "-a" then
+            options.target = "active"
+            options.region = nil
+            options.window_query = nil
         elseif argument == "--select" or argument == "-s" then
             options.target = "select"
             options.region = nil
@@ -3429,6 +3847,17 @@ local function parse_options(arguments)
         elseif argument == "--clip" then
             options.clipboard = true
             options.clipboard_set = true
+        elseif argument == "--clip-path" then
+            local mode = arguments[index + 1]
+            if mode == nil or mode:sub(1, 1) == "-" then
+                options.clip_path = "plain"
+            elseif mode == "plain" or mode == "md" then
+                options.clip_path = mode
+                index = index + 1
+            else
+                return nil, string.format(
+                    "invalid --clip-path mode %q: expected plain or md", mode)
+            end
         elseif argument == "--no-clip" then
             options.clipboard = false
             options.clipboard_set = true
@@ -3476,17 +3905,33 @@ local function parse_options(arguments)
     end
 
     -- The editor saves and copies on accept by default (Greenshot behavior);
-    -- --no-clip opts out and --no-file keeps only the clipboard copy.
+    -- --no-clip opts out and --no-file keeps only the clipboard copy. A path
+    -- copy takes the clipboard instead of the image, so the paths never fight.
     if options.edit and not options.clipboard_set then
-        options.clipboard = true
+        options.clipboard = (options.clip_path == nil)
     end
 
     if options.edit and not IS_WINDOWS then
         return nil, "--edit is only implemented on Windows"
     end
 
+    if options.target == "active" and not IS_WINDOWS then
+        return nil, "--active-window is only implemented on Windows; "
+            .. "use --window TEXT or --region X,Y,W,H instead"
+    end
+
     if not options.write_file and options.output then
         return nil, "cannot combine --out with --no-file"
+    end
+
+    if options.clip_path and not options.write_file then
+        return nil, "--clip-path needs a saved file; drop --no-file, "
+            .. "or use --clip for image-only copies"
+    end
+
+    if options.clip_path and options.clipboard_set and options.clipboard then
+        return nil, "cannot combine --clip (image) with --clip-path (text): "
+            .. "both replace the clipboard contents"
     end
 
     if not options.write_file and not options.clipboard
@@ -3498,33 +3943,47 @@ local function parse_options(arguments)
     return options
 end
 
-local function default_output_path()
-    local base = os.date("shot-%Y%m%d-%H%M%S")
-    local path = base .. ".png"
+local function default_output_path(directory, filename_template)
+    local base = os.date(filename_template or DEFAULT_FILENAME_TEMPLATE)
+    local candidate = join_path(directory, base .. ".png")
     local counter = 1
 
     while true do
-        local existing = io.open(path, "rb")
+        local existing = io.open(candidate, "rb")
         if not existing then
-            return path
+            return candidate
         end
         existing:close()
-        path = string.format("%s-%d.png", base, counter)
+        candidate = join_path(directory, string.format("%s-%d.png", base, counter))
         counter = counter + 1
     end
 end
 
-function resolve_output_path(requested)
-    if not requested then
-        return default_output_path()
+function resolve_output_path(requested, options)
+    options = options or {}
+    local filename_template = options.filename_template or DEFAULT_FILENAME_TEMPLATE
+
+    if requested then
+        local last_character = requested:sub(-1)
+        if last_character == "/" or last_character == "\\" then
+            local created, create_error = ensure_directory(requested)
+            if not created then
+                return nil, create_error
+            end
+
+            return default_output_path(requested, filename_template)
+        end
+
+        return requested
     end
 
-    local last_character = requested:sub(-1)
-    if last_character == "/" or last_character == "\\" then
-        return requested .. default_output_path()
+    local directory = options.output_dir or DEFAULT_OUTPUT_DIRECTORY
+    local created, create_error = ensure_directory(directory)
+    if not created then
+        return nil, create_error
     end
 
-    return requested
+    return default_output_path(directory, filename_template)
 end
 
 local function describe_write_error(path, raw_error)
@@ -3559,7 +4018,8 @@ function write_binary_file(path, data, size)
     return true
 end
 
-local function json_summary(image, path, size, compressed, elapsed_ms, clipboard_ok)
+local function json_summary(image, path, size, compressed, elapsed_ms, clipboard_ok,
+                            path_copied)
     local fields = {
         string.format('"path":%s', path and string.format("%q", path) or "null"),
         string.format('"width":%d', image.width),
@@ -3571,6 +4031,7 @@ local function json_summary(image, path, size, compressed, elapsed_ms, clipboard
         string.format('"source":"%s"', image.source or "screen"),
         string.format('"elapsed_ms":%d', elapsed_ms),
         string.format('"clipboard":%s', clipboard_ok and "true" or "false"),
+        string.format('"clip_path":%s', path_copied and "true" or "false"),
     }
     return "{" .. table.concat(fields, ",") .. "}"
 end
@@ -3704,6 +4165,78 @@ local function run_tests()
     local zero_region, zero_region_error = parse_region("0,0,0,10")
     check("parse_region rejects zero width",
         zero_region == nil and type(zero_region_error) == "string")
+
+    local joined_path = join_path("C:/Users/me/shots/", "shot.png")
+    if IS_WINDOWS then
+        check("join_path produces native separators",
+            joined_path == "C:\\Users\\me\\shots\\shot.png", joined_path)
+    else
+        check("join_path keeps POSIX separators",
+            joined_path == "C:/Users/me/shots/shot.png", joined_path)
+    end
+
+    local markdown_link = format_clip_path("shot one.png", "md")
+    local markdown_suffix = "shot%20one.png)"
+    check("format_clip_path builds a percent-encoded markdown link",
+        markdown_link:sub(1, 4) == "![]("
+            and markdown_link:sub(-#markdown_suffix) == markdown_suffix,
+        markdown_link)
+
+    local plain_path = format_clip_path("shot one.png", "plain")
+    check("format_clip_path returns an absolute native path",
+        plain_path ~= "shot one.png"
+            and (plain_path:find("/", 1, true) ~= nil
+                or plain_path:find("\\", 1, true) ~= nil),
+        plain_path)
+
+    local validated_config, validated_config_error = validate_config(
+        { output_dir = "tmp/shots", filename = "shot-%Y%m%d" }, "test")
+    check("validate_config accepts output_dir and filename",
+        validated_config ~= nil and validated_config.output_dir == "tmp/shots",
+        validated_config_error)
+
+    local unknown_config, unknown_config_error = validate_config({ outputdir = "tmp" }, "test")
+    check("validate_config rejects unknown keys with the valid list",
+        unknown_config == nil
+            and tostring(unknown_config_error):find("unknown key", 1, true) ~= nil
+            and tostring(unknown_config_error):find("output_dir", 1, true) ~= nil,
+        tostring(unknown_config_error))
+
+    local separator_config, separator_config_error = validate_config(
+        { filename = "a/b" }, "test")
+    check("validate_config rejects path separators in filename",
+        separator_config == nil
+            and tostring(separator_config_error):find("separator", 1, true) ~= nil,
+        tostring(separator_config_error))
+
+    local clip_path_options = parse_options({ "--clip-path", "md" }, {})
+    check("parse_options accepts --clip-path md",
+        clip_path_options ~= nil and clip_path_options.clip_path == "md")
+
+    local conflict_options, conflict_error = parse_options({ "--clip", "--clip-path" }, {})
+    check("parse_options rejects --clip with --clip-path",
+        conflict_options == nil
+            and tostring(conflict_error):find("cannot combine", 1, true) ~= nil,
+        tostring(conflict_error))
+
+    local no_file_options, no_file_error = parse_options({ "--clip-path", "--no-file" }, {})
+    check("parse_options rejects --clip-path with --no-file",
+        no_file_options == nil
+            and tostring(no_file_error):find("saved file", 1, true) ~= nil,
+        tostring(no_file_error))
+
+    if IS_WINDOWS then
+        local active_options = parse_options({ "--active-window" }, {})
+        check("parse_options maps --active-window to the active target",
+            active_options ~= nil and active_options.target == "active")
+
+        local edit_clip_options = parse_options({ "--edit", "--clip-path" }, {})
+        check("--edit with --clip-path copies the path instead of the image",
+            edit_clip_options ~= nil and edit_clip_options.clip_path == "plain"
+                and edit_clip_options.clipboard == false)
+    else
+        skip("--active-window and --edit parsing", "Windows only")
+    end
 
     local test_width, test_height = 4, 3
     local source = ffi.new("uint8_t[?]", test_width * test_height * 4)
@@ -3839,7 +4372,19 @@ end
 --------------------------------------------------------------------------------
 
 local function main(arguments)
-    local options, option_error = parse_options(arguments)
+    -- Help, self-tests, and window listing must stay usable while the user is
+    -- fixing a broken config, so they do not load it at all.
+    local config = {}
+    if not arguments_skip_config(arguments) then
+        local config_error
+        config, config_error = load_config()
+        if not config then
+            io.stderr:write("fshot: " .. config_error .. "\n")
+            return 1
+        end
+    end
+
+    local options, option_error = parse_options(arguments, config)
     if not options then
         io.stderr:write("fshot: " .. option_error .. "\n")
         io.stderr:write("Try 'fshot --help' for usage.\n")
@@ -3885,7 +4430,14 @@ local function main(arguments)
     local started_at = now_ms()
     local image, capture_error
 
-    if options.target == "window" then
+    if options.target == "active" then
+        local window, window_error = platform_active_window()
+        if not window then
+            io.stderr:write("fshot: " .. window_error .. "\n")
+            return 1
+        end
+        image, capture_error = platform_capture_window(window)
+    elseif options.target == "window" then
         local window, window_error, match_count = resolve_window(options.window_query)
         if not window then
             io.stderr:write("fshot: " .. window_error .. "\n")
@@ -3932,13 +4484,17 @@ local function main(arguments)
 
         if options.json then
             print(json_summary(image, result.path, result.bytes, result.compressed,
-                result.elapsed_ms, result.copied))
+                result.elapsed_ms, result.copied, result.path_copied))
         else
             local compression = result.compressed and "zlib" or "stored"
             local summary = string.format("%dx%d  %s  %s  %d ms",
                 image.width, image.height, format_bytes(result.bytes), compression,
                 result.elapsed_ms)
-            if result.path and result.copied then
+            if result.path and result.path_copied then
+                local copied_kind = (options.clip_path == "md") and "markdown" or "path"
+                print(string.format("%s  %s  (%s copied)",
+                    result.path, summary, copied_kind))
+            elseif result.path and result.copied then
                 print(string.format("%s  %s  (also copied to clipboard)",
                     result.path, summary))
             elseif result.path then
@@ -3960,7 +4516,15 @@ local function main(arguments)
 
     local output_path = nil
     if options.write_file then
-        output_path = resolve_output_path(options.output)
+        local path_error
+        output_path, path_error = resolve_output_path(options.output, options)
+        if not output_path then
+            io.stderr:write("fshot: " .. path_error .. "\n")
+            io.stderr:write("fshot: set a writable directory with --out, FSHOT_DIR, "
+                .. "or ~/.config/fshot/config.lua\n")
+            return 1
+        end
+
         local write_ok, write_error = write_binary_file(output_path, png, png_size)
         if not write_ok then
             io.stderr:write("fshot: " .. write_error .. "\n")
@@ -3986,15 +4550,33 @@ local function main(arguments)
         end
     end
 
+    local path_copied = false
+    if options.clip_path then
+        local copied_path, path_copy_error = copy_saved_path(output_path, options.clip_path)
+        if not copied_path then
+            io.stderr:write("fshot: " .. tostring(path_copy_error) .. "\n")
+            if output_path then
+                io.stderr:write(string.format(
+                    "fshot: the image was still written to %s\n", output_path))
+            end
+            return 1
+        end
+        path_copied = true
+    end
+
     local elapsed_ms = now_ms() - started_at
 
     if options.json then
-        print(json_summary(image, output_path, png_size, compressed, elapsed_ms, clipboard_ok))
+        print(json_summary(image, output_path, png_size, compressed, elapsed_ms,
+            clipboard_ok, path_copied))
     else
         local compression = compressed and "zlib" or "stored"
         local summary = string.format("%dx%d  %s  %s  %d ms",
             image.width, image.height, format_bytes(png_size), compression, elapsed_ms)
-        if output_path and clipboard_ok then
+        if output_path and path_copied then
+            local copied_kind = (options.clip_path == "md") and "markdown" or "path"
+            print(string.format("%s  %s  (%s copied)", output_path, summary, copied_kind))
+        elseif output_path and clipboard_ok then
             print(string.format("%s  %s  (also copied to clipboard)", output_path, summary))
         elseif output_path then
             print(string.format("%s  %s", output_path, summary))
