@@ -7,8 +7,9 @@
     - Region capture in physical pixels (--region X,Y,W,H).
     - Interactive capture (--select) over a frozen, dimmed desktop: drag a region or
       click the highlighted window under the cursor; Esc or right-click cancels.
-    - Annotation editor (--edit) with rectangle, arrow, highlight, and pixelating
-      redaction tools, palette, line width, undo/redo, and save/copy actions.
+    - Annotation editor (--edit) with rectangle, ellipse, arrow, text, highlight,
+      pixelating redaction, and crop tools, palette, line width, undo/redo, and
+      save/copy actions.
     - Window capture by title or process substring (--window TEXT), or of the
       foreground window (--active-window), using PrintWindow so occluded windows are
       rendered, with a screen-blit fallback when that fails.
@@ -18,6 +19,8 @@
     - Optional clipboard copy: native CF_DIB + "PNG" formats on Windows; wl-copy or
       xclip on Linux when installed. --clip-path copies the saved path, or a
       percent-encoded markdown image link, as Unicode text instead.
+    - --stdout streams the PNG instead of writing a file, and --exec runs a command
+      afterwards with FSHOT_FILE set to the saved path.
     - Configurable output directory and filename template via
       ~/.config/fshot/config.lua; FSHOT_DIR and --out override it.
     - Built-in self-test suite (--test) that validates the PNG encoder without a display.
@@ -42,10 +45,13 @@
     --clip               Also copy the image to the system clipboard.
     --clip-path [MODE]   Also copy the saved path as text (plain), or as a
                          percent-encoded markdown image link (md).
+    --stdout             Write the PNG to standard output instead of a file.
+    --exec CMD           Run CMD after saving, with FSHOT_FILE set to the path.
     --no-clip            In --edit, do not copy on Enter or Save.
-    --no-file            Do not write a file; requires --clip.
+    --no-file            Do not write a file; requires --clip or --stdout.
     --edit               Open the annotation editor before saving (Windows only).
-    --tool NAME          Annotation tool: rect, arrow, highlight, or redact.
+    --tool NAME          Annotation tool: rect, oval, arrow, text, highlight,
+                         redact, or crop.
     --color NAME|#RRGGBB Annotation color (default red, #E53935).
     --width N            Annotation line width in image pixels (default 4).
     --no-compress        Store uncompressed deflate blocks even when zlib is available.
@@ -201,6 +207,10 @@ if IS_WINDOWS then
         int WideCharToMultiByte(UINT CodePage, DWORD dwFlags, const wchar_t* lpWideCharStr,
                                 int cchWideChar, char* lpMultiByteStr, int cbMultiByte,
                                 const char* lpDefaultChar, BOOL* lpUsedDefaultChar);
+        BOOL SetEnvironmentVariableW(const wchar_t* name, const wchar_t* value);
+        HANDLE GetStdHandle(DWORD std_handle);
+        BOOL WriteFile(HANDLE file, const void* buffer, DWORD bytes_to_write,
+                       DWORD* bytes_written, void* overlapped);
     ]]
 
     ffi.cdef[[
@@ -306,6 +316,7 @@ if IS_WINDOWS then
                         HDC hdcSrc, int xoriginSrc, int yoriginSrc, int wSrc, int hSrc,
                         BLENDFUNCTION ftn);
         int SetStretchBltMode(HDC hdc, int mode);
+        BOOL Ellipse(HDC hdc, int left, int top, int right, int bottom);
         BOOL SetBrushOrgEx(HDC hdc, int x, int y, POINT* lppt);
         BOOL StretchBlt(HDC hdcDest, int xDest, int yDest, int wDest, int hDest,
                         HDC hdcSrc, int xSrc, int ySrc, int wSrc, int hSrc,
@@ -490,10 +501,14 @@ Output:
   --clip               Also copy the image to the system clipboard.
   --clip-path [MODE]   Also copy the saved path as text; MODE is plain (default)
                        or md for a percent-encoded markdown image link.
+  --stdout             Write the PNG to standard output instead of a file; the
+                       summary goes to stderr so the stream stays clean.
+  --exec CMD           Run CMD through the shell after saving, with FSHOT_FILE
+                       set to the saved path. A failing command exits 1.
   --no-clip            In --edit, do not copy on Enter or Save.
-  --no-file            Do not write a file; requires --clip.
+  --no-file            Do not write a file; requires --clip or --stdout.
   --no-compress        Use stored deflate blocks instead of zlib compression.
-  --json               Print a machine-readable summary.
+  --json               Print a machine-readable summary (not with --stdout).
 
 Configuration:
   ~/.config/fshot/config.lua may return a table with:
@@ -504,15 +519,18 @@ Configuration:
   the current directory.
 
 Editor (--edit, Windows only):
-  --tool NAME          Annotation tool: rect, arrow, highlight, or redact.
+  --tool NAME          Annotation tool: rect, oval, arrow, text, highlight,
+                       redact, or crop.
   --color NAME|#RRGGBB Annotation color (default red, #E53935).
   --width N            Line width in image pixels (default 4).
 
   The editor opens with the capture fitted to the monitor. Drag to draw the
-  active tool, T cycles tools (R returns to rectangles), 1-6 pick a color,
+  active tool, T cycles tools (R rectangles, E ovals), 1-6 pick a color,
   [ and ] change width, Ctrl+Z/Ctrl+Y undo and redo, C copies without closing,
   Enter saves and copies, and Esc discards (a second Esc confirms when shapes
   exist). Redact pixelates the region so text underneath cannot be recovered.
+  Text places a label: click, type, then Enter commits it; Esc drops it. Crop
+  dims everything outside the dragged region and saves only that region.
 
 Other:
   -h, --help           Show this help message.
@@ -525,6 +543,8 @@ Examples:
   fshot --active-window --clip-path
   fshot --select --clip
   fshot --select --edit
+  fshot --window firefox --stdout > shot.png
+  fshot --select --exec 'frsync %FSHOT_FILE%'
   fshot --delay 1500 --window "Save As"
   fshot --out . --clip          # keep the old current-directory behavior
 ]]
@@ -2097,6 +2117,7 @@ end
 -- Clipboard and output helpers live with the command-line code below; the
 -- forward declarations keep them visible to the editor's nested closures.
 local win_copy_to_clipboard, resolve_output_path, write_binary_file, copy_saved_path
+local write_stdout_binary, run_exec_hook
 
 local EDITOR_PALETTE = {
     { name = "red", hex = "#E53935" },
@@ -2109,12 +2130,16 @@ local EDITOR_PALETTE = {
 
 local EDITOR_WIDTHS = { 2, 4, 6, 8, 12 }
 
--- Compact labels keep all four tools beside the palette on narrow captures.
+-- Compact labels keep every tool beside the palette on narrow captures; the
+-- window is widened to the toolbar's natural width when needed.
 local EDITOR_TOOLS = {
-    { id = "rect", label = "Rect", width = 50 },
-    { id = "arrow", label = "Arrow", width = 54 },
-    { id = "highlight", label = "Mark", width = 50 },
-    { id = "redact", label = "Redact", width = 58 },
+    { id = "rect", label = "Rect", width = 46 },
+    { id = "ellipse", label = "Oval", width = 44 },
+    { id = "arrow", label = "Arrow", width = 50 },
+    { id = "text", label = "Text", width = 44 },
+    { id = "highlight", label = "Mark", width = 46 },
+    { id = "redact", label = "Redact", width = 54 },
+    { id = "crop", label = "Crop", width = 44 },
 }
 
 local EDITOR_TOOL_IDS = {}
@@ -2126,6 +2151,7 @@ local function tool_label(tool_id)
     local tool = EDITOR_TOOL_IDS[tool_id]
     return tool and tool.label or "Rect"
 end
+
 
 -- Annotations keep both drag endpoints: rectangles and redactions use the
 -- normalized box, arrows need to know which end is the tip.
@@ -2140,6 +2166,103 @@ end
 local function annotation_size(annotation)
     local left, top, right, bottom = annotation_bounds(annotation)
     return right - left + 1, bottom - top + 1
+end
+
+-- Pure helpers for labels, crops, and hooks. They live in one table so the
+-- main chunk stays under LuaJIT's 200-local limit; each entry is independent and
+-- safe to unit test.
+local editor_support = {}
+
+-- Used by --tool diagnostics and the self-tests, so the list cannot drift from
+-- the toolbar.
+function editor_support.tool_names()
+    local names = {}
+    for _, tool in ipairs(EDITOR_TOOLS) do
+        names[#names + 1] = tool.id
+    end
+    return table.concat(names, ", ")
+end
+
+-- Label height follows the line width so [ and ] also scale text.
+function editor_support.text_height(line_width)
+    return math.max(12, math.min(96, math.floor(line_width * 5 + 0.5)))
+end
+
+-- A single WM_CHAR code unit; surrogate pairs are rare in labels and are
+-- dropped rather than mis-encoded.
+function editor_support.utf16_to_utf8(code)
+    if not IS_WINDOWS then
+        return ""
+    end
+    if code < 32 or (code >= 0xD800 and code <= 0xDFFF) then
+        return ""
+    end
+
+    local wide = ffi.new("wchar_t[2]")
+    wide[0] = code
+    wide[1] = 0
+    return wide_to_utf8(wide)
+end
+
+-- Backspace must remove a whole code point, not one continuation byte.
+function editor_support.remove_last_char(text)
+    if text == "" then
+        return text
+    end
+
+    local index = #text
+    while index > 1 do
+        local byte = text:byte(index)
+        if byte < 0x80 or byte >= 0xC0 then
+            break
+        end
+        index = index - 1
+    end
+    return text:sub(1, index - 1)
+end
+
+-- The last crop annotation wins; everything before it is just history.
+function editor_support.crop_bounds(annotations, width, height)
+    local crop = nil
+    for _, annotation in ipairs(annotations) do
+        if annotation.tool == "crop" then
+            crop = annotation
+        end
+    end
+    if crop == nil then
+        return nil
+    end
+
+    local left, top, right, bottom = annotation_bounds(crop)
+    left = math.max(0, math.floor(left))
+    top = math.max(0, math.floor(top))
+    right = math.min(width, math.ceil(right))
+    bottom = math.min(height, math.ceil(bottom))
+    if right - left < 1 or bottom - top < 1 then
+        return nil
+    end
+    return left, top, right - left, bottom - top
+end
+
+-- Copy a sub-rectangle out of a top-down BGRA buffer. Bounds are clamped, so a
+-- crop dragged past the edge still yields the visible part.
+function editor_support.crop_pixels(pixels, width, height, left, top,
+                                    crop_width, crop_height)
+    left = math.max(0, math.floor(left))
+    top = math.max(0, math.floor(top))
+    crop_width = math.min(math.floor(crop_width), width - left)
+    crop_height = math.min(math.floor(crop_height), height - top)
+    if crop_width < 1 or crop_height < 1 then
+        return nil, "crop region is outside the image"
+    end
+
+    local source = ffi.cast("uint8_t*", pixels)
+    local cropped = ffi.new("uint8_t[?]", crop_width * crop_height * 4)
+    for row = 0, crop_height - 1 do
+        ffi.copy(cropped + row * crop_width * 4,
+            source + ((top + row) * width + left) * 4, crop_width * 4)
+    end
+    return cropped
 end
 
 -- Endpoints of the two barbs for an arrow whose tip is (x2, y2).
@@ -2214,9 +2337,12 @@ local EDITOR_KEYS = {
     WM_LBUTTONUP = WM_LBUTTONUP,
     WM_RBUTTONUP = WM_RBUTTONUP,
     WM_KEYDOWN = WM_KEYDOWN,
+    WM_CHAR = 0x0102,
     WM_CLOSE = WM_CLOSE,
     WM_DESTROY = WM_DESTROY,
+    VK_BACK = 0x08,
     VK_ESCAPE = VK_ESCAPE,
+    VK_E = 0x45,
     VK_RETURN = VK_RETURN,
     VK_CONTROL = VK_CONTROL,
     VK_1 = VK_1,
@@ -2235,6 +2361,7 @@ local EDITOR_KEYS = {
     DT_CENTER = DT_CENTER,
     DT_VCENTER = DT_VCENTER,
     DT_SINGLELINE = DT_SINGLELINE,
+    DT_NOCLIP = 0x00000100,
     DT_END_ELLIPSIS = DT_END_ELLIPSIS,
 }
 
@@ -2321,12 +2448,66 @@ local function win_edit_image(image, options)
     local toolbar_height = math.max(34, math.floor(38 * ui))
     local status_height = math.max(22, math.floor(26 * ui))
 
+    -- One layout pass drives both hit testing and the initial window width, so
+    -- adding a tool can never push the right-hand buttons off-screen silently.
+    local function build_toolbar_buttons(bar_height)
+        local buttons = {}
+        local cursor_x = math.floor(10 * ui)
+        local cursor_y = math.floor(7 * ui)
+        local button_height = math.max(18, bar_height - 2 * cursor_y)
+
+        local function push_button(id, label, width)
+            table.insert(buttons, {
+                id = id,
+                label = label,
+                rect = {
+                    left = cursor_x,
+                    top = cursor_y,
+                    right = cursor_x + width,
+                    bottom = cursor_y + button_height,
+                },
+            })
+            cursor_x = cursor_x + width + math.floor(6 * ui)
+        end
+
+        for _, tool in ipairs(EDITOR_TOOLS) do
+            push_button("tool_" .. tool.id, tool.label, math.floor(tool.width * ui))
+        end
+
+        local swatch_size = math.max(12, button_height - math.floor(6 * ui))
+        local swatch_pad = math.floor(3 * ui)
+        for index = 1, #EDITOR_PALETTE do
+            table.insert(buttons, {
+                id = "color",
+                index = index,
+                rect = {
+                    left = cursor_x,
+                    top = cursor_y + swatch_pad,
+                    right = cursor_x + swatch_size,
+                    bottom = cursor_y + swatch_pad + swatch_size,
+                },
+            })
+            cursor_x = cursor_x + swatch_size + math.floor(5 * ui)
+        end
+
+        cursor_x = cursor_x + math.floor(8 * ui)
+        push_button("width_down", "-", math.floor(26 * ui))
+        push_button("width_up", "+", math.floor(26 * ui))
+        push_button("undo", "Undo", math.floor(54 * ui))
+        push_button("copy", "Copy", math.floor(54 * ui))
+        push_button("save", "Save", math.floor(54 * ui))
+
+        return buttons, cursor_x + math.floor(10 * ui)
+    end
+
     local image_bitmap, image_dc, previous_image
     local scratch_bitmap, scratch_dc, previous_scratch
     local font, owns_font
     local background_brush, toolbar_brush, status_brush, button_brush, active_brush
     local ring_brush, image_border_brush
     local swatch_brushes = {}
+    local text_fonts = {}
+    local owned_text_fonts = {}
 
     local function release_resources()
         if image_dc ~= nil and previous_image ~= nil then
@@ -2349,6 +2530,9 @@ local function win_edit_image(image, options)
         end
         for _, brush in ipairs(swatch_brushes) do
             gdi32.DeleteObject(brush)
+        end
+        for _, text_font in pairs(owned_text_fonts) do
+            gdi32.DeleteObject(text_font)
         end
         if background_brush ~= nil then
             gdi32.DeleteObject(background_brush)
@@ -2494,8 +2678,9 @@ local function win_edit_image(image, options)
         available_width, available_height)
     local initial_display_width = math.max(1, math.floor(image_width * initial_scale + 0.5))
     local initial_display_height = math.max(1, math.floor(image_height * initial_scale + 0.5))
+    local _, toolbar_natural_width = build_toolbar_buttons(toolbar_height)
     local initial_client_width = math.max(initial_display_width + 2 * margin_x,
-        math.floor(660 * ui))
+        math.floor(660 * ui), toolbar_natural_width)
     local initial_client_height = toolbar_height + initial_display_height + status_height
         + 2 * margin_y
 
@@ -2536,6 +2721,7 @@ local function win_edit_image(image, options)
         tool = options.tool or "rect",
         width_index = width_index,
         width_px = options.editor_width,
+        text_edit = nil,
         discard_armed = false,
         status = string.format(
             "%s  %s  %d px   |   drag to draw   |   T tool   |   Ctrl+Z undo   |   Enter save+copy   |   Esc discard",
@@ -2571,6 +2757,7 @@ local function win_edit_image(image, options)
                 y2 = annotation.y2,
                 color = annotation.color,
                 line_width = annotation.line_width,
+                text = annotation.text,
             }
         end
         return copied
@@ -2624,6 +2811,86 @@ local function win_edit_image(image, options)
         end
 
         set_tool(EDITOR_TOOLS[next_index].id)
+    end
+
+    -- Label editing lives in one table so the window procedure, which is close
+    -- to LuaJIT's upvalue limit, captures a single additional binding.
+    local text_editor = {}
+
+    function text_editor.status()
+        local editing = state.text_edit
+        if editing == nil then
+            return
+        end
+
+        set_status(string.format(
+            "Text  %d char%s   |   type   |   Enter commit   |   Esc cancel",
+            #editing.buffer, #editing.buffer == 1 and "" or "s"))
+    end
+
+    function text_editor.cancel()
+        if state.text_edit == nil then
+            return false
+        end
+
+        state.text_edit = nil
+        set_status("Text cancelled")
+        return true
+    end
+
+    function text_editor.commit()
+        local editing = state.text_edit
+        if editing == nil then
+            return false
+        end
+
+        state.text_edit = nil
+        local text = editing.buffer:gsub("%s+$", "")
+        if text == "" then
+            set_status("Empty label discarded")
+            return false
+        end
+
+        table.insert(state.undo_stack, copy_annotations())
+        state.redo_stack = {}
+        table.insert(state.annotations, {
+            tool = "text",
+            x1 = editing.x,
+            y1 = editing.y,
+            x2 = editing.x,
+            y2 = editing.y,
+            text = text,
+            color = editing.color,
+            line_width = editing.line_width,
+        })
+        set_status(string.format("Text  %q", text))
+        return true
+    end
+
+    function text_editor.start(image_x, image_y)
+        text_editor.commit()
+        state.text_edit = {
+            x = image_x,
+            y = image_y,
+            buffer = "",
+            color = state.color,
+            line_width = state.width_px,
+        }
+        text_editor.status()
+    end
+
+    function text_editor.type_code(code)
+        local editing = state.text_edit
+        if editing == nil then
+            return
+        end
+
+        if code == VK_BACK then
+            editing.buffer = editor_support.remove_last_char(editing.buffer)
+        elseif code >= 32 and code ~= 127 then
+            editing.buffer = editing.buffer .. editor_support.utf16_to_utf8(code)
+        end
+        text_editor.status()
     end
 
     local function to_rect(rectangle)
@@ -2683,6 +2950,84 @@ local function win_edit_image(image, options)
             scratch_dc, 0, 0, 1, 1, blend)
     end
 
+    -- Labels get one font per pixel height; the cache keeps [ and ] responsive
+    -- while typing, and the editor deletes what it created.
+    local function font_for_text_height(pixel_height)
+        local height = math.max(6, math.floor(pixel_height + 0.5))
+        local cached = text_fonts[height]
+        if cached ~= nil then
+            return cached
+        end
+
+        local face = utf8_to_wide("Segoe UI")
+        local created = gdi32.CreateFontW(-height, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0,
+            face)
+        if created ~= nil then
+            text_fonts[height] = created
+            owned_text_fonts[#owned_text_fonts + 1] = created
+            return created
+        end
+
+        text_fonts[height] = font
+        return font
+    end
+
+    local function draw_text_label(dc, annotation, origin_x, origin_y, scale,
+                                   preview_suffix)
+        local text = (annotation.text or "") .. (preview_suffix or "")
+        if text == "" then
+            return
+        end
+
+        local height = editor_support.text_height(annotation.line_width or 4) * scale
+        local label_font = font_for_text_height(height)
+        local previous_font = gdi32.SelectObject(dc, label_font)
+
+        gdi32.SetBkMode(dc, 1) -- TRANSPARENT
+        gdi32.SetTextColor(dc, annotation.color)
+        local rect = ffi.new("RECT")
+        rect.left = math.floor(origin_x + annotation.x1 * scale + 0.5)
+        rect.top = math.floor(origin_y + annotation.y1 * scale + 0.5)
+        rect.right = rect.left + math.floor(image_width * scale) + 1
+        rect.bottom = rect.top + math.floor(height * 1.5 + 4 * scale) + 2
+        user32.DrawTextW(dc, utf8_to_wide(text), -1, rect,
+            bit.bor(EDITOR_KEYS.DT_LEFT, EDITOR_KEYS.DT_SINGLELINE,
+                EDITOR_KEYS.DT_NOCLIP))
+
+        gdi32.SelectObject(dc, previous_font)
+    end
+
+    -- Everything outside the kept region is dimmed, so the crop preview cannot
+    -- be mistaken for the saved image.
+    local function draw_crop_mask(dc, annotation, origin_x, origin_y, scale)
+        local left, top, right, bottom = annotation_bounds(annotation)
+        local destination_left = math.floor(origin_x + left * scale + 0.5)
+        local destination_top = math.floor(origin_y + top * scale + 0.5)
+        local destination_right = math.floor(origin_x + right * scale + 0.5)
+        local destination_bottom = math.floor(origin_y + bottom * scale + 0.5)
+
+        local area_left = origin_x
+        local area_top = origin_y
+        local area_right = origin_x + image_width * scale
+        local area_bottom = origin_y + image_height * scale
+        local shadow = 0x00000000
+
+        fill_alpha_rect(dc, area_left, area_top, area_right, destination_top, shadow, 150)
+        fill_alpha_rect(dc, area_left, destination_bottom, area_right, area_bottom,
+            shadow, 150)
+        fill_alpha_rect(dc, area_left, destination_top, destination_left,
+            destination_bottom, shadow, 150)
+        fill_alpha_rect(dc, destination_right, destination_top, area_right,
+            destination_bottom, shadow, 150)
+
+        local frame = ffi.new("RECT")
+        frame.left = destination_left
+        frame.top = destination_top
+        frame.right = destination_right
+        frame.bottom = destination_bottom
+        user32.FrameRect(dc, frame, ring_brush)
+    end
+
     -- Pixelate the pixels under the annotation by shrinking them into the
     -- scratch surface and stretching the blocks back over the region.
     local function draw_redaction(dc, source_dc, left, top, right, bottom,
@@ -2717,8 +3062,19 @@ local function win_edit_image(image, options)
     end
 
     local function draw_annotation(dc, annotation, origin_x, origin_y, scale, source_dc)
+        -- Labels are anchored at a point, so they have no box to normalize.
+        if annotation.tool == "text" then
+            draw_text_label(dc, annotation, origin_x, origin_y, scale)
+            return
+        end
+
         local left, top, right, bottom = annotation_bounds(annotation)
         if right <= left and bottom <= top then
+            return
+        end
+
+        if annotation.tool == "crop" then
+            draw_crop_mask(dc, annotation, origin_x, origin_y, scale)
             return
         end
 
@@ -2746,7 +3102,13 @@ local function win_edit_image(image, options)
         end
         local old_pen = gdi32.SelectObject(dc, pen)
 
-        if annotation.tool == "arrow" then
+        if annotation.tool == "ellipse" then
+            local old_brush = gdi32.SelectObject(dc, gdi32.GetStockObject(NULL_BRUSH))
+            gdi32.Ellipse(dc, math.floor(destination_left + 0.5),
+                math.floor(destination_top + 0.5), math.floor(destination_right + 0.5),
+                math.floor(destination_bottom + 0.5))
+            gdi32.SelectObject(dc, old_brush)
+        elseif annotation.tool == "arrow" then
             local start_x = origin_x + annotation.x1 * scale
             local start_y = origin_y + annotation.y1 * scale
             local tip_x = origin_x + annotation.x2 * scale
@@ -2787,51 +3149,7 @@ local function win_edit_image(image, options)
         state.ox = math.floor((client_width - state.display_width) / 2)
         state.oy = area_top + math.floor((area_height - state.display_height) / 2)
 
-        state.buttons = {}
-        local cursor_x = math.floor(10 * ui)
-        local cursor_y = math.floor(7 * ui)
-        local button_height = math.max(18, toolbar_height - 2 * cursor_y)
-
-        local function push_button(id, label, width)
-            table.insert(state.buttons, {
-                id = id,
-                label = label,
-                rect = {
-                    left = cursor_x,
-                    top = cursor_y,
-                    right = cursor_x + width,
-                    bottom = cursor_y + button_height,
-                },
-            })
-            cursor_x = cursor_x + width + math.floor(6 * ui)
-        end
-
-        for _, tool in ipairs(EDITOR_TOOLS) do
-            push_button("tool_" .. tool.id, tool.label, math.floor(tool.width * ui))
-        end
-
-        local swatch_size = math.max(12, button_height - math.floor(6 * ui))
-        local swatch_pad = math.floor(3 * ui)
-        for index = 1, #EDITOR_PALETTE do
-            table.insert(state.buttons, {
-                id = "color",
-                index = index,
-                rect = {
-                    left = cursor_x,
-                    top = cursor_y + swatch_pad,
-                    right = cursor_x + swatch_size,
-                    bottom = cursor_y + swatch_pad + swatch_size,
-                },
-            })
-            cursor_x = cursor_x + swatch_size + math.floor(5 * ui)
-        end
-
-        cursor_x = cursor_x + math.floor(8 * ui)
-        push_button("width_down", "-", math.floor(26 * ui))
-        push_button("width_up", "+", math.floor(26 * ui))
-        push_button("undo", "Undo", math.floor(54 * ui))
-        push_button("copy", "Copy", math.floor(54 * ui))
-        push_button("save", "Save", math.floor(54 * ui))
+        state.buttons = build_toolbar_buttons(toolbar_height)
     end
 
     local function release_back_buffer()
@@ -2957,8 +3275,19 @@ local function win_edit_image(image, options)
         image_rect.bottom = state.oy + state.display_height
         user32.FrameRect(dc, image_rect, image_border_brush)
 
+        -- Only the newest crop decides what is kept; older ones are history and
+        -- would stack their dimming on top of each other.
+        local active_crop = nil
         for _, annotation in ipairs(state.annotations) do
-            draw_annotation(dc, annotation, state.ox, state.oy, state.scale, image_dc)
+            if annotation.tool == "crop" then
+                active_crop = annotation
+            end
+        end
+
+        for _, annotation in ipairs(state.annotations) do
+            if annotation.tool ~= "crop" or annotation == active_crop then
+                draw_annotation(dc, annotation, state.ox, state.oy, state.scale, image_dc)
+            end
         end
 
         if state.dragging then
@@ -2971,6 +3300,16 @@ local function win_edit_image(image, options)
                 color = state.color,
                 line_width = state.width_px,
             }, state.ox, state.oy, state.scale, image_dc)
+        end
+
+        if state.text_edit ~= nil then
+            draw_text_label(dc, {
+                text = state.text_edit.buffer,
+                x1 = state.text_edit.x,
+                y1 = state.text_edit.y,
+                color = state.text_edit.color,
+                line_width = state.text_edit.line_width,
+            }, state.ox, state.oy, state.scale, "|")
         end
 
         draw_toolbar(dc)
@@ -3014,9 +3353,12 @@ local function win_edit_image(image, options)
         local previous = gdi32.SelectObject(flat_dc, flat_bitmap)
 
         for _, annotation in ipairs(state.annotations) do
-            -- Redaction always samples the untouched capture, so preview and
-            -- final output agree even when shapes overlap.
-            draw_annotation(flat_dc, annotation, 0, 0, 1, image_dc)
+            -- Crop is a viewport, not a mark; it is applied to the pixels below.
+            if annotation.tool ~= "crop" then
+                -- Redaction always samples the untouched capture, so preview and
+                -- final output agree even when shapes overlap.
+                draw_annotation(flat_dc, annotation, 0, 0, 1, image_dc)
+            end
         end
 
         gdi32.SelectObject(flat_dc, previous)
@@ -3029,37 +3371,51 @@ local function win_edit_image(image, options)
         if rows ~= image_height then
             return nil, string.format("GetDIBits returned %d of %d rows", rows, image_height)
         end
-        return pixels
+
+        local crop_left, crop_top, crop_width, crop_height =
+            editor_support.crop_bounds(state.annotations, image_width, image_height)
+        if crop_left == nil then
+            return pixels, image_width, image_height
+        end
+
+        local cropped, crop_error = editor_support.crop_pixels(pixels, image_width, image_height,
+            crop_left, crop_top, crop_width, crop_height)
+        if not cropped then
+            return nil, crop_error
+        end
+        return cropped, crop_width, crop_height
     end
 
     local function encode_annotated()
-        local pixels, flatten_error = flatten_image()
+        local pixels, pixel_width, pixel_height = flatten_image()
         if not pixels then
-            return nil, flatten_error
+            return nil, pixel_width
         end
 
         local png, size_or_error, compressed = encode_png({
-            width = image_width,
-            height = image_height,
+            width = pixel_width,
+            height = pixel_height,
             pixels = pixels,
         }, options.compress)
         if not png then
             return nil, "PNG encoding failed: " .. tostring(size_or_error)
         end
 
-        return png, size_or_error, compressed, pixels
+        return png, size_or_error, compressed, pixels, pixel_width, pixel_height
     end
 
     local function copy_current()
-        local png, png_size, _compressed, pixels = encode_annotated()
+        text_editor.commit()
+        local png, png_size, _compressed, pixels, pixel_width, pixel_height =
+            encode_annotated()
         if not png then
             set_status(png_size, true)
             return false
         end
 
         local copied, clipboard_error, warnings = win_copy_to_clipboard({
-            width = image_width,
-            height = image_height,
+            width = pixel_width,
+            height = pixel_height,
             pixels = pixels,
         }, png, png_size)
         if not copied then
@@ -3071,13 +3427,15 @@ local function win_edit_image(image, options)
         for _, warning in ipairs(warnings or {}) do
             io.stderr:write("fshot: warning: " .. warning .. "\n")
         end
-        set_status(string.format("Copied %dx%d to clipboard", image_width, image_height))
+        set_status(string.format("Copied %dx%d to clipboard", pixel_width, pixel_height))
         return true
     end
 
     local function accept()
+        text_editor.commit()
         local started = now_ms()
-        local png, png_size, compressed, pixels = encode_annotated()
+        local png, png_size, compressed, pixels, pixel_width, pixel_height =
+            encode_annotated()
         if not png then
             set_status(png_size, true)
             return
@@ -3085,7 +3443,14 @@ local function win_edit_image(image, options)
 
         local result = nil
         local output_path = nil
-        if options.write_file then
+        if options.stdout then
+            local written, write_error = write_stdout_binary(png, png_size)
+            if not written then
+                io.stderr:write("fshot: " .. write_error .. "\n")
+                set_status(write_error, true)
+                return
+            end
+        elseif options.write_file then
             local path_error
             output_path, path_error = resolve_output_path(options.output, options)
             if not output_path then
@@ -3113,8 +3478,8 @@ local function win_edit_image(image, options)
         local copied = false
         if options.clipboard then
             local clipboard_ok, clipboard_error, warnings = win_copy_to_clipboard({
-                width = image_width,
-                height = image_height,
+                width = pixel_width,
+                height = pixel_height,
                 pixels = pixels,
             }, png, png_size)
             if not clipboard_ok then
@@ -3169,6 +3534,9 @@ local function win_edit_image(image, options)
         end
         result.copied = copied
         result.path_copied = path_copied
+        result.width = pixel_width
+        result.height = pixel_height
+        result.stdout = options.stdout and true or false
         result.elapsed_ms = now_ms() - started
         state.result = result
         user32.DestroyWindow(hwnd)
@@ -3190,6 +3558,7 @@ local function win_edit_image(image, options)
             local rect = button.rect
             if x >= rect.left and x < rect.right and y >= rect.top and y < rect.bottom then
                 state.discard_armed = false
+                text_editor.commit()
                 local tool_id = button.id:match("^tool_(.+)$")
                 if tool_id then
                     set_tool(tool_id)
@@ -3286,6 +3655,13 @@ local function win_edit_image(image, options)
                 return 0
             end
 
+            if state.tool == "text" then
+                local image_x, image_y = client_to_image(x, y)
+                text_editor.start(image_x, image_y)
+                user32.InvalidateRect(message_hwnd, nil, 0)
+                return 0
+            end
+
             state.discard_armed = false
             state.dragging = true
             state.start_x, state.start_y = client_to_image(x, y)
@@ -3353,8 +3729,29 @@ local function win_edit_image(image, options)
                 user32.InvalidateRect(message_hwnd, nil, 0)
             end
             return 0
+        elseif message == EDITOR_KEYS.WM_CHAR then
+            if state.text_edit ~= nil then
+                local code = tonumber(wparam)
+                if code == 13 then
+                    text_editor.commit()
+                else
+                    text_editor.type_code(code)
+                end
+                user32.InvalidateRect(message_hwnd, nil, 0)
+            end
+            return 0
         elseif message == EDITOR_KEYS.WM_KEYDOWN then
             local key = tonumber(wparam)
+            if state.text_edit ~= nil then
+                if key == EDITOR_KEYS.VK_ESCAPE then
+                    text_editor.cancel()
+                elseif key == EDITOR_KEYS.VK_RETURN then
+                    text_editor.commit()
+                end
+                user32.InvalidateRect(message_hwnd, nil, 0)
+                return 0
+            end
+
             if key == EDITOR_KEYS.VK_ESCAPE then
                 if state.dragging then
                     state.dragging = false
@@ -3392,6 +3789,8 @@ local function win_edit_image(image, options)
                 cycle_tool()
             elseif key == EDITOR_KEYS.VK_R then
                 set_tool("rect")
+            elseif key == EDITOR_KEYS.VK_E then
+                set_tool("ellipse")
             end
 
             user32.InvalidateRect(message_hwnd, nil, 0)
@@ -4322,6 +4721,8 @@ local function parse_options(arguments, config)
         clipboard_set = false,
         clip_path = nil,
         write_file = true,
+        stdout = false,
+        exec = nil,
         json = false,
         compress = true,
         edit = false,
@@ -4404,17 +4805,24 @@ local function parse_options(arguments, config)
         elseif argument == "--no-clip" then
             options.clipboard = false
             options.clipboard_set = true
+        elseif argument == "--stdout" then
+            options.stdout = true
+        elseif argument == "--exec" then
+            index = index + 1
+            if not arguments[index] or arguments[index] == "" then
+                return nil, "--exec requires a shell command"
+            end
+            options.exec = arguments[index]
         elseif argument == "--edit" then
             options.edit = true
         elseif argument == "--tool" then
             index = index + 1
             if not arguments[index] then
-                return nil, "--tool requires a name (rect, arrow, highlight, or redact)"
+                return nil, "--tool requires a name (" .. editor_support.tool_names() .. ")"
             end
             if not EDITOR_TOOL_IDS[arguments[index]] then
-                return nil, string.format(
-                    "unsupported --tool %q: use rect, arrow, highlight, or redact",
-                    arguments[index])
+                return nil, string.format("unsupported --tool %q: use %s",
+                    arguments[index], editor_support.tool_names())
             end
             options.tool = arguments[index]
         elseif argument == "--color" then
@@ -4451,7 +4859,29 @@ local function parse_options(arguments, config)
     -- --no-clip opts out and --no-file keeps only the clipboard copy. A path
     -- copy takes the clipboard instead of the image, so the paths never fight.
     if options.edit and not options.clipboard_set then
-        options.clipboard = (options.clip_path == nil)
+        options.clipboard = (options.clip_path == nil) and not options.stdout
+    end
+
+    if options.stdout and options.output then
+        return nil, "cannot combine --stdout with --out: stdout already carries the image"
+    end
+
+    if options.stdout and options.json then
+        return nil, "cannot combine --stdout with --json: the summary would corrupt "
+            .. "the PNG stream"
+    end
+
+    if options.stdout and options.clip_path then
+        return nil, "cannot combine --stdout with --clip-path: there is no saved file "
+            .. "to copy"
+    end
+
+    if options.stdout then
+        options.write_file = false
+    end
+
+    if options.exec and not options.write_file then
+        return nil, "--exec needs a saved file for FSHOT_FILE; drop --stdout or --no-file"
     end
 
     if options.edit and not IS_WINDOWS then
@@ -4477,10 +4907,10 @@ local function parse_options(arguments, config)
             .. "both replace the clipboard contents"
     end
 
-    if not options.write_file and not options.clipboard
+    if not options.write_file and not options.clipboard and not options.stdout
         and not options.test and not options.help and not options.list_windows then
-        return nil, "--no-file requires --clip (or --edit without --no-clip), "
-            .. "otherwise the capture would be discarded"
+        return nil, "--no-file requires --clip or --stdout (or --edit without "
+            .. "--no-clip), otherwise the capture would be discarded"
     end
 
     return options
@@ -4558,6 +4988,77 @@ function write_binary_file(path, data, size)
         return false, describe_write_error(path, close_error)
     end
 
+    return true
+end
+
+-- Windows stdio is text mode and would turn every 0x0A into CRLF, corrupting
+-- the PNG, so the bytes go straight to the standard handle instead.
+function write_stdout_binary(data, size)
+    if not IS_WINDOWS then
+        local written, write_error = io.stdout:write(ffi.string(data, size))
+        if not written then
+            return false, "cannot write the PNG to stdout: " .. tostring(write_error)
+        end
+
+        local flushed, flush_error = io.stdout:flush()
+        if not flushed then
+            return false, "cannot flush the PNG on stdout: " .. tostring(flush_error)
+        end
+        return true
+    end
+
+    local standard_output = -11 -- STD_OUTPUT_HANDLE
+    local handle = kernel32.GetStdHandle(standard_output)
+    if handle == nil or handle == ffi.cast("HANDLE", -1) then
+        return false, "cannot write the PNG to stdout: no standard output handle"
+    end
+
+    local written = ffi.new("DWORD[1]")
+    local source = ffi.cast("const uint8_t*", data)
+    local offset = 0
+    while offset < size do
+        local chunk = math.min(65536, size - offset)
+        written[0] = 0
+        if kernel32.WriteFile(handle, source + offset, chunk, written, nil) == 0 then
+            return false, "cannot write the PNG to stdout: " .. win_error_message()
+        end
+        if written[0] == 0 then
+            return false, "cannot write the PNG to stdout: the reader closed the pipe"
+        end
+        offset = offset + written[0]
+    end
+    return true
+end
+
+-- FSHOT_FILE carries the saved path into the hook; the shell command runs
+-- verbatim so users keep quoting and redirection control.
+function run_exec_hook(command, path)
+    if path == nil then
+        return false, "no saved file for FSHOT_FILE"
+    end
+
+    if IS_WINDOWS then
+        kernel32.SetEnvironmentVariableW(utf8_to_wide("FSHOT_FILE"), utf8_to_wide(path))
+    elseif os.setenv ~= nil then
+        pcall(os.setenv, "FSHOT_FILE", path)
+    end
+
+    local ok, how, code = os.execute(command)
+    -- os.execute reports a number on LuaJIT/Windows but may report the
+    -- (ok, "exit", code) triple elsewhere; collapse both shapes into an integer.
+    local status
+    if type(ok) == "number" then
+        status = ok
+    elseif how == "exit" and tonumber(code) then
+        status = tonumber(code)
+    elseif ok == true then
+        status = 0
+    else
+        status = 1
+    end
+    if status ~= 0 then
+        return false, status
+    end
     return true
 end
 
@@ -4780,9 +5281,78 @@ local function run_tests()
     local unknown_tool, unknown_tool_error = parse_options({ "--tool", "circle" }, {})
     check("parse_options rejects unknown tools with the valid list",
         unknown_tool == nil
-            and tostring(unknown_tool_error):find("rect, arrow, highlight, or redact", 1, true)
+            and tostring(unknown_tool_error):find(editor_support.tool_names(), 1, true)
                 ~= nil,
         tostring(unknown_tool_error))
+
+    for _, tool_id in ipairs({ "ellipse", "text", "crop" }) do
+        local tool_options, tool_error = parse_options({ "--tool", tool_id }, {})
+        check(string.format("parse_options accepts --tool %s", tool_id),
+            tool_options ~= nil and tool_options.tool == tool_id, tool_error)
+    end
+
+    check("tool_names lists every toolbar tool in order",
+        editor_support.tool_names() == "rect, ellipse, arrow, text, highlight, redact, crop",
+        editor_support.tool_names())
+
+    check("text_height scales with the line width and clamps",
+        editor_support.text_height(2) == 12
+            and editor_support.text_height(4) == 20
+            and editor_support.text_height(64) == 96,
+        string.format("%d %d %d", editor_support.text_height(2),
+            editor_support.text_height(4), editor_support.text_height(64)))
+
+    check("remove_last_char drops one ASCII character",
+        editor_support.remove_last_char("abc") == "ab")
+
+    check("remove_last_char drops a multi-byte code point",
+        editor_support.remove_last_char("caf\195\169") == "caf",
+        editor_support.remove_last_char("caf\195\169"))
+
+    check("remove_last_char handles an empty label",
+        editor_support.remove_last_char("") == "")
+
+    local crop_annotations = {
+        { tool = "crop", x1 = 2, y1 = 3, x2 = 10, y2 = 12 },
+        { tool = "rect", x1 = 0, y1 = 0, x2 = 1, y2 = 1 },
+        { tool = "crop", x1 = 20, y1 = 20, x2 = 99, y2 = 99 },
+    }
+    local crop_left, crop_top, crop_width, crop_height =
+        editor_support.crop_bounds(crop_annotations, 32, 24)
+    check("crop_bounds keeps the newest crop and clamps to the image",
+        crop_left == 20 and crop_top == 20 and crop_width == 12 and crop_height == 4,
+        string.format("%s,%s %sx%s", tostring(crop_left), tostring(crop_top),
+            tostring(crop_width), tostring(crop_height)))
+
+    check("crop_bounds ignores annotations without a crop",
+        editor_support.crop_bounds({ { tool = "rect", x1 = 0, y1 = 0, x2 = 5, y2 = 5 } },
+            10, 10) == nil)
+
+    do
+        local source_width, source_height = 4, 3
+        local source_pixels = ffi.new("uint8_t[?]", source_width * source_height * 4)
+        for pixel = 0, source_width * source_height - 1 do
+            source_pixels[pixel * 4] = pixel
+        end
+
+        local cropped, crop_error = editor_support.crop_pixels(source_pixels,
+            source_width, source_height, 1, 1, 2, 2)
+        local crop_values = {}
+        if cropped ~= nil then
+            for pixel = 0, 3 do
+                crop_values[#crop_values + 1] = cropped[pixel * 4]
+            end
+        end
+        check("crop_pixels copies the requested rows",
+            cropped ~= nil and table.concat(crop_values, ",") == "5,6,9,10",
+            crop_error or table.concat(crop_values, ","))
+
+        local outside, outside_error = editor_support.crop_pixels(source_pixels,
+            source_width, source_height, 9, 9, 2, 2)
+        check("crop_pixels rejects a region outside the image",
+            outside == nil and tostring(outside_error):find("outside", 1, true) ~= nil,
+            tostring(outside_error))
+    end
 
     if IS_WINDOWS then
         local screen = user32.GetDC(nil)
@@ -4965,6 +5535,75 @@ local function run_tests()
         no_file_options == nil
             and tostring(no_file_error):find("saved file", 1, true) ~= nil,
         tostring(no_file_error))
+
+    local stdout_options = parse_options({ "--stdout" }, {})
+    check("parse_options turns --stdout into a no-file capture",
+        stdout_options ~= nil and stdout_options.stdout
+            and stdout_options.write_file == false,
+        "write_file not cleared")
+
+    local stdout_out, stdout_out_error = parse_options(
+        { "--stdout", "--out", "shot.png" }, {})
+    check("parse_options rejects --stdout with --out",
+        stdout_out == nil and tostring(stdout_out_error):find("--out", 1, true) ~= nil,
+        tostring(stdout_out_error))
+
+    local stdout_json, stdout_json_error = parse_options({ "--stdout", "--json" }, {})
+    check("parse_options rejects --stdout with --json",
+        stdout_json == nil and tostring(stdout_json_error):find("--json", 1, true) ~= nil,
+        tostring(stdout_json_error))
+
+    local stdout_path, stdout_path_error = parse_options({ "--stdout", "--clip-path" }, {})
+    check("parse_options rejects --stdout with --clip-path",
+        stdout_path == nil
+            and tostring(stdout_path_error):find("no saved file", 1, true) ~= nil,
+        tostring(stdout_path_error))
+
+    local exec_options, exec_error = parse_options({ "--exec", "echo hi" }, {})
+    check("parse_options accepts --exec with a saved file",
+        exec_options ~= nil and exec_options.exec == "echo hi", exec_error)
+
+    local exec_stdout, exec_stdout_error = parse_options(
+        { "--stdout", "--exec", "echo hi" }, {})
+    check("parse_options rejects --exec with --stdout",
+        exec_stdout == nil
+            and tostring(exec_stdout_error):find("FSHOT_FILE", 1, true) ~= nil,
+        tostring(exec_stdout_error))
+
+    local exec_missing, exec_missing_error = parse_options({ "--exec" }, {})
+    check("parse_options requires a command for --exec",
+        exec_missing == nil
+            and tostring(exec_missing_error):find("shell command", 1, true) ~= nil,
+        tostring(exec_missing_error))
+
+    if IS_WINDOWS then
+        local hook_log = join_path(os.getenv("TEMP") or ".", "fshot-exec-test.txt")
+        os.remove(hook_log)
+        local hook_ok, hook_status = run_exec_hook(
+            string.format('echo %%FSHOT_FILE%%> "%s"', hook_log), "C:/hook target.png")
+
+        local hook_log_file = io.open(hook_log, "rb")
+        local hook_content = nil
+        if hook_log_file then
+            hook_content = hook_log_file:read("*a")
+            hook_log_file:close()
+            os.remove(hook_log)
+        end
+
+        check("run_exec_hook exposes FSHOT_FILE to the command",
+            hook_ok and hook_content ~= nil
+                and hook_content:find("hook target.png", 1, true) ~= nil,
+            string.format("ok=%s status=%s content=%s", tostring(hook_ok),
+                tostring(hook_status), tostring(hook_content)))
+
+        local failing_ok, failing_status = run_exec_hook("exit 7", "C:/hook.png")
+        check("run_exec_hook reports a failing command status",
+            failing_ok == false and tonumber(failing_status) == 7,
+            string.format("ok=%s status=%s", tostring(failing_ok),
+                tostring(failing_status)))
+    else
+        skip("run_exec_hook", "Windows only")
+    end
 
     if IS_WINDOWS then
         local active_options = parse_options({ "--active-window" }, {})
@@ -5215,6 +5854,16 @@ local function main(arguments)
         return run_tests()
     end
 
+    -- With --stdout the PNG owns stdout, so human-readable summaries move to
+    -- stderr instead of corrupting the stream.
+    local function report(message)
+        if options.stdout then
+            io.stderr:write(message .. "\n")
+        else
+            print(message)
+        end
+    end
+
     platform_prepare()
 
     if options.list_windows then
@@ -5297,26 +5946,49 @@ local function main(arguments)
             return 1
         end
 
+        local summary_image = {
+            width = result.width or image.width,
+            height = result.height or image.height,
+            x = image.x,
+            y = image.y,
+            source = image.source,
+        }
+
+        local exec_ok = true
+        local exec_status = nil
+        if options.exec then
+            exec_ok, exec_status = run_exec_hook(options.exec, result.path)
+        end
+
         if options.json then
-            print(json_summary(image, result.path, result.bytes, result.compressed,
+            print(json_summary(summary_image, result.path, result.bytes, result.compressed,
                 result.elapsed_ms, result.copied, result.path_copied))
         else
             local compression = result.compressed and "zlib" or "stored"
             local summary = string.format("%dx%d  %s  %s  %d ms",
-                image.width, image.height, format_bytes(result.bytes), compression,
-                result.elapsed_ms)
-            if result.path and result.path_copied then
+                summary_image.width, summary_image.height, format_bytes(result.bytes),
+                compression, result.elapsed_ms)
+            if result.stdout then
+                report(string.format("PNG written to stdout  %s", summary))
+            elseif result.path and result.path_copied then
                 local copied_kind = (options.clip_path == "md") and "markdown" or "path"
-                print(string.format("%s  %s  (%s copied)",
+                report(string.format("%s  %s  (%s copied)",
                     result.path, summary, copied_kind))
             elseif result.path and result.copied then
-                print(string.format("%s  %s  (also copied to clipboard)",
+                report(string.format("%s  %s  (also copied to clipboard)",
                     result.path, summary))
             elseif result.path then
-                print(string.format("%s  %s", result.path, summary))
+                report(string.format("%s  %s", result.path, summary))
             else
-                print(string.format("copied to clipboard  %s", summary))
+                report(string.format("copied to clipboard  %s", summary))
             end
+        end
+
+        if not exec_ok then
+            io.stderr:write(string.format(
+                "fshot: --exec %q failed with status %s; the image is at %s\n",
+                options.exec, tostring(exec_status), tostring(result.path)))
+            return 1
         end
         return 0
     end
@@ -5330,7 +6002,13 @@ local function main(arguments)
     local png_size = png_size_or_error
 
     local output_path = nil
-    if options.write_file then
+    if options.stdout then
+        local written, write_error = write_stdout_binary(png, png_size)
+        if not written then
+            io.stderr:write("fshot: " .. write_error .. "\n")
+            return 1
+        end
+    elseif options.write_file then
         local path_error
         output_path, path_error = resolve_output_path(options.output, options)
         if not output_path then
@@ -5379,6 +6057,12 @@ local function main(arguments)
         path_copied = true
     end
 
+    local exec_ok = true
+    local exec_status = nil
+    if options.exec then
+        exec_ok, exec_status = run_exec_hook(options.exec, output_path)
+    end
+
     local elapsed_ms = now_ms() - started_at
 
     if options.json then
@@ -5388,16 +6072,25 @@ local function main(arguments)
         local compression = compressed and "zlib" or "stored"
         local summary = string.format("%dx%d  %s  %s  %d ms",
             image.width, image.height, format_bytes(png_size), compression, elapsed_ms)
-        if output_path and path_copied then
+        if options.stdout then
+            report(string.format("PNG written to stdout  %s", summary))
+        elseif output_path and path_copied then
             local copied_kind = (options.clip_path == "md") and "markdown" or "path"
-            print(string.format("%s  %s  (%s copied)", output_path, summary, copied_kind))
+            report(string.format("%s  %s  (%s copied)", output_path, summary, copied_kind))
         elseif output_path and clipboard_ok then
-            print(string.format("%s  %s  (also copied to clipboard)", output_path, summary))
+            report(string.format("%s  %s  (also copied to clipboard)", output_path, summary))
         elseif output_path then
-            print(string.format("%s  %s", output_path, summary))
+            report(string.format("%s  %s", output_path, summary))
         else
-            print(string.format("copied to clipboard  %s", summary))
+            report(string.format("copied to clipboard  %s", summary))
         end
+    end
+
+    if not exec_ok then
+        io.stderr:write(string.format(
+            "fshot: --exec %q failed with status %s; the image is at %s\n",
+            options.exec, tostring(exec_status), tostring(output_path)))
+        return 1
     end
 
     return 0
