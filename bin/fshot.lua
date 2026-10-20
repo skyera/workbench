@@ -300,6 +300,7 @@ if IS_WINDOWS then
         BOOL MoveToEx(HDC hdc, int x, int y, POINT* previous);
         BOOL LineTo(HDC hdc, int x, int y);
         BOOL GetCursorPos(POINT* point);
+        BOOL ScreenToClient(HWND hWnd, POINT* point);
         HGDIOBJ GetStockObject(int i);
         int FillRect(HDC hDC, const RECT* lprc, HBRUSH hbr);
         int FrameRect(HDC hDC, const RECT* lprc, HBRUSH hbr);
@@ -462,6 +463,7 @@ local VK_OEM_6 = 0xDD
 local VK_T = 0x54
 local VK_ADD = 0x6B
 local VK_SUBTRACT = 0x6D
+local VK_M = 0x4D
 
 local DT_LEFT = 0x00000000
 local DT_CENTER = 0x00000001
@@ -533,7 +535,8 @@ Editor (--edit, Windows only):
   Text places a label: click, type, then Enter commits it; Esc drops it. Crop
   dims everything outside the dragged region and saves only that region. Move
   selects the shape under the cursor: drag it or a corner handle, press Delete
-  to remove it, or nudge it with the arrow keys (Shift for 10 px).
+  to remove it, or nudge it with the arrow keys (Shift for 10 px). M toggles a
+  4x loupe with an X,Y readout; the selector shows the same loupe by default.
 
 Other:
   -h, --help           Show this help message.
@@ -1512,6 +1515,169 @@ end
 -- Windows Region Selector
 --------------------------------------------------------------------------------
 
+-- Magnifier loupe shared by the selector and the editor: a 4x view of the
+-- image under the cursor with a crosshair and a coordinate readout. Grouped in
+-- one table to keep the main chunk's local slots in budget.
+local loupe = {}
+
+-- Sample rectangle centred on the cursor, clamped to the image. Sampling a
+-- smaller area than requested only happens next to an edge or on a tiny image.
+function loupe.source_rect(cursor_x, cursor_y, image_width, image_height,
+                           sample_width, sample_height)
+    local width = math.min(math.max(1, sample_width), math.max(1, image_width))
+    local height = math.min(math.max(1, sample_height), math.max(1, image_height))
+
+    local left = math.floor(cursor_x - width / 2)
+    local top = math.floor(cursor_y - height / 2)
+    left = math.max(0, math.min(image_width - width, left))
+    top = math.max(0, math.min(image_height - height, top))
+    return left, top, width, height
+end
+
+-- Panel position in view space: offset from the cursor, flipped to the other
+-- side when it would leave the view, then clamped.
+function loupe.panel_origin(cursor_x, cursor_y, view_width, view_height,
+                            panel_width, panel_height, offset)
+    local max_left = math.max(0, view_width - panel_width)
+    local max_top = math.max(0, view_height - panel_height)
+
+    local left = cursor_x + offset
+    local top = cursor_y + offset
+    if left + panel_width > view_width then
+        -- Flip to the other side; fall back to the far edge when that side is
+        -- too small either.
+        left = cursor_x - offset - panel_width
+        if left < 0 then
+            left = max_left
+        end
+    end
+    if top + panel_height > view_height then
+        top = cursor_y - offset - panel_height
+        if top < 0 then
+            top = max_top
+        end
+    end
+
+    left = math.max(0, math.min(max_left, left))
+    top = math.max(0, math.min(max_top, top))
+    return left, top
+end
+
+function loupe.readout(x, y)
+    return string.format("X %d   Y %d", math.floor(x + 0.5), math.floor(y + 0.5))
+end
+
+function loupe.draw(dc, source_dc, options)
+    local sample_left, sample_top, sample_width, sample_height = loupe.source_rect(
+        options.cursor_x, options.cursor_y, options.image_width, options.image_height,
+        options.sample_width, options.sample_height)
+
+    local zoom = options.zoom or 4
+    local scale = options.scale or 1
+    local panel_width = math.max(1, math.floor(sample_width * zoom * scale + 0.5))
+    local panel_height = math.max(1, math.floor(sample_height * zoom * scale + 0.5))
+    local offset = math.max(8, math.floor(18 * scale))
+
+    -- Measure the readout first: it sits under the panel and therefore takes
+    -- part in the placement decision.
+    local label = nil
+    local text_width, text_height = 0, 0
+    local padding = math.max(3, math.floor(5 * scale))
+    local strip_height = 0
+    if options.text ~= nil and options.text ~= "" and options.font ~= nil then
+        label = utf8_to_wide(options.text)
+        local measure = ffi.new("RECT")
+        user32.DrawTextW(dc, label, -1, measure,
+            bit.bor(DT_CALCRECT, DT_SINGLELINE, DT_LEFT))
+        text_width = measure.right - measure.left
+        text_height = measure.bottom - measure.top
+        strip_height = text_height + padding * 2
+    end
+
+    local strip_width = math.max(panel_width, text_width + padding * 2)
+    local unit_width = strip_width
+    -- +1 leaves the panel's bottom border row free between panel and readout.
+    local unit_height = panel_height + strip_height + 1
+
+    local panel_left, panel_top = loupe.panel_origin(options.cursor_view_x,
+        options.cursor_view_y, options.view_width, options.view_height,
+        unit_width, unit_height, offset)
+
+    gdi32.SetStretchBltMode(dc, COLORONCOLOR)
+    gdi32.StretchBlt(dc, panel_left, panel_top, panel_width, panel_height,
+        source_dc, sample_left, sample_top, sample_width, sample_height, SRCCOPY)
+
+    -- Crosshair on the target pixel, outlined so it shows on any content.
+    local cross_x = panel_left + math.floor(
+        (options.cursor_x - sample_left) / sample_width * panel_width)
+    local cross_y = panel_top + math.floor(
+        (options.cursor_y - sample_top) / sample_height * panel_height)
+
+    local outline_pen = gdi32.CreatePen(0, 3, 0x00000000)
+    local cross_pen = gdi32.CreatePen(0, 1, 0x00FFFFFF)
+    if outline_pen ~= nil then
+        local previous = gdi32.SelectObject(dc, outline_pen)
+        gdi32.MoveToEx(dc, cross_x, panel_top, nil)
+        gdi32.LineTo(dc, cross_x, panel_top + panel_height)
+        gdi32.MoveToEx(dc, panel_left, cross_y, nil)
+        gdi32.LineTo(dc, panel_left + panel_width, cross_y)
+        gdi32.SelectObject(dc, previous)
+    end
+    if cross_pen ~= nil then
+        local previous = gdi32.SelectObject(dc, cross_pen)
+        gdi32.MoveToEx(dc, cross_x, panel_top, nil)
+        gdi32.LineTo(dc, cross_x, panel_top + panel_height)
+        gdi32.MoveToEx(dc, panel_left, cross_y, nil)
+        gdi32.LineTo(dc, panel_left + panel_width, cross_y)
+        gdi32.SelectObject(dc, previous)
+    end
+
+    local border_brush = gdi32.CreateSolidBrush(0x00FFFFFF)
+    if border_brush ~= nil then
+        local frame = ffi.new("RECT")
+        frame.left = panel_left - 1
+        frame.top = panel_top - 1
+        frame.right = panel_left + panel_width + 1
+        frame.bottom = panel_top + panel_height + 1
+        user32.FrameRect(dc, frame, border_brush)
+        gdi32.DeleteObject(border_brush)
+    end
+
+    -- The readout sits directly under the panel so it never hides the sampled
+    -- pixels.
+    if label ~= nil then
+        local strip = ffi.new("RECT")
+        strip.left = panel_left
+        strip.top = panel_top + panel_height + 1
+        strip.right = panel_left + strip_width
+        strip.bottom = strip.top + strip_height
+        user32.FillRect(dc, strip, options.label_brush)
+
+        local previous_font = gdi32.SelectObject(dc, options.font)
+        gdi32.SetBkMode(dc, 1) -- TRANSPARENT
+        gdi32.SetTextColor(dc, 0x00FFFFFF)
+
+        local text_rect = ffi.new("RECT")
+        text_rect.left = strip.left + padding
+        text_rect.top = strip.top + padding
+        text_rect.right = strip.right - padding
+        text_rect.bottom = strip.bottom - padding
+        user32.DrawTextW(dc, label, -1, text_rect,
+            bit.bor(DT_LEFT, DT_SINGLELINE, DT_VCENTER))
+
+        gdi32.SelectObject(dc, previous_font)
+    end
+
+    if outline_pen ~= nil then
+        gdi32.DeleteObject(outline_pen)
+    end
+    if cross_pen ~= nil then
+        gdi32.DeleteObject(cross_pen)
+    end
+
+    return panel_left, panel_top, panel_width, panel_height
+end
+
 -- Module-level anchor for the active WNDPROC callback. RegisterClassW stores
 -- only a raw pointer, and LuaJIT may collect a callback cdata once its local
 -- is no longer referenced, which would panic on the next delivered message.
@@ -1690,8 +1856,10 @@ local function win_select_region()
         anchor_y = 0,
         cursor_x = 0,
         cursor_y = 0,
+        pointer_seen = false,
         selection = nil,
         hover = nil,
+        loupe = true,
         cancel_reason = nil,
         destroyed = false,
     }
@@ -1894,6 +2062,26 @@ local function win_select_region()
                 bit.bor(DT_LEFT, DT_SINGLELINE, DT_VCENTER))
         end
 
+        if state.loupe and state.pointer_seen then
+            loupe.draw(dc, frozen_dc, {
+                cursor_x = state.cursor_x,
+                cursor_y = state.cursor_y,
+                cursor_view_x = state.cursor_x,
+                cursor_view_y = state.cursor_y,
+                view_width = width,
+                view_height = height,
+                image_width = width,
+                image_height = height,
+                sample_width = 40,
+                sample_height = 30,
+                zoom = 4,
+                scale = 1,
+                font = font,
+                label_brush = label_brush,
+                text = loupe.readout(state.cursor_x, state.cursor_y),
+            })
+        end
+
         local hint_rect = ffi.new("RECT")
         hint_rect.left = 0
         hint_rect.top = 0
@@ -1905,7 +2093,7 @@ local function win_select_region()
         gdi32.SetTextColor(dc, 0x00FFFFFF)
         gdi32.SelectObject(dc, font)
         local hint = utf8_to_wide(
-            "Drag to select a region, or click a window      Esc or right-click to cancel")
+            "Drag to select a region, or click a window      M loupe      Esc or right-click to cancel")
         user32.DrawTextW(dc, hint, -1, hint_rect,
             bit.bor(DT_CENTER, DT_VCENTER, DT_SINGLELINE))
     end
@@ -1932,12 +2120,14 @@ local function win_select_region()
         elseif message == WM_LBUTTONDOWN then
             state.anchor_x, state.anchor_y = mouse_point(lparam)
             state.cursor_x, state.cursor_y = state.anchor_x, state.anchor_y
+            state.pointer_seen = true
             update_hover(state.anchor_x, state.anchor_y)
             state.dragging = true
             user32.SetCapture(hwnd)
             user32.InvalidateRect(hwnd, nil, 0)
             return 0
         elseif message == WM_MOUSEMOVE then
+            state.pointer_seen = true
             if state.dragging then
                 local next_x, next_y = mouse_point(lparam)
                 if next_x ~= state.cursor_x or next_y ~= state.cursor_y then
@@ -1947,6 +2137,8 @@ local function win_select_region()
             else
                 local next_x, next_y = mouse_point(lparam)
                 local previous_hover = state.hover
+                local previous_x, previous_y = state.cursor_x, state.cursor_y
+                state.cursor_x, state.cursor_y = next_x, next_y
                 update_hover(next_x, next_y)
                 local changed = (previous_hover == nil) ~= (state.hover == nil)
                     or (previous_hover ~= nil and state.hover ~= nil
@@ -1954,7 +2146,8 @@ local function win_select_region()
                             or previous_hover.y ~= state.hover.y
                             or previous_hover.width ~= state.hover.width
                             or previous_hover.height ~= state.hover.height))
-                if changed then
+                local moved = previous_x ~= next_x or previous_y ~= next_y
+                if changed or (state.loupe and moved) then
                     user32.InvalidateRect(hwnd, nil, 0)
                 end
             end
@@ -1987,9 +2180,15 @@ local function win_select_region()
             user32.DestroyWindow(hwnd)
             return 0
         elseif message == WM_KEYDOWN then
-            if tonumber(wparam) == VK_ESCAPE then
+            local key = tonumber(wparam)
+            if key == VK_ESCAPE then
                 state.cancel_reason = "selection cancelled"
                 user32.DestroyWindow(hwnd)
+                return 0
+            end
+            if key == VK_M then
+                state.loupe = not state.loupe
+                user32.InvalidateRect(hwnd, nil, 0)
                 return 0
             end
         elseif message == WM_DESTROY then
@@ -2054,6 +2253,8 @@ local function win_select_region()
         local cursor_x = tonumber(cursor_position.x) - bounds.x
         local cursor_y = tonumber(cursor_position.y) - bounds.y
         if cursor_x >= 0 and cursor_x < width and cursor_y >= 0 and cursor_y < height then
+            state.cursor_x, state.cursor_y = cursor_x, cursor_y
+            state.pointer_seen = true
             update_hover(cursor_x, cursor_y)
         end
     end
@@ -2497,6 +2698,7 @@ local EDITOR_KEYS = {
     VK_OEM_6 = VK_OEM_6,
     VK_ADD = VK_ADD,
     VK_SUBTRACT = VK_SUBTRACT,
+    VK_M = VK_M,
     DT_LEFT = DT_LEFT,
     DT_CENTER = DT_CENTER,
     DT_VCENTER = DT_VCENTER,
@@ -2874,9 +3076,10 @@ local function win_edit_image(image, options)
         selection = nil,
         hover = nil,
         gesture = nil,
+        loupe = false,
         discard_armed = false,
         status = string.format(
-            "%s  %s  %d px   |   drag to draw   |   T tool   |   Ctrl+Z undo   |   Enter save+copy   |   Esc discard",
+            "%s  %s  %d px   |   drag to draw   |   T tool   |   M loupe   |   Ctrl+Z undo   |   Enter save+copy   |   Esc discard",
             tool_label(options.tool), color_to_hex(options.editor_color),
             options.editor_width),
         status_is_error = false,
@@ -3645,6 +3848,34 @@ local function win_edit_image(image, options)
             move_tool.draw(dc)
         end
 
+        if state.loupe then
+            local pointer_x = state.last_x
+            local pointer_y = state.last_y
+            local over = pointer_x >= state.ox and pointer_x < state.ox + state.display_width
+                and pointer_y >= state.oy and pointer_y < state.oy + state.display_height
+            if over then
+                local image_x = (pointer_x - state.ox) / state.scale
+                local image_y = (pointer_y - state.oy) / state.scale
+                loupe.draw(dc, image_dc, {
+                    cursor_x = image_x,
+                    cursor_y = image_y,
+                    cursor_view_x = pointer_x,
+                    cursor_view_y = pointer_y,
+                    view_width = state.client_width,
+                    view_height = state.client_height - status_height,
+                    image_width = image_width,
+                    image_height = image_height,
+                    sample_width = 40,
+                    sample_height = 30,
+                    zoom = 4,
+                    scale = state.scale,
+                    font = font,
+                    label_brush = status_brush,
+                    text = loupe.readout(image_x, image_y),
+                })
+            end
+        end
+
         draw_toolbar(dc)
         draw_status(dc)
     end
@@ -4044,6 +4275,7 @@ local function win_edit_image(image, options)
         elseif message == EDITOR_KEYS.WM_MOUSEMOVE then
             local x = mouse_x(lparam)
             local y = mouse_y(lparam)
+            local previous_x, previous_y = state.last_x, state.last_y
             state.last_x, state.last_y = x, y
             if state.gesture ~= nil then
                 local image_x, image_y = client_to_image(x, y)
@@ -4070,6 +4302,12 @@ local function win_edit_image(image, options)
                 user32.SetCursor(cross_cursor)
             else
                 user32.SetCursor(arrow_cursor)
+            end
+
+            -- The loupe tracks the pointer, so a move with no other visible
+            -- change still needs a repaint while it is on.
+            if state.loupe and (previous_x ~= x or previous_y ~= y) then
+                user32.InvalidateRect(message_hwnd, nil, 0)
             end
             return 0
         elseif message == EDITOR_KEYS.WM_LBUTTONUP then
@@ -4185,6 +4423,9 @@ local function win_edit_image(image, options)
                 set_tool("rect")
             elseif key == EDITOR_KEYS.VK_E then
                 set_tool("ellipse")
+            elseif key == EDITOR_KEYS.VK_M then
+                state.loupe = not state.loupe
+                set_status(state.loupe and "Loupe on" or "Loupe off")
             elseif key == EDITOR_KEYS.VK_DELETE then
                 move_tool.delete()
             elseif key == EDITOR_KEYS.VK_LEFT or key == EDITOR_KEYS.VK_RIGHT
@@ -4278,6 +4519,14 @@ local function win_edit_image(image, options)
         return nil, reason
     end
     update_layout()
+
+    -- Seed the pointer so the loupe can draw before the first mouse move.
+    local pointer = ffi.new("POINT")
+    if user32.GetCursorPos(pointer) ~= 0
+        and user32.ScreenToClient(hwnd, pointer) ~= 0 then
+        state.last_x = tonumber(pointer.x)
+        state.last_y = tonumber(pointer.y)
+    end
 
     -- Same reveal discipline as the selector: compose the first frame while the
     -- layered window is fully transparent, then fade it in.
@@ -5844,6 +6093,53 @@ local function run_tests()
         local height = math.abs(shape.y2 - shape.y1)
         check("resize enforces a two-pixel minimum", shrunk and width == 2 and height == 2,
             string.format("%d,%d %d,%d", shape.x1, shape.y1, shape.x2, shape.y2))
+    end
+
+    do
+        local left, top, width, height = loupe.source_rect(100, 100, 400, 300, 40, 30)
+        check("loupe source rect is centred on the cursor",
+            left == 80 and top == 85 and width == 40 and height == 30,
+            string.format("%d,%d %dx%d", left, top, width, height))
+
+        local edge_left, edge_top = loupe.source_rect(0, 0, 400, 300, 40, 30)
+        check("loupe source rect clamps at the top-left edge",
+            edge_left == 0 and edge_top == 0,
+            string.format("%d,%d", edge_left, edge_top))
+
+        local far_left, far_top = loupe.source_rect(399, 299, 400, 300, 40, 30)
+        check("loupe source rect clamps at the bottom-right edge",
+            far_left == 360 and far_top == 270,
+            string.format("%d,%d", far_left, far_top))
+
+        local tiny_width, tiny_height = select(3, loupe.source_rect(5, 5, 10, 8, 40, 30))
+        check("loupe source rect never exceeds a tiny image",
+            tiny_width == 10 and tiny_height == 8,
+            string.format("%dx%d", tiny_width, tiny_height))
+    end
+
+    do
+        local panel_left, panel_top = loupe.panel_origin(100, 100, 800, 600, 160, 120, 18)
+        check("loupe panel sits below and right of the cursor",
+            panel_left == 118 and panel_top == 118,
+            string.format("%d,%d", panel_left, panel_top))
+
+        local flip_left, flip_top = loupe.panel_origin(700, 500, 800, 600, 160, 120, 18)
+        check("loupe panel flips near the bottom-right corner",
+            flip_left == 522 and flip_top == 362,
+            string.format("%d,%d", flip_left, flip_top))
+
+        local clamp_left, clamp_top = loupe.panel_origin(5, 5, 100, 80, 160, 120, 18)
+        check("loupe panel clamps inside a small view",
+            clamp_left == 0 and clamp_top == 0,
+            string.format("%d,%d", clamp_left, clamp_top))
+
+        local tight_left, tight_top = loupe.panel_origin(30, 180, 600, 320, 160, 167, 18)
+        check("loupe panel falls back to the far edge when the flipped side is too small",
+            tight_left == 48 and tight_top == 153,
+            string.format("%d,%d", tight_left, tight_top))
+
+        check("loupe readout rounds and labels coordinates",
+            loupe.readout(12.4, 99.6) == "X 12   Y 100", loupe.readout(12.4, 99.6))
     end
 
     if IS_WINDOWS then
