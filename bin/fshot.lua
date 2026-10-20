@@ -5,15 +5,16 @@
   Features:
     - Full virtual desktop capture across monitors, including negative coordinates.
     - Region capture in physical pixels (--region X,Y,W,H).
-    - Interactive region selection (--select) over a frozen, dimmed desktop with a live
-      size readout; Esc or right-click cancels (Windows only).
-    - Annotation editor (--edit) that opens the capture with a rectangle tool, palette,
-      line width, undo/redo, and save/copy actions (Windows only).
+    - Interactive capture (--select) over a frozen, dimmed desktop: drag a region or
+      click the highlighted window under the cursor; Esc or right-click cancels.
+    - Annotation editor (--edit) with rectangle, arrow, highlight, and pixelating
+      redaction tools, palette, line width, undo/redo, and save/copy actions.
     - Window capture by title or process substring (--window TEXT), or of the
       foreground window (--active-window), using PrintWindow so occluded windows are
       rendered, with a screen-blit fallback when that fails.
     - PNG encoding in-process: zlib when a zlib library is available, otherwise valid
-      stored-deflate blocks, so there is never an external dependency.
+      stored-deflate blocks, so there is never an external dependency. Predictive
+      row filtering is used only when it actually beats unfiltered deflate.
     - Optional clipboard copy: native CF_DIB + "PNG" formats on Windows; wl-copy or
       xclip on Linux when installed. --clip-path copies the saved path, or a
       percent-encoded markdown image link, as Unicode text instead.
@@ -44,7 +45,7 @@
     --no-clip            In --edit, do not copy on Enter or Save.
     --no-file            Do not write a file; requires --clip.
     --edit               Open the annotation editor before saving (Windows only).
-    --tool rect          Annotation tool (phase 1 only supports rect).
+    --tool NAME          Annotation tool: rect, arrow, highlight, or redact.
     --color NAME|#RRGGBB Annotation color (default red, #E53935).
     --width N            Annotation line width in image pixels (default 4).
     --no-compress        Store uncompressed deflate blocks even when zlib is available.
@@ -159,6 +160,8 @@ if IS_WINDOWS then
         BOOL GetMonitorInfoW(HMONITOR hMonitor, MONITORINFO* lpmi);
         BOOL IsWindowVisible(HWND hWnd);
         BOOL IsIconic(HWND hWnd);
+        LONG GetWindowLongW(HWND hWnd, int nIndex);
+        int GetClassNameW(HWND hWnd, wchar_t* lpClassName, int nMaxCount);
         int GetWindowTextW(HWND hWnd, wchar_t* lpString, int nMaxCount);
         int GetWindowTextLengthW(HWND hWnd);
         DWORD GetWindowThreadProcessId(HWND hWnd, DWORD* lpdwProcessId);
@@ -283,6 +286,9 @@ if IS_WINDOWS then
 
         HBRUSH CreateSolidBrush(DWORD color);
         HPEN CreatePen(int iStyle, int cWidth, DWORD color);
+        BOOL MoveToEx(HDC hdc, int x, int y, POINT* previous);
+        BOOL LineTo(HDC hdc, int x, int y);
+        BOOL GetCursorPos(POINT* point);
         HGDIOBJ GetStockObject(int i);
         int FillRect(HDC hDC, const RECT* lprc, HBRUSH hbr);
         int FrameRect(HDC hDC, const RECT* lprc, HBRUSH hbr);
@@ -300,6 +306,7 @@ if IS_WINDOWS then
                         HDC hdcSrc, int xoriginSrc, int yoriginSrc, int wSrc, int hSrc,
                         BLENDFUNCTION ftn);
         int SetStretchBltMode(HDC hdc, int mode);
+        BOOL SetBrushOrgEx(HDC hdc, int x, int y, POINT* lppt);
         BOOL StretchBlt(HDC hdcDest, int xDest, int yDest, int wDest, int hDest,
                         HDC hdcSrc, int xSrc, int ySrc, int wSrc, int hSrc,
                         DWORD rop);
@@ -402,11 +409,15 @@ local WS_OVERLAPPEDWINDOW = 0x00CF0000
 local WS_EX_TOPMOST = 0x00000008
 local WS_EX_TOOLWINDOW = 0x00000080
 local WS_EX_LAYERED = 0x00080000
+local WS_EX_TRANSPARENT = 0x00000020
+local WS_EX_NOACTIVATE = 0x08000000
+local GWL_EXSTYLE = -20
 local LWA_ALPHA = 0x00000002
 local SW_SHOW = 5
 local NULL_BRUSH = 5
 local DEFAULT_GUI_FONT = 17
 local COLORONCOLOR = 3
+local HALFTONE = 4
 local MONITOR_DEFAULTTONEAREST = 2
 local LOGPIXELSY = 90
 local IDC_ARROW = 32512
@@ -436,6 +447,7 @@ local VK_Y = 0x59
 local VK_Z = 0x5A
 local VK_OEM_4 = 0xDB
 local VK_OEM_6 = 0xDD
+local VK_T = 0x54
 local VK_ADD = 0x6B
 local VK_SUBTRACT = 0x6D
 
@@ -452,6 +464,12 @@ local LSB_FIRST = 0
 local PNG_SIGNATURE = "\x89PNG\r\n\x1a\n"
 local DEFLATE_BLOCK_MAX = 65535
 
+local PNG_FILTER_NONE = 0
+local PNG_FILTER_SUB = 1
+local PNG_FILTER_UP = 2
+local PNG_FILTER_AVERAGE = 3
+local PNG_FILTER_PAETH = 4
+
 local USAGE = [[
 Usage:
   fshot [--full | --region X,Y,W,H | --window TEXT | --active-window | --select] [options]
@@ -463,7 +481,7 @@ Capture:
   --region X,Y,W,H     Capture a rectangle in physical pixels (negative origins allowed).
   --window TEXT        Capture the best visible window matching TEXT (Windows only).
   --active-window, -a  Capture the foreground window (Windows only).
-  --select, -s         Drag a rectangle to capture it (Windows only).
+  --select, -s         Drag a region, or click the highlighted window (Windows only).
   --list-windows       List visible top-level windows (Windows only).
   --delay MS           Wait before capturing, so menus can be opened.
 
@@ -486,14 +504,15 @@ Configuration:
   the current directory.
 
 Editor (--edit, Windows only):
-  --tool rect          Annotation tool; phase 1 supports rectangles only.
+  --tool NAME          Annotation tool: rect, arrow, highlight, or redact.
   --color NAME|#RRGGBB Annotation color (default red, #E53935).
   --width N            Line width in image pixels (default 4).
 
-  The editor opens with the capture fitted to the monitor. Drag to draw a
-  rectangle, 1-6 pick a color, [ and ] change width, Ctrl+Z/Ctrl+Y undo and
-  redo, C copies without closing, Enter saves and copies, and Esc discards
-  (a second Esc confirms when shapes exist).
+  The editor opens with the capture fitted to the monitor. Drag to draw the
+  active tool, T cycles tools (R returns to rectangles), 1-6 pick a color,
+  [ and ] change width, Ctrl+Z/Ctrl+Y undo and redo, C copies without closing,
+  Enter saves and copies, and Esc discards (a second Esc confirms when shapes
+  exist). Redact pixelates the region so text underneath cannot be recovered.
 
 Other:
   -h, --help           Show this help message.
@@ -752,23 +771,108 @@ end
 -- PNG Encoder
 --------------------------------------------------------------------------------
 
-local function build_scanlines(width, height, pixels)
+local function paeth_predictor(left, up, up_left)
+    local estimate = left + up - up_left
+    local distance_left = math.abs(estimate - left)
+    local distance_up = math.abs(estimate - up)
+    local distance_up_left = math.abs(estimate - up_left)
+
+    if distance_left <= distance_up and distance_left <= distance_up_left then
+        return left
+    end
+    if distance_up <= distance_up_left then
+        return up
+    end
+    return up_left
+end
+
+-- PNG's filter heuristic treats bytes as signed and sums their magnitudes.
+local function filter_magnitude(value)
+    if value >= 128 then
+        return 256 - value
+    end
+    return value
+end
+
+-- filter_mode is "auto" for the per-row heuristic or a fixed PNG filter
+-- constant. Auto can lose to None on flat UI, so encode_png tries both.
+local function build_scanlines(width, height, pixels, filter_mode)
     local source_stride = width * 4
-    local row_size = 1 + width * 3
+    local pixel_row_size = width * 3
+    local row_size = 1 + pixel_row_size
     local raw = ffi.new("uint8_t[?]", row_size * height)
+    local line = ffi.new("uint8_t[?]", pixel_row_size)
+    local previous = ffi.new("uint8_t[?]", pixel_row_size)
     local position = 0
 
     for row = 0, height - 1 do
         local source = row * source_stride
-        raw[position] = 0 -- PNG filter type 0 (None)
-        position = position + 1
-        for _ = 0, width - 1 do
-            raw[position] = pixels[source + 2]
-            raw[position + 1] = pixels[source + 1]
-            raw[position + 2] = pixels[source]
-            position = position + 3
+
+        -- Unpack BGRA into the RGB bytes this row filters.
+        for index = 0, width - 1 do
+            line[index * 3] = pixels[source + 2]
+            line[index * 3 + 1] = pixels[source + 1]
+            line[index * 3 + 2] = pixels[source]
             source = source + 4
         end
+
+        local filter = filter_mode
+        if filter_mode == "auto" then
+            -- Score None, Sub, Up, and Paeth; the cheapest wins for this row.
+            local score_none = 0
+            local score_sub = 0
+            local score_up = 0
+            local score_paeth = 0
+            for index = 0, pixel_row_size - 1 do
+                local value = line[index]
+                local left = index >= 3 and line[index - 3] or 0
+                local up = previous[index]
+                local up_left = index >= 3 and previous[index - 3] or 0
+
+                score_none = score_none + filter_magnitude(value)
+                score_sub = score_sub + filter_magnitude((value - left) % 256)
+                score_up = score_up + filter_magnitude((value - up) % 256)
+                score_paeth = score_paeth + filter_magnitude(
+                    (value - paeth_predictor(left, up, up_left)) % 256)
+            end
+
+            filter = PNG_FILTER_NONE
+            local best_score = score_none
+            if score_sub < best_score then
+                filter = PNG_FILTER_SUB
+                best_score = score_sub
+            end
+            if score_up < best_score then
+                filter = PNG_FILTER_UP
+                best_score = score_up
+            end
+            if score_paeth < best_score then
+                filter = PNG_FILTER_PAETH
+            end
+        end
+
+        raw[position] = filter
+        position = position + 1
+
+        for index = 0, pixel_row_size - 1 do
+            local value = line[index]
+            local left = index >= 3 and line[index - 3] or 0
+            local up = previous[index]
+            local up_left = index >= 3 and previous[index - 3] or 0
+
+            if filter == PNG_FILTER_SUB then
+                value = (value - left) % 256
+            elseif filter == PNG_FILTER_UP then
+                value = (value - up) % 256
+            elseif filter == PNG_FILTER_PAETH then
+                value = (value - paeth_predictor(left, up, up_left)) % 256
+            end
+
+            raw[position] = value
+            position = position + 1
+        end
+
+        ffi.copy(previous, line, pixel_row_size)
     end
 
     return raw
@@ -836,22 +940,7 @@ local function write_chunk(png, offset, chunk_type, data, data_length)
     return offset + 12 + data_length
 end
 
-local function encode_png(image, allow_compression)
-    local raw = build_scanlines(image.width, image.height, image.pixels)
-    local raw_size = ffi.sizeof(raw)
-
-    local idat, idat_size, compressed
-    if allow_compression and zlib then
-        local compressed_idat, compressed_idat_size = compress_with_zlib(raw, raw_size)
-        if not compressed_idat then
-            return nil, compressed_idat_size
-        end
-        idat, idat_size, compressed = compressed_idat, compressed_idat_size, true
-    else
-        idat, idat_size = wrap_stored_deflate(raw, raw_size)
-        compressed = false
-    end
-
+local function assemble_png(image, idat, idat_size, compressed)
     local header = ffi.new("uint8_t[13]")
     write_u32_be(header, 0, image.width)
     write_u32_be(header, 4, image.height)
@@ -871,6 +960,36 @@ local function encode_png(image, allow_compression)
     assert(offset == total, "PNG size accounting mismatch")
 
     return png, total, compressed
+end
+
+local function encode_png(image, allow_compression)
+    if allow_compression and zlib then
+        -- Per-row filtering helps gradients and photographs but can lose to
+        -- unfiltered flat UI, so encode both and keep the smaller stream.
+        local unfiltered = build_scanlines(image.width, image.height, image.pixels,
+            PNG_FILTER_NONE)
+        local adaptive = build_scanlines(image.width, image.height, image.pixels, "auto")
+
+        local unfiltered_idat, unfiltered_size = compress_with_zlib(unfiltered,
+            ffi.sizeof(unfiltered))
+        if not unfiltered_idat then
+            return nil, unfiltered_size
+        end
+
+        local adaptive_idat, adaptive_size = compress_with_zlib(adaptive, ffi.sizeof(adaptive))
+        if not adaptive_idat then
+            return nil, adaptive_size
+        end
+
+        if adaptive_size < unfiltered_size then
+            return assemble_png(image, adaptive_idat, adaptive_size, true)
+        end
+        return assemble_png(image, unfiltered_idat, unfiltered_size, true)
+    end
+
+    local raw = build_scanlines(image.width, image.height, image.pixels, PNG_FILTER_NONE)
+    local idat, idat_size = wrap_stored_deflate(raw, ffi.sizeof(raw))
+    return assemble_png(image, idat, idat_size, false)
 end
 
 local function inspect_png(png, size)
@@ -1027,18 +1146,47 @@ local function inflate_with_zlib(compressed, compressed_size, expected_size)
 end
 
 local function decode_scanlines(raw, width, height)
-    local row_size = 1 + width * 3
+    local pixel_row_size = width * 3
+    local row_size = 1 + pixel_row_size
+    local previous = ffi.new("uint8_t[?]", pixel_row_size)
+    local current = ffi.new("uint8_t[?]", pixel_row_size)
     local pixels = {}
 
     for row = 0, height - 1 do
         local base = row * row_size
-        if raw[base] ~= 0 then
-            return nil, string.format("row %d uses filter %d, expected 0", row, raw[base])
+        local filter = raw[base]
+        if filter ~= PNG_FILTER_NONE and filter ~= PNG_FILTER_UP
+            and filter ~= PNG_FILTER_SUB and filter ~= PNG_FILTER_AVERAGE
+            and filter ~= PNG_FILTER_PAETH then
+            return nil, string.format("row %d uses unknown filter %d", row, filter)
         end
+
+        for index = 0, pixel_row_size - 1 do
+            local value = raw[base + 1 + index]
+            local left = index >= 3 and current[index - 3] or 0
+            local up = previous[index]
+            local up_left = index >= 3 and previous[index - 3] or 0
+
+            if filter == PNG_FILTER_UP then
+                value = value + up
+            elseif filter == PNG_FILTER_SUB then
+                value = value + left
+            elseif filter == PNG_FILTER_AVERAGE then
+                value = value + math.floor((left + up) / 2)
+            elseif filter == PNG_FILTER_PAETH then
+                value = value + paeth_predictor(left, up, up_left)
+            end
+
+            current[index] = value % 256
+        end
+
         for column = 0, width - 1 do
-            local offset = base + 1 + column * 3
-            table.insert(pixels, { r = raw[offset], g = raw[offset + 1], b = raw[offset + 2] })
+            local offset = column * 3
+            table.insert(pixels, { r = current[offset], g = current[offset + 1],
+                b = current[offset + 2] })
         end
+
+        ffi.copy(previous, current, pixel_row_size)
     end
 
     return pixels
@@ -1520,9 +1668,88 @@ local function win_select_region()
         cursor_x = 0,
         cursor_y = 0,
         selection = nil,
+        hover = nil,
         cancel_reason = nil,
         destroyed = false,
     }
+
+    local overlay_hwnd = nil
+    local probe_x, probe_y = 0, 0
+    local probe_result = nil
+
+    -- Top-level enumeration is the only reliable hit test here: WindowFromPoint
+    -- would return this full-screen overlay instead of the window beneath it.
+    local window_probe = ffi.cast("WNDENUMPROC", function(candidate, _)
+        if candidate == overlay_hwnd then
+            return 1
+        end
+        if user32.IsWindowVisible(candidate) == 0 then
+            return 1
+        end
+        if user32.IsIconic(candidate) ~= 0 then
+            return 1
+        end
+        if user32.GetWindowTextLengthW(candidate) <= 0 then
+            return 1
+        end
+
+        local extended_style = tonumber(user32.GetWindowLongW(candidate, GWL_EXSTYLE))
+        if bit.band(extended_style, WS_EX_TRANSPARENT) ~= 0
+            or bit.band(extended_style, WS_EX_NOACTIVATE) ~= 0 then
+            return 1
+        end
+
+        -- Shell and IME surfaces ("Windows Input Experience") are top-level
+        -- CoreWindows that cover the desktop but cannot be captured meaningfully.
+        local class_buffer = ffi.new("wchar_t[?]", 128)
+        if user32.GetClassNameW(candidate, class_buffer, 128) > 0
+            and wide_to_utf8(class_buffer) == "Windows.UI.Core.CoreWindow" then
+            return 1
+        end
+
+        local candidate_rect = ffi.new("RECT")
+        local have_rect = false
+        if dwmapi then
+            have_rect = dwmapi.DwmGetWindowAttribute(candidate,
+                DWMWA_EXTENDED_FRAME_BOUNDS, candidate_rect,
+                ffi.sizeof("RECT")) == 0
+        end
+        if not have_rect and user32.GetWindowRect(candidate, candidate_rect) == 0 then
+            return 1
+        end
+
+        local left = tonumber(candidate_rect.left)
+        local top = tonumber(candidate_rect.top)
+        local right = tonumber(candidate_rect.right)
+        local bottom = tonumber(candidate_rect.bottom)
+        if probe_x < left or probe_x >= right or probe_y < top or probe_y >= bottom then
+            return 1
+        end
+
+        local local_left = math.max(0, left - bounds.x)
+        local local_top = math.max(0, top - bounds.y)
+        local local_right = math.min(width, right - bounds.x)
+        local local_bottom = math.min(height, bottom - bounds.y)
+        if local_right - local_left < 2 or local_bottom - local_top < 2 then
+            return 1
+        end
+
+        probe_result = {
+            x = local_left,
+            y = local_top,
+            width = local_right - local_left,
+            height = local_bottom - local_top,
+        }
+        return 0
+    end)
+
+    local function update_hover(cursor_x, cursor_y)
+        probe_x = bounds.x + cursor_x
+        probe_y = bounds.y + cursor_y
+        probe_result = nil
+        user32.EnumWindows(window_probe, 0)
+        state.hover = probe_result
+    end
 
     local function mouse_point(lparam)
         local packed = tonumber(lparam) or 0
@@ -1564,11 +1791,19 @@ local function win_select_region()
         gdi32.BitBlt(dc, 0, 0, width, height, frozen_dc, 0, 0, SRCCOPY)
 
         local rectangle
+        local show_handles = false
         if state.dragging then
             rectangle = normalize_selection(state.anchor_x, state.anchor_y,
                 state.cursor_x, state.cursor_y)
+            show_handles = true
+            if rectangle.width <= 2 and rectangle.height <= 2 and state.hover then
+                rectangle = state.hover
+            end
         elseif state.selection then
             rectangle = state.selection
+            show_handles = true
+        elseif state.hover then
+            rectangle = state.hover
         end
 
         if rectangle then
@@ -1592,7 +1827,9 @@ local function win_select_region()
             gdi32.SelectObject(dc, old_pen)
             gdi32.SelectObject(dc, old_brush)
 
-            draw_handles(dc, rectangle)
+            if show_handles then
+                draw_handles(dc, rectangle)
+            end
 
             local label = utf8_to_wide(string.format("%d x %d",
                 rectangle.width, rectangle.height))
@@ -1645,7 +1882,7 @@ local function win_select_region()
         gdi32.SetTextColor(dc, 0x00FFFFFF)
         gdi32.SelectObject(dc, font)
         local hint = utf8_to_wide(
-            "Left-drag to select      Esc or right-click to cancel")
+            "Drag to select a region, or click a window      Esc or right-click to cancel")
         user32.DrawTextW(dc, hint, -1, hint_rect,
             bit.bor(DT_CENTER, DT_VCENTER, DT_SINGLELINE))
     end
@@ -1670,9 +1907,10 @@ local function win_select_region()
             end
             return 1
         elseif message == WM_LBUTTONDOWN then
-            state.dragging = true
             state.anchor_x, state.anchor_y = mouse_point(lparam)
             state.cursor_x, state.cursor_y = state.anchor_x, state.anchor_y
+            update_hover(state.anchor_x, state.anchor_y)
+            state.dragging = true
             user32.SetCapture(hwnd)
             user32.InvalidateRect(hwnd, nil, 0)
             return 0
@@ -1681,6 +1919,19 @@ local function win_select_region()
                 local next_x, next_y = mouse_point(lparam)
                 if next_x ~= state.cursor_x or next_y ~= state.cursor_y then
                     state.cursor_x, state.cursor_y = next_x, next_y
+                    user32.InvalidateRect(hwnd, nil, 0)
+                end
+            else
+                local next_x, next_y = mouse_point(lparam)
+                local previous_hover = state.hover
+                update_hover(next_x, next_y)
+                local changed = (previous_hover == nil) ~= (state.hover == nil)
+                    or (previous_hover ~= nil and state.hover ~= nil
+                        and (previous_hover.x ~= state.hover.x
+                            or previous_hover.y ~= state.hover.y
+                            or previous_hover.width ~= state.hover.width
+                            or previous_hover.height ~= state.hover.height))
+                if changed then
                     user32.InvalidateRect(hwnd, nil, 0)
                 end
             end
@@ -1695,6 +1946,10 @@ local function win_select_region()
                     state.cursor_x, state.cursor_y)
                 if rectangle.width >= 2 and rectangle.height >= 2 then
                     state.selection = rectangle
+                elseif state.hover then
+                    -- A click without a drag means "take the window under the
+                    -- cursor", the same gesture as most screenshot tools.
+                    state.selection = state.hover
                 else
                     state.cancel_reason = string.format(
                         "selection is too small (%dx%d); drag at least 2x2 pixels",
@@ -1767,6 +2022,17 @@ local function win_select_region()
         local reason = win_error_message()
         release_gdi()
         return nil, "CreateWindowExW failed: " .. reason
+    end
+    overlay_hwnd = hwnd
+
+    -- Highlight the window under the pointer before the first frame is shown.
+    local cursor_position = ffi.new("POINT")
+    if user32.GetCursorPos(cursor_position) ~= 0 then
+        local cursor_x = tonumber(cursor_position.x) - bounds.x
+        local cursor_y = tonumber(cursor_position.y) - bounds.y
+        if cursor_x >= 0 and cursor_x < width and cursor_y >= 0 and cursor_y < height then
+            update_hover(cursor_x, cursor_y)
+        end
     end
 
     -- Start fully transparent: paint the complete first frame while hidden from
@@ -1843,6 +2109,99 @@ local EDITOR_PALETTE = {
 
 local EDITOR_WIDTHS = { 2, 4, 6, 8, 12 }
 
+-- Compact labels keep all four tools beside the palette on narrow captures.
+local EDITOR_TOOLS = {
+    { id = "rect", label = "Rect", width = 50 },
+    { id = "arrow", label = "Arrow", width = 54 },
+    { id = "highlight", label = "Mark", width = 50 },
+    { id = "redact", label = "Redact", width = 58 },
+}
+
+local EDITOR_TOOL_IDS = {}
+for _, tool in ipairs(EDITOR_TOOLS) do
+    EDITOR_TOOL_IDS[tool.id] = tool
+end
+
+local function tool_label(tool_id)
+    local tool = EDITOR_TOOL_IDS[tool_id]
+    return tool and tool.label or "Rect"
+end
+
+-- Annotations keep both drag endpoints: rectangles and redactions use the
+-- normalized box, arrows need to know which end is the tip.
+local function annotation_bounds(annotation)
+    local left = math.min(annotation.x1, annotation.x2)
+    local top = math.min(annotation.y1, annotation.y2)
+    local right = math.max(annotation.x1, annotation.x2)
+    local bottom = math.max(annotation.y1, annotation.y2)
+    return left, top, right, bottom
+end
+
+local function annotation_size(annotation)
+    local left, top, right, bottom = annotation_bounds(annotation)
+    return right - left + 1, bottom - top + 1
+end
+
+-- Endpoints of the two barbs for an arrow whose tip is (x2, y2).
+local function arrow_head_points(x1, y1, x2, y2, head_length)
+    local delta_x = x2 - x1
+    local delta_y = y2 - y1
+    local length = math.sqrt(delta_x * delta_x + delta_y * delta_y)
+    if length < 1 then
+        return x2, y2, x2, y2
+    end
+
+    local unit_x = delta_x / length
+    local unit_y = delta_y / length
+    local spread = math.rad(24)
+    local cosine = math.cos(spread)
+    local sine = math.sin(spread)
+
+    local left_x = x2 - head_length * (unit_x * cosine - unit_y * sine)
+    local left_y = y2 - head_length * (unit_y * cosine + unit_x * sine)
+    local right_x = x2 - head_length * (unit_x * cosine + unit_y * sine)
+    local right_y = y2 - head_length * (unit_y * cosine - unit_x * sine)
+    return left_x, left_y, right_x, right_y
+end
+
+-- Shared by the editor and the self-tests: shrink the region into the scratch
+-- surface, then stretch the blocks back over the destination.
+local function blit_redaction(dc, source_dc, scratch_dc,
+                              source_left, source_top, source_width, source_height,
+                              destination_left, destination_top,
+                              destination_width, destination_height)
+    if source_width <= 0 or source_height <= 0
+        or destination_width <= 0 or destination_height <= 0 then
+        return false
+    end
+
+    -- One block per ~12 px of the shorter side keeps text unreadable.
+    local block = math.max(4, math.floor(math.min(source_width, source_height) / 12))
+    local blocks_x = math.min(64, math.max(1, math.floor(source_width / block)))
+    local blocks_y = math.min(64, math.max(1, math.floor(source_height / block)))
+
+    -- HALFTONE averages each block instead of sampling a single pixel, so thin
+    -- glyph strokes average into the block instead of being dropped or, worse,
+    -- surviving as a readable pixel run. Windows requires the brush origin to be
+    -- reset after selecting HALFTONE; skip the call if the mode was refused.
+    local halftone = gdi32.SetStretchBltMode(scratch_dc, HALFTONE) ~= 0
+    if halftone then
+        gdi32.SetBrushOrgEx(scratch_dc, 0, 0, nil)
+    else
+        gdi32.SetStretchBltMode(scratch_dc, COLORONCOLOR)
+    end
+    gdi32.StretchBlt(scratch_dc, 0, 0, blocks_x, blocks_y, source_dc,
+        source_left, source_top, source_width, source_height, SRCCOPY)
+    if halftone then
+        gdi32.SetStretchBltMode(scratch_dc, COLORONCOLOR)
+    end
+
+    gdi32.SetStretchBltMode(dc, COLORONCOLOR)
+    return gdi32.StretchBlt(dc, destination_left, destination_top,
+        destination_width, destination_height, scratch_dc,
+        0, 0, blocks_x, blocks_y, SRCCOPY) ~= 0
+end
+
 -- Grouped so the editor's nested window procedures stay well under LuaJIT's
 -- 60-upvalue limit; each message/key constant would otherwise cost one each.
 local EDITOR_KEYS = {
@@ -1863,6 +2222,7 @@ local EDITOR_KEYS = {
     VK_1 = VK_1,
     VK_6 = VK_6,
     VK_R = VK_R,
+    VK_T = VK_T,
     VK_C = VK_C,
     VK_S = VK_S,
     VK_Y = VK_Y,
@@ -1962,6 +2322,7 @@ local function win_edit_image(image, options)
     local status_height = math.max(22, math.floor(26 * ui))
 
     local image_bitmap, image_dc, previous_image
+    local scratch_bitmap, scratch_dc, previous_scratch
     local font, owns_font
     local background_brush, toolbar_brush, status_brush, button_brush, active_brush
     local ring_brush, image_border_brush
@@ -1976,6 +2337,15 @@ local function win_edit_image(image, options)
         end
         if image_bitmap ~= nil then
             gdi32.DeleteObject(image_bitmap)
+        end
+        if scratch_dc ~= nil and previous_scratch ~= nil then
+            gdi32.SelectObject(scratch_dc, previous_scratch)
+        end
+        if scratch_dc ~= nil then
+            gdi32.DeleteDC(scratch_dc)
+        end
+        if scratch_bitmap ~= nil then
+            gdi32.DeleteObject(scratch_bitmap)
         end
         for _, brush in ipairs(swatch_brushes) do
             gdi32.DeleteObject(brush)
@@ -2032,6 +2402,31 @@ local function win_edit_image(image, options)
         return nil, "CreateCompatibleDC failed for the editor image: " .. reason
     end
     previous_image = gdi32.SelectObject(image_dc, image_bitmap)
+
+    -- Shared scratch surface: redaction downsampling and the 1x1 alpha source
+    -- for highlights both draw through it, so neither allocates per frame.
+    local scratch_info = ffi.new("BITMAPINFO")
+    scratch_info.bmiHeader.biSize = ffi.sizeof("BITMAPINFOHEADER")
+    scratch_info.bmiHeader.biWidth = 64
+    scratch_info.bmiHeader.biHeight = -64
+    scratch_info.bmiHeader.biPlanes = 1
+    scratch_info.bmiHeader.biBitCount = 32
+    scratch_info.bmiHeader.biCompression = BI_RGB
+    scratch_bitmap = gdi32.CreateDIBSection(screen_dc, scratch_info, DIB_RGB_COLORS,
+        ffi.new("void*[1]"), nil, 0)
+    if scratch_bitmap == nil then
+        local reason = win_error_message()
+        release_resources()
+        return nil, "cannot create the annotation scratch surface: " .. reason
+    end
+    scratch_dc = gdi32.CreateCompatibleDC(screen_dc)
+    if scratch_dc == nil then
+        local reason = win_error_message()
+        release_resources()
+        return nil, "CreateCompatibleDC failed for the annotation scratch surface: "
+            .. reason
+    end
+    previous_scratch = gdi32.SelectObject(scratch_dc, scratch_bitmap)
 
     local font_face = utf8_to_wide("Segoe UI")
     font = gdi32.CreateFontW(-math.max(12, math.floor(15 * ui)), 0, 0, 0, 400,
@@ -2138,12 +2533,14 @@ local function win_edit_image(image, options)
         last_y = 0,
         color_index = color_index,
         color = options.editor_color,
+        tool = options.tool or "rect",
         width_index = width_index,
         width_px = options.editor_width,
         discard_armed = false,
         status = string.format(
-            "Rect  %s  %d px   |   drag to draw   |   Ctrl+Z undo   |   Enter save+copy   |   Esc discard",
-            color_to_hex(options.editor_color), options.editor_width),
+            "%s  %s  %d px   |   drag to draw   |   T tool   |   Ctrl+Z undo   |   Enter save+copy   |   Esc discard",
+            tool_label(options.tool), color_to_hex(options.editor_color),
+            options.editor_width),
         status_is_error = false,
         result = nil,
         fatal = nil,
@@ -2167,10 +2564,11 @@ local function win_edit_image(image, options)
         local copied = {}
         for index, annotation in ipairs(state.annotations) do
             copied[index] = {
-                x = annotation.x,
-                y = annotation.y,
-                width = annotation.width,
-                height = annotation.height,
+                tool = annotation.tool,
+                x1 = annotation.x1,
+                y1 = annotation.y1,
+                x2 = annotation.x2,
+                y2 = annotation.y2,
                 color = annotation.color,
                 line_width = annotation.line_width,
             }
@@ -2207,6 +2605,27 @@ local function win_edit_image(image, options)
         set_status(string.format("Line width  %d px", state.width_px))
     end
 
+    local function set_tool(tool_id)
+        if not EDITOR_TOOL_IDS[tool_id] then
+            return
+        end
+
+        state.tool = tool_id
+        set_status(string.format("Tool  %s", tool_label(tool_id)))
+    end
+
+    local function cycle_tool()
+        local next_index = 1
+        for index, tool in ipairs(EDITOR_TOOLS) do
+            if tool.id == state.tool then
+                next_index = index % #EDITOR_TOOLS + 1
+                break
+            end
+        end
+
+        set_tool(EDITOR_TOOLS[next_index].id)
+    end
+
     local function to_rect(rectangle)
         local rect = ffi.new("RECT")
         rect.left = rectangle.left
@@ -2223,23 +2642,134 @@ local function win_edit_image(image, options)
         user32.DrawTextW(dc, utf8_to_wide(text), -1, rect, format)
     end
 
-    local function draw_annotation(dc, annotation, origin_x, origin_y, scale)
-        local left = origin_x + annotation.x * scale
-        local top = origin_y + annotation.y * scale
-        local right = origin_x + (annotation.x + annotation.width) * scale
-        local bottom = origin_y + (annotation.y + annotation.height) * scale
-        local pen_width = math.max(1, math.floor(annotation.line_width * scale + 0.5))
+    local function fill_alpha_rect(dc, left, top, right, bottom, color, alpha)
+        local destination_left = math.floor(left + 0.5)
+        local destination_top = math.floor(top + 0.5)
+        local width = math.floor(right + 0.5) - destination_left
+        local height = math.floor(bottom + 0.5) - destination_top
+        if width <= 0 or height <= 0 then
+            return
+        end
 
+        local brush = gdi32.CreateSolidBrush(color)
+        if msimg32 == nil or scratch_dc == nil then
+            -- Without AlphaBlend, outline the region so it is still visible.
+            if brush ~= nil then
+                local frame = ffi.new("RECT")
+                frame.left = destination_left
+                frame.top = destination_top
+                frame.right = destination_left + width
+                frame.bottom = destination_top + height
+                user32.FrameRect(dc, frame, brush)
+                gdi32.DeleteObject(brush)
+            end
+            return
+        end
+
+        local pixel = ffi.new("RECT")
+        pixel.left = 0
+        pixel.top = 0
+        pixel.right = 1
+        pixel.bottom = 1
+        user32.FillRect(scratch_dc, pixel, brush)
+        gdi32.DeleteObject(brush)
+
+        local blend = ffi.new("BLENDFUNCTION")
+        blend.BlendOp = 0
+        blend.BlendFlags = 0
+        blend.SourceConstantAlpha = alpha
+        blend.AlphaFormat = 0
+        msimg32.AlphaBlend(dc, destination_left, destination_top, width, height,
+            scratch_dc, 0, 0, 1, 1, blend)
+    end
+
+    -- Pixelate the pixels under the annotation by shrinking them into the
+    -- scratch surface and stretching the blocks back over the region.
+    local function draw_redaction(dc, source_dc, left, top, right, bottom,
+                                  origin_x, origin_y, scale)
+        if source_dc == nil or scratch_dc == nil then
+            return
+        end
+
+        local source_left = math.max(0, math.floor(left))
+        local source_top = math.max(0, math.floor(top))
+        local source_right = math.min(image_width, math.ceil(right))
+        local source_bottom = math.min(image_height, math.ceil(bottom))
+        local source_width = source_right - source_left
+        local source_height = source_bottom - source_top
+        if source_width <= 0 or source_height <= 0 then
+            return
+        end
+
+        local destination_left = math.floor(origin_x + left * scale + 0.5)
+        local destination_top = math.floor(origin_y + top * scale + 0.5)
+        local destination_right = math.floor(origin_x + right * scale + 0.5)
+        local destination_bottom = math.floor(origin_y + bottom * scale + 0.5)
+        local destination_width = destination_right - destination_left
+        local destination_height = destination_bottom - destination_top
+        if destination_width <= 0 or destination_height <= 0 then
+            return
+        end
+
+        blit_redaction(dc, source_dc, scratch_dc,
+            source_left, source_top, source_width, source_height,
+            destination_left, destination_top, destination_width, destination_height)
+    end
+
+    local function draw_annotation(dc, annotation, origin_x, origin_y, scale, source_dc)
+        local left, top, right, bottom = annotation_bounds(annotation)
+        if right <= left and bottom <= top then
+            return
+        end
+
+        if annotation.tool == "redact" then
+            draw_redaction(dc, source_dc, left, top, right, bottom,
+                origin_x, origin_y, scale)
+            return
+        end
+
+        local destination_left = origin_x + left * scale
+        local destination_top = origin_y + top * scale
+        local destination_right = origin_x + right * scale
+        local destination_bottom = origin_y + bottom * scale
+
+        if annotation.tool == "highlight" then
+            fill_alpha_rect(dc, destination_left, destination_top,
+                destination_right, destination_bottom, annotation.color, 70)
+            return
+        end
+
+        local pen_width = math.max(1, math.floor(annotation.line_width * scale + 0.5))
         local pen = gdi32.CreatePen(0, pen_width, annotation.color)
         if pen == nil then
             return
         end
         local old_pen = gdi32.SelectObject(dc, pen)
-        local old_brush = gdi32.SelectObject(dc, gdi32.GetStockObject(NULL_BRUSH))
-        gdi32.Rectangle(dc, math.floor(left + 0.5), math.floor(top + 0.5),
-            math.floor(right + 0.5), math.floor(bottom + 0.5))
+
+        if annotation.tool == "arrow" then
+            local start_x = origin_x + annotation.x1 * scale
+            local start_y = origin_y + annotation.y1 * scale
+            local tip_x = origin_x + annotation.x2 * scale
+            local tip_y = origin_y + annotation.y2 * scale
+            local head_length = math.max(8 * scale, pen_width * 4)
+            local left_x, left_y, right_x, right_y = arrow_head_points(
+                start_x, start_y, tip_x, tip_y, head_length)
+
+            gdi32.MoveToEx(dc, math.floor(start_x + 0.5), math.floor(start_y + 0.5), nil)
+            gdi32.LineTo(dc, math.floor(tip_x + 0.5), math.floor(tip_y + 0.5))
+            gdi32.MoveToEx(dc, math.floor(tip_x + 0.5), math.floor(tip_y + 0.5), nil)
+            gdi32.LineTo(dc, math.floor(left_x + 0.5), math.floor(left_y + 0.5))
+            gdi32.MoveToEx(dc, math.floor(tip_x + 0.5), math.floor(tip_y + 0.5), nil)
+            gdi32.LineTo(dc, math.floor(right_x + 0.5), math.floor(right_y + 0.5))
+        else
+            local old_brush = gdi32.SelectObject(dc, gdi32.GetStockObject(NULL_BRUSH))
+            gdi32.Rectangle(dc, math.floor(destination_left + 0.5),
+                math.floor(destination_top + 0.5), math.floor(destination_right + 0.5),
+                math.floor(destination_bottom + 0.5))
+            gdi32.SelectObject(dc, old_brush)
+        end
+
         gdi32.SelectObject(dc, old_pen)
-        gdi32.SelectObject(dc, old_brush)
         gdi32.DeleteObject(pen)
     end
 
@@ -2276,7 +2806,9 @@ local function win_edit_image(image, options)
             cursor_x = cursor_x + width + math.floor(6 * ui)
         end
 
-        push_button("tool_rect", "Rect", math.floor(58 * ui))
+        for _, tool in ipairs(EDITOR_TOOLS) do
+            push_button("tool_" .. tool.id, tool.label, math.floor(tool.width * ui))
+        end
 
         local swatch_size = math.max(12, button_height - math.floor(6 * ui))
         local swatch_pad = math.floor(3 * ui)
@@ -2367,7 +2899,7 @@ local function win_edit_image(image, options)
                     draw_swatch_ring(dc, button)
                 end
             else
-                local active = button.id == "tool_rect"
+                local active = button.id == ("tool_" .. state.tool)
                 user32.FillRect(dc, rect, active and active_brush or button_brush)
                 draw_text(dc, button.label, rect,
                     active and 0x00FFFFFF or 0x00D8D8D8,
@@ -2426,20 +2958,19 @@ local function win_edit_image(image, options)
         user32.FrameRect(dc, image_rect, image_border_brush)
 
         for _, annotation in ipairs(state.annotations) do
-            draw_annotation(dc, annotation, state.ox, state.oy, state.scale)
+            draw_annotation(dc, annotation, state.ox, state.oy, state.scale, image_dc)
         end
 
         if state.dragging then
-            local rectangle = normalize_selection(state.start_x, state.start_y,
-                state.current_x, state.current_y)
             draw_annotation(dc, {
-                x = rectangle.x,
-                y = rectangle.y,
-                width = rectangle.width,
-                height = rectangle.height,
+                tool = state.tool,
+                x1 = state.start_x,
+                y1 = state.start_y,
+                x2 = state.current_x,
+                y2 = state.current_y,
                 color = state.color,
                 line_width = state.width_px,
-            }, state.ox, state.oy, state.scale)
+            }, state.ox, state.oy, state.scale, image_dc)
         end
 
         draw_toolbar(dc)
@@ -2483,7 +3014,9 @@ local function win_edit_image(image, options)
         local previous = gdi32.SelectObject(flat_dc, flat_bitmap)
 
         for _, annotation in ipairs(state.annotations) do
-            draw_annotation(flat_dc, annotation, 0, 0, 1)
+            -- Redaction always samples the untouched capture, so preview and
+            -- final output agree even when shapes overlap.
+            draw_annotation(flat_dc, annotation, 0, 0, 1, image_dc)
         end
 
         gdi32.SelectObject(flat_dc, previous)
@@ -2657,7 +3190,10 @@ local function win_edit_image(image, options)
             local rect = button.rect
             if x >= rect.left and x < rect.right and y >= rect.top and y < rect.bottom then
                 state.discard_armed = false
-                if button.id == "color" then
+                local tool_id = button.id:match("^tool_(.+)$")
+                if tool_id then
+                    set_tool(tool_id)
+                elseif button.id == "color" then
                     state.color_index = button.index
                     state.color = EDITOR_PALETTE[button.index].colorref
                     set_status(string.format("Color  %s", EDITOR_PALETTE[button.index].hex))
@@ -2781,24 +3317,29 @@ local function win_edit_image(image, options)
                 user32.ReleaseCapture()
                 state.current_x, state.current_y = client_to_image(mouse_x(lparam), mouse_y(lparam))
 
-                local rectangle = normalize_selection(state.start_x, state.start_y,
-                    state.current_x, state.current_y)
-                if rectangle.width >= 2 and rectangle.height >= 2 then
+                local start_x = state.start_x
+                local start_y = state.start_y
+                local end_x = state.current_x
+                local end_y = state.current_y
+                local rectangle = normalize_selection(start_x, start_y, end_x, end_y)
+                local span = math.max(math.abs(end_x - start_x), math.abs(end_y - start_y))
+                if span >= 2 then
                     table.insert(state.undo_stack, copy_annotations())
                     state.redo_stack = {}
                     table.insert(state.annotations, {
-                        x = rectangle.x,
-                        y = rectangle.y,
-                        width = rectangle.width,
-                        height = rectangle.height,
+                        tool = state.tool,
+                        x1 = start_x,
+                        y1 = start_y,
+                        x2 = end_x,
+                        y2 = end_y,
                         color = state.color,
                         line_width = state.width_px,
                     })
-                    set_status(string.format("Rect  %dx%d  %s  %d px",
-                        rectangle.width, rectangle.height,
+                    set_status(string.format("%s  %dx%d  %s  %d px",
+                        tool_label(state.tool), rectangle.width, rectangle.height,
                         color_to_hex(state.color), state.width_px))
                 else
-                    set_status("Shape too small; drag at least 2x2 image pixels", true)
+                    set_status("Shape too small; drag at least 2 image pixels", true)
                 end
 
                 user32.InvalidateRect(message_hwnd, nil, 0)
@@ -2847,8 +3388,10 @@ local function win_edit_image(image, options)
                 state.color_index = key - EDITOR_KEYS.VK_1 + 1
                 state.color = EDITOR_PALETTE[state.color_index].colorref
                 set_status(string.format("Color  %s", EDITOR_PALETTE[state.color_index].hex))
+            elseif key == EDITOR_KEYS.VK_T then
+                cycle_tool()
             elseif key == EDITOR_KEYS.VK_R then
-                set_status("Tool  Rect")
+                set_tool("rect")
             end
 
             user32.InvalidateRect(message_hwnd, nil, 0)
@@ -3866,11 +4409,11 @@ local function parse_options(arguments, config)
         elseif argument == "--tool" then
             index = index + 1
             if not arguments[index] then
-                return nil, "--tool requires a name (phase 1: rect)"
+                return nil, "--tool requires a name (rect, arrow, highlight, or redact)"
             end
-            if arguments[index] ~= "rect" then
+            if not EDITOR_TOOL_IDS[arguments[index]] then
                 return nil, string.format(
-                    "unsupported --tool %q: phase 1 implements rectangles only",
+                    "unsupported --tool %q: use rect, arrow, highlight, or redact",
                     arguments[index])
             end
             options.tool = arguments[index]
@@ -4209,6 +4752,204 @@ local function run_tests()
             and tostring(separator_config_error):find("separator", 1, true) ~= nil,
         tostring(separator_config_error))
 
+    local reversed_annotation = { tool = "arrow", x1 = 90, y1 = 70, x2 = 10, y2 = 20 }
+    local bounds_left, bounds_top, bounds_right, bounds_bottom =
+        annotation_bounds(reversed_annotation)
+    check("annotation_bounds normalizes reversed drags",
+        bounds_left == 10 and bounds_top == 20
+            and bounds_right == 90 and bounds_bottom == 70)
+
+    local annotation_width, annotation_height = annotation_size(reversed_annotation)
+    check("annotation_size counts inclusive pixels",
+        annotation_width == 81 and annotation_height == 51,
+        string.format("%dx%d", annotation_width, annotation_height))
+
+    local head_left_x, head_left_y, head_right_x, head_right_y =
+        arrow_head_points(0, 0, 100, 0, 10)
+    check("arrow_head_points places symmetric barbs behind the tip",
+        math.abs(head_left_x - 90.865) < 0.01 and math.abs(head_right_x - 90.865) < 0.01
+            and math.abs(head_left_y + 4.067) < 0.01
+            and math.abs(head_right_y - 4.067) < 0.01,
+        string.format("%.2f,%.2f / %.2f,%.2f",
+            head_left_x, head_left_y, head_right_x, head_right_y))
+
+    local arrow_options, arrow_error = parse_options({ "--tool", "arrow" }, {})
+    check("parse_options accepts --tool arrow",
+        arrow_options ~= nil and arrow_options.tool == "arrow", arrow_error)
+
+    local unknown_tool, unknown_tool_error = parse_options({ "--tool", "circle" }, {})
+    check("parse_options rejects unknown tools with the valid list",
+        unknown_tool == nil
+            and tostring(unknown_tool_error):find("rect, arrow, highlight, or redact", 1, true)
+                ~= nil,
+        tostring(unknown_tool_error))
+
+    if IS_WINDOWS then
+        local screen = user32.GetDC(nil)
+        if screen == nil then
+            skip("redaction blit", "no screen device context available")
+        else
+            local function make_surface(surface_width, surface_height)
+                local surface_info = ffi.new("BITMAPINFO")
+                surface_info.bmiHeader.biSize = ffi.sizeof("BITMAPINFOHEADER")
+                surface_info.bmiHeader.biWidth = surface_width
+                surface_info.bmiHeader.biHeight = -surface_height
+                surface_info.bmiHeader.biPlanes = 1
+                surface_info.bmiHeader.biBitCount = 32
+                surface_info.bmiHeader.biCompression = BI_RGB
+
+                local surface_bits = ffi.new("void*[1]")
+                local surface_bitmap = gdi32.CreateDIBSection(screen, surface_info,
+                    DIB_RGB_COLORS, surface_bits, nil, 0)
+                if surface_bitmap == nil then
+                    return nil
+                end
+
+                local surface_dc = gdi32.CreateCompatibleDC(screen)
+                if surface_dc == nil then
+                    gdi32.DeleteObject(surface_bitmap)
+                    return nil
+                end
+
+                local previous = gdi32.SelectObject(surface_dc, surface_bitmap)
+                return {
+                    bitmap = surface_bitmap,
+                    dc = surface_dc,
+                    bits = surface_bits,
+                    info = surface_info,
+                    previous = previous,
+                }
+            end
+
+            local source_surface = make_surface(32, 32)
+            local destination_surface = make_surface(32, 32)
+            local scratch_surface = make_surface(64, 64)
+
+            if not source_surface or not destination_surface or not scratch_surface then
+                check("blit_redaction produces uniform mosaic blocks", false,
+                    "cannot create test surfaces: " .. win_error_message())
+            else
+                local source_pixels = ffi.cast("uint8_t*", source_surface.bits[0])
+                for row = 0, 31 do
+                    for column = 0, 31 do
+                        local offset = (row * 32 + column) * 4
+                        source_pixels[offset] = (column * 8) % 256
+                        source_pixels[offset + 1] = (row * 8) % 256
+                        source_pixels[offset + 2] = 0
+                        source_pixels[offset + 3] = 255
+                    end
+                end
+
+                local blitted = blit_redaction(destination_surface.dc, source_surface.dc,
+                    scratch_surface.dc, 0, 0, 32, 32, 0, 0, 32, 32)
+
+                local redacted = ffi.new("uint8_t[?]", 32 * 32 * 4)
+                local rows = gdi32.GetDIBits(destination_surface.dc,
+                    destination_surface.bitmap, 0, 32, redacted,
+                    destination_surface.info, DIB_RGB_COLORS)
+
+                local function redacted_pixel(column, row)
+                    local offset = (row * 32 + column) * 4
+                    return redacted[offset], redacted[offset + 1], redacted[offset + 2]
+                end
+
+                local first_blue, first_green = redacted_pixel(0, 0)
+                local uniform = true
+                for row = 0, 3 do
+                    for column = 0, 3 do
+                        local blue, green = redacted_pixel(column, row)
+                        if blue ~= first_blue or green ~= first_green then
+                            uniform = false
+                        end
+                    end
+                end
+
+                local next_blue = redacted_pixel(4, 0)
+                check("blit_redaction produces uniform mosaic blocks",
+                    blitted and rows == 32 and uniform and next_blue ~= first_blue,
+                    string.format("rows=%d uniform=%s block=(%d,%d) next=%d",
+                        rows, tostring(uniform), first_blue, first_green, next_blue))
+
+                for _, surface in ipairs({ source_surface, destination_surface,
+                                           scratch_surface }) do
+                    gdi32.SelectObject(surface.dc, surface.previous)
+                    gdi32.DeleteDC(surface.dc)
+                    gdi32.DeleteObject(surface.bitmap)
+                end
+            end
+
+            -- A thin stroke must be averaged into its block, not dropped. A
+            -- plain sampling stretch keeps whichever pixel the block's corner
+            -- lands on, which can erase 1-2 px glyph strokes completely and
+            -- leave the redacted area looking untouched.
+            local thin_source = make_surface(84, 84)
+            local thin_destination = make_surface(84, 84)
+            local thin_scratch = make_surface(64, 64)
+
+            if not thin_source or not thin_destination or not thin_scratch then
+                check("blit_redaction averages thin strokes into their block", false,
+                    "cannot create test surfaces: " .. win_error_message())
+            else
+                local thin_pixels = ffi.cast("uint8_t*", thin_source.bits[0])
+                for row = 0, 83 do
+                    for column = 0, 83 do
+                        local offset = (row * 84 + column) * 4
+                        local shade = (column == 8 or column == 9) and 0 or 255
+                        thin_pixels[offset] = shade
+                        thin_pixels[offset + 1] = shade
+                        thin_pixels[offset + 2] = shade
+                        thin_pixels[offset + 3] = 255
+                    end
+                end
+
+                local thin_blitted = blit_redaction(thin_destination.dc,
+                    thin_source.dc, thin_scratch.dc, 0, 0, 84, 84, 0, 0, 84, 84)
+
+                local thin_output = ffi.new("uint8_t[?]", 84 * 84 * 4)
+                local thin_rows = gdi32.GetDIBits(thin_destination.dc,
+                    thin_destination.bitmap, 0, 84, thin_output,
+                    thin_destination.info, DIB_RGB_COLORS)
+
+                local function thin_pixel(column, row)
+                    local offset = (row * 84 + column) * 4
+                    return thin_output[offset]
+                end
+
+                -- Blocks are 7 px here; column 8 sits inside block 1, whose
+                -- corner pixel (column 7) is still white.
+                local background_luma = thin_pixel(2, 10)
+                local stroke_luma = thin_pixel(10, 10)
+                local averaged = background_luma > 245 and stroke_luma < 230
+                    and stroke_luma > 120
+                local block_uniform = true
+                for row = 7, 13 do
+                    for column = 7, 13 do
+                        if thin_pixel(column, row) ~= stroke_luma then
+                            block_uniform = false
+                        end
+                    end
+                end
+
+                check("blit_redaction averages thin strokes into their block",
+                    thin_blitted and thin_rows == 84 and averaged and block_uniform,
+                    string.format("rows=%d background=%d stroke=%d uniform=%s",
+                        thin_rows, background_luma, stroke_luma,
+                        tostring(block_uniform)))
+
+                for _, surface in ipairs({ thin_source, thin_destination,
+                                           thin_scratch }) do
+                    gdi32.SelectObject(surface.dc, surface.previous)
+                    gdi32.DeleteDC(surface.dc)
+                    gdi32.DeleteObject(surface.bitmap)
+                end
+            end
+
+            user32.ReleaseDC(nil, screen)
+        end
+    else
+        skip("redaction blit", "Windows only")
+    end
+
     local clip_path_options = parse_options({ "--clip-path", "md" }, {})
     check("parse_options accepts --clip-path md",
         clip_path_options ~= nil and clip_path_options.clip_path == "md")
@@ -4237,6 +4978,52 @@ local function run_tests()
     else
         skip("--active-window and --edit parsing", "Windows only")
     end
+
+    check("paeth_predictor chooses the closest neighbor",
+        paeth_predictor(10, 10, 10) == 10
+            and paeth_predictor(100, 10, 10) == 100
+            and paeth_predictor(10, 100, 10) == 100
+            and paeth_predictor(10, 20, 15) == 15)
+
+    local function decode_single_row(filter, encoded)
+        local raw = ffi.new("uint8_t[?]", 1 + #encoded)
+        raw[0] = filter
+        for index = 1, #encoded do
+            raw[index] = encoded[index]
+        end
+
+        local decoded, decode_error = decode_scanlines(raw, 2, 1)
+        if not decoded then
+            return nil, decode_error
+        end
+
+        local bytes = {}
+        for _, pixel in ipairs(decoded) do
+            table.insert(bytes, pixel.r)
+            table.insert(bytes, pixel.g)
+            table.insert(bytes, pixel.b)
+        end
+        return table.concat(bytes, ",")
+    end
+
+    local expected_row = "10,20,30,40,50,60"
+    local sub_row, sub_row_error = decode_single_row(PNG_FILTER_SUB,
+        { 10, 20, 30, 30, 30, 30 })
+    check("decode_scanlines reverses the Sub filter", sub_row == expected_row, sub_row_error)
+
+    local up_row, up_row_error = decode_single_row(PNG_FILTER_UP,
+        { 10, 20, 30, 40, 50, 60 })
+    check("decode_scanlines reverses the Up filter", up_row == expected_row, up_row_error)
+
+    local average_row, average_row_error = decode_single_row(PNG_FILTER_AVERAGE,
+        { 10, 20, 30, 35, 40, 45 })
+    check("decode_scanlines reverses the Average filter",
+        average_row == expected_row, average_row_error)
+
+    local paeth_row, paeth_row_error = decode_single_row(PNG_FILTER_PAETH,
+        { 10, 20, 30, 30, 30, 30 })
+    check("decode_scanlines reverses the Paeth filter",
+        paeth_row == expected_row, paeth_row_error)
 
     local test_width, test_height = 4, 3
     local source = ffi.new("uint8_t[?]", test_width * test_height * 4)
@@ -4298,6 +5085,34 @@ local function run_tests()
         check("stored IDAT inflates with a valid adler32", raw ~= nil, raw_error)
 
         if raw then
+            local adaptive_raw = build_scanlines(test_width, test_height, source, "auto")
+            local adaptive_filters = 0
+            for row = 0, test_height - 1 do
+                if adaptive_raw[row * (1 + test_width * 3)] ~= PNG_FILTER_NONE then
+                    adaptive_filters = adaptive_filters + 1
+                end
+            end
+
+            local adaptive_decoded, adaptive_error = decode_scanlines(adaptive_raw,
+                test_width, test_height)
+            local adaptive_matches = adaptive_decoded ~= nil
+            if adaptive_decoded then
+                for index = 1, #expected do
+                    local actual = adaptive_decoded[index]
+                    local wanted = expected[index]
+                    if actual.r ~= wanted.r or actual.g ~= wanted.g
+                        or actual.b ~= wanted.b then
+                        adaptive_matches = false
+                        break
+                    end
+                end
+            end
+
+            check("PNG auto filters round-trip to the source pixels",
+                adaptive_filters > 0 and adaptive_matches,
+                adaptive_error or string.format("%d of %d rows filtered",
+                    adaptive_filters, test_height))
+
             local decoded, decode_error = decode_scanlines(raw, test_width, test_height)
             local matches = decoded ~= nil
             if decoded then
