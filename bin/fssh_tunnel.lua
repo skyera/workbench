@@ -1463,17 +1463,28 @@ local function get_temporary_path(prefix)
     return string.format("%s/%s_%d_%04d.txt", directory, prefix, os.time(), math.random(0, 9999))
 end
 
--- fzf only selects a row; the kill/open actions run in Lua after it exits, so
--- the pipeline stays quotable on both shells. The list is fed by redirection
--- rather than `cat`/`type`: both shells handle `< file`, while cmd.exe's `type`
--- is unreliable under _popen.
+-- fzf reads its candidates from a file by redirection: both shells handle
+-- `< file`, while cmd.exe's `type` fails under _popen and leaves fzf showing an
+-- empty list. Every fzf call must go through here.
+local function build_fzf_command(list_path, prompt, visible_fields, header)
+    local parts = {
+        "fzf",
+        string.format("--delimiter=%s", shell_quote("\t")),
+        string.format("--with-nth=%s", visible_fields),
+        string.format("--prompt=%s", shell_quote(prompt)),
+    }
+
+    if header then
+        parts[#parts + 1] = string.format("--header=%s", shell_quote(header))
+    end
+
+    parts[#parts + 1] = string.format("< %s", shell_quote(list_path))
+    return table.concat(parts, " ")
+end
+
 local function build_manager_command(list_path)
-    return string.format(
-        "fzf --delimiter=%s --with-nth=1,2,3,4,5,6 --header=%s --prompt=%s < %s",
-        shell_quote("\t"),
-        shell_quote("[ACTIVE SSH TUNNELS] ENTER: Inspect | ESC: Exit"),
-        shell_quote("Tunnel > "),
-        shell_quote(list_path))
+    return build_fzf_command(list_path, "Tunnel > ", "1,2,3,4,5,6",
+        "[ACTIVE SSH TUNNELS] ENTER: Inspect | ESC: Exit")
 end
 
 local function open_local_endpoint(port)
@@ -1867,12 +1878,8 @@ local function run_interactive_wizard(default_host)
                     handle:write(table.concat(host_entries, "\n") .. "\n")
                     handle:close()
 
-                    local list_command = IS_WINDOWS
-                        and string.format("type %s", shell_quote(temporary_path))
-                        or string.format("cat %s", shell_quote(temporary_path))
-                    local pipe = io.popen(string.format(
-                        "%s | fzf --delimiter=%s --with-nth=1,2 --prompt=%s",
-                        list_command, shell_quote("\t"), shell_quote("Select Host > ")))
+                    local pipe = io.popen(build_fzf_command(
+                        temporary_path, "Select Host > ", "1,2"))
                     if pipe then
                         selected = pipe:read("*l")
                         pipe:close()
@@ -2483,6 +2490,39 @@ run_tests = function()
 
     check("invalid port is rejected with a reason",
         select(2, is_port_free(70000)) ~= nil)
+
+    print("\nfzf commands")
+    local picker_template = build_fzf_command("list.txt", "p > ", "1,2")
+    check("fzf commands read the list by redirection",
+        picker_template:find("< ", 1, true) ~= nil
+            and picker_template:find("type ", 1, true) == nil
+            and picker_template:find("cat ", 1, true) == nil,
+        picker_template)
+
+    local host_list = get_temporary_path("fssh_tunnel_hosts")
+    local host_handle = io.open(host_list, "wb")
+    if host_handle then
+        host_handle:write("centre\t(centre.local) [putty]\n")
+        host_handle:write("pi4\t(raspberrypi.local) [putty]\n")
+        host_handle:close()
+
+        local picker_command = build_fzf_command(host_list, "Select Host > ", "1,2")
+        if fzf_available() then
+            local pipe = io.popen(picker_command .. " --filter=centre 2>&1")
+            local output = pipe and pipe:read("*a") or ""
+            if pipe then
+                pipe:close()
+            end
+            check("host picker receives the discovered hosts",
+                output:find("centre", 1, true) ~= nil, output)
+        else
+            skip("host picker receives the discovered hosts", "fzf is not installed")
+        end
+
+        os.remove(host_list)
+    else
+        skip("host picker receives the discovered hosts", "cannot create a temporary list")
+    end
 
     print("\nfzf manager pipeline")
     local manager_list = get_temporary_path("fssh_tunnel_fzf")
