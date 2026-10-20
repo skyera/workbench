@@ -23,8 +23,7 @@
     -l, --list           Print formatted socket table to stdout and exit
     -a, --all            Show all socket states (including ESTABLISHED, TIME_WAIT)
     -k, --kill <PORT>    Terminate process(es) bound to <PORT> and exit
-    --pid <PID>          Terminate or inspect by specific PID
-    --preview <PORT>     Print rich ANSI details card for <PORT> and exit
+    --preview <PORT|PID> Print rich ANSI details card for a port or PID and exit
     --test               Run built-in automated self-test suite and exit
     -h, --help           Show this help message
 ]]
@@ -976,19 +975,45 @@ local function matches_tab(sock, tab_id)
     return true
 end
 
+-- A digits-only query is an exact port or PID lookup. Treating it as fuzzy
+-- text used to pull in unrelated rows ("45678" also matched a row whose digits
+-- happened to appear in order), which is dangerous next to the kill key.
+local function parse_numeric_query(query)
+    local lowered = query:lower()
+    local prefix, value = lowered:match("^(%a+):(%d+)$")
+    if prefix == "port" or prefix == "pid" then
+        return prefix, tonumber(value)
+    end
+    if lowered:match("^%d+$") then
+        return "port_or_pid", tonumber(lowered)
+    end
+    return nil, nil
+end
+
+local function matches_query(sock, query)
+    if not query or #query == 0 then
+        return true
+    end
+
+    local kind, number = parse_numeric_query(query)
+    if kind == "port" then
+        return sock.port == number
+    elseif kind == "pid" then
+        return sock.pid == number
+    elseif kind == "port_or_pid" then
+        return sock.port == number or sock.pid == number
+    end
+
+    local hay = string.format("%d %s %s %s %d %s",
+        sock.port, sock.proto, sock.local_addr, sock.state, sock.pid, sock.process)
+    return fuzzy_score(query, hay) ~= nil
+end
+
 local function filter_and_sort(sockets, tab_id, query, sort_mode)
     local out = {}
     for _, s in ipairs(sockets) do
-        if matches_tab(s, tab_id) then
-            if not query or #query == 0 then
-                table.insert(out, s)
-            else
-                local hay = string.format("%d %s %s %s %d %s",
-                    s.port, s.proto, s.local_addr, s.state, s.pid, s.process)
-                if fuzzy_score(query, hay) then
-                    table.insert(out, s)
-                end
-            end
+        if matches_tab(s, tab_id) and matches_query(s, query) then
+            table.insert(out, s)
         end
     end
 
@@ -1136,7 +1161,7 @@ local function run_tui(initial_query, start_all)
             table.insert(r_lines, " " .. C.b_cyan .. "gg / G / Home/End " .. C.reset .. "Jump to first / last entry")
             table.insert(r_lines, " " .. C.b_cyan .. "Ctrl+d / Ctrl+u   " .. C.reset .. "Scroll down / up 10 rows")
             table.insert(r_lines, " " .. C.b_cyan .. "Tab / h / l / 1-4 " .. C.reset .. "Switch category tab")
-            table.insert(r_lines, " " .. C.b_cyan .. "/                 " .. C.reset .. "Filter by port, PID, process, IP")
+            table.insert(r_lines, " " .. C.b_cyan .. "/                 " .. C.reset .. "Filter (digits = exact port/PID, text = fuzzy)")
             table.insert(r_lines, " " .. C.b_cyan .. "s                 " .. C.reset .. "Cycle sort column")
             table.insert(r_lines, " " .. C.b_cyan .. "r                 " .. C.reset .. "Refresh socket table (FFI)")
             table.insert(r_lines, " " .. C.b_cyan .. "x / Enter / Del   " .. C.reset .. "Kill process (with [y/N] prompt)")
@@ -1452,11 +1477,20 @@ end
 local function cmd_preview(target)
     Term.init()
     local sockets, proc_map = Backend.get_sockets()
-    local port_num = tonumber(target)
+    local kind, number = parse_numeric_query(target)
     local matches = {}
     for _, s in ipairs(sockets) do
-        if (port_num and (s.port == port_num or s.pid == port_num))
-            or s.process:lower():find(target:lower(), 1, true) then
+        local hit
+        if kind == "port" then
+            hit = (s.port == number)
+        elseif kind == "pid" then
+            hit = (s.pid == number)
+        elseif kind == "port_or_pid" then
+            hit = (s.port == number or s.pid == number)
+        else
+            hit = s.process:lower():find(target:lower(), 1, true) ~= nil
+        end
+        if hit then
             table.insert(matches, s)
         end
     end
@@ -1547,6 +1581,38 @@ local function run_tests()
     local listen_list = filter_and_sort(sockets, "listen", "", "port")
     assert_eq("Listen filter returns table", type(listen_list), "table")
 
+    -- Synthetic rows prove the matcher never widens a numeric query.
+    local fixtures = {
+        { proto = "TCP", port = 45678, pid = 4336, process = "python.exe",
+          local_addr = "127.0.0.1:45678", state = "LISTEN" },
+        { proto = "TCP6", port = 42050, pid = 1728, process = "OneDrive.Sync.Service.exe",
+          local_addr = "[::1]:42050", state = "LISTEN" },
+    }
+    local hits = filter_and_sort(fixtures, "all", "45678", "port")
+    assert_eq("digits-only query matches exactly one port", #hits, 1)
+    assert_eq("digits-only query picks the right port", hits[1] and hits[1].port, 45678)
+
+    hits = filter_and_sort(fixtures, "all", "4336", "port")
+    assert_eq("digits-only query also matches an exact PID", #hits, 1)
+    assert_eq("digits-only query picks the right PID", hits[1] and hits[1].pid, 4336)
+
+    hits = filter_and_sort(fixtures, "all", "42050", "port")
+    assert_eq("port query does not match unrelated rows", #hits, 1)
+    assert_eq("port query keeps the bound row", hits[1] and hits[1].port, 42050)
+
+    hits = filter_and_sort(fixtures, "all", "port:42050", "port")
+    assert_eq("port: prefix matches that port", #hits, 1)
+    assert_eq("port: prefix ignores PIDs", hits[1] and hits[1].pid, 1728)
+
+    hits = filter_and_sort(fixtures, "all", "pid:4336", "port")
+    assert_eq("pid: prefix matches that PID", #hits, 1)
+    assert_eq("pid: prefix ignores ports", hits[1] and hits[1].port, 45678)
+
+    hits = filter_and_sort(fixtures, "all", "onedrive", "port")
+    assert_eq("text queries still match the process name", #hits, 1)
+    assert_eq("text query keeps case-insensitive matching", hits[1] and hits[1].process,
+        "OneDrive.Sync.Service.exe")
+
     print(string.format("\nSelf-test summary: %d passed, %d failed.", passed, failed))
     if failed > 0 then os.exit(1) end
 end
@@ -1561,9 +1627,14 @@ Options:
   -l, --list           Print formatted port table to stdout and exit
   -a, --all            Include all TCP states (ESTABLISHED, TIME_WAIT) and UDP sockets
   -k, --kill <PORT>    Terminate process(es) listening/bound on <PORT>
-  --preview <PORT>     Print detailed ANSI socket & process card for <PORT>
+  --preview <PORT|PID> Print detailed ANSI socket & process card for a port or PID
   --test               Run automated self-test suite
   -h, --help           Show this help message
+
+Search behavior:
+  A digits-only query matches a port or a PID exactly; use port:N or pid:N to
+  pick one explicitly. Any other text is fuzzy-matched against the row.
+  Examples:  fport --list 5173     fport --list pid:4336     fport --list node
 
 TUI Keybindings:
   j / k / Up / Down    Navigate socket list
