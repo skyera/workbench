@@ -1044,23 +1044,39 @@ netsh advfirewall firewall delete rule name="SSH_PortProxy_2222"
 
 ### Linux
 ```bash
-# -----------------------------------------------------------------------------
-# Remote Desktop & VNC Server Setup (Ubuntu 24.04 / Debian - e.g. centre1)
-# Independent concurrent sessions: VNC on :1 (5901), XRDP on :10 (3389)
-# -----------------------------------------------------------------------------
+# core dumps
+sudo sysctl -w kernel.core_pattern=core
+ulimit -c unlimited
+# /etc/sysctl.conf:
+#     kernel.core_pattern = core
+#     sudo sysctl -p
 
-# 1. Install desktop environment & servers
+fortune | cowsay
+lsof
+```
+
+---
+
+## Remote Desktop (RDP) & VNC Setup (centre / Laptop)
+
+Independent concurrent sessions for user `zliu` on Ubuntu 24.04 LTS:
+* **VNC**: Display `:1` (Port `5901`) — Persistent background session
+* **RDP**: Display `:10` (Port `3389`) — Dynamic isolated session
+
+### Common Prerequisites (Desktop Environment)
+```bash
 sudo apt update
 sudo apt install -y xrdp xorgxrdp tigervnc-standalone-server tigervnc-common xfce4 xfce4-goodies
 sudo adduser xrdp ssl-cert
 echo "xfce4-session" > ~/.xsession
+```
 
-# 2. Fix headless boot freeze (Plymouth deadlock)
-# Headless machines have no physical monitor; GDM never tells Plymouth to quit,
-# causing plymouth-quit-wait.service to hang forever and timing out xrdp on boot.
+### 1. RDP Server Configuration (XRDP)
+```bash
+# A. Prevent headless boot deadlock (Plymouth wait hang)
 sudo systemctl mask plymouth-quit-wait.service
 
-# 3. XRDP systemd boot override (start after network-online & multi-user)
+# B. Sequence XRDP after network and multi-user targets
 sudo mkdir -p /etc/systemd/system/xrdp.service.d
 sudo tee /etc/systemd/system/xrdp.service.d/override.conf << 'EOF'
 [Unit]
@@ -1068,8 +1084,7 @@ After=multi-user.target network-online.target xrdp-sesman.service
 Wants=network-online.target
 EOF
 
-# 4. Isolate XRDP D-Bus session (allows simultaneous VNC + RDP without conflict)
-# In /etc/xrdp/startwm.sh, insert before 'test -x /etc/X11/Xsession':
+# C. Isolate D-Bus session in /etc/xrdp/startwm.sh (prevents clash with active VNC)
 sudo sed -i '/test -x \/etc\/X11\/Xsession/i \
 # Isolate D-Bus and session variables to prevent collision with concurrent VNC/local sessions\n\
 unset DBUS_SESSION_BUS_ADDRESS\n\
@@ -1078,7 +1093,7 @@ export XDG_SESSION_TYPE=x11\n\
 export XDG_CURRENT_DESKTOP=XFCE\n\
 export DESKTOP_SESSION=xfce\n' /etc/xrdp/startwm.sh
 
-# 5. Suppress Polkit color manager authentication popups on remote login
+# D. Suppress Polkit color-manager authentication dialogs on remote login
 sudo tee /etc/polkit-1/rules.d/45-xrdp-colord.rules << 'EOF'
 polkit.addRule(function(action, subject) {
     if ((action.id == "org.freedesktop.color-manager.create-device" ||
@@ -1093,8 +1108,17 @@ polkit.addRule(function(action, subject) {
 });
 EOF
 
-# 6. TigerVNC setup (Display :1, Port 5901)
+# E. Enable & start XRDP
+sudo systemctl daemon-reload
+sudo systemctl enable --now xrdp-sesman xrdp
+```
+
+### 2. VNC Server Configuration (TigerVNC)
+```bash
+# A. Set VNC password
 vncpasswd
+
+# B. User config (Port 5901 on display :1, shared session)
 mkdir -p ~/.vnc
 cat << 'EOF' > ~/.vnc/config
 session=xfce
@@ -1104,6 +1128,7 @@ alwaysshared
 securitytypes=VncAuth,TLSVnc
 EOF
 
+# C. Startup script
 cat << 'EOF' > ~/.vnc/xstartup
 #!/bin/sh
 unset SESSION_MANAGER
@@ -1115,23 +1140,24 @@ exec startxfce4
 EOF
 chmod +x ~/.vnc/xstartup
 
+# D. Map user to Display :1 and enable systemd service
 echo ":1=$USER" | sudo tee -a /etc/tigervnc/vncserver.users
 sudo systemctl daemon-reload
-sudo systemctl enable --now tigervncserver@:1.service xrdp-sesman xrdp
+sudo systemctl enable --now tigervncserver@:1.service
+```
 
-# 7. Verify
+### 3. Verification & Connectivity Checks
+```bash
+# Check service listening ports
 ss -tlpn | grep -E "3389|5901"
+
+# Check overall system running state (should report 'running', not 'starting')
 systemctl is-system-running
 
-# core dumps
-sudo sysctl -w kernel.core_pattern=core
-ulimit -c unlimited
-# /etc/sysctl.conf:
-#     kernel.core_pattern = core
-#     sudo sysctl -p
-
-fortune | cowsay
-lsof
+# Optional: Allow through UFW firewall if enabled
+sudo ufw allow 3389/tcp comment "XRDP"
+sudo ufw allow 5901/tcp comment "TigerVNC"
+```
 ```
 
 ### Disk Space
