@@ -23,6 +23,7 @@ OMB_ALIASES=${OMB_ALIASES:-"general"}
 OMB_COMPLETIONS=${OMB_COMPLETIONS:-"git npm pip"}
 
 # PATH: Safely add to PATH without creating duplicate entries upon sourcing/reloading
+[[ ":$PATH:" != *":$HOME/.local/bin:"* ]] && export PATH="$HOME/.local/bin:$PATH"
 [[ ":$PATH:" != *":$HOME/bin:"* ]] && export PATH="$HOME/bin:$PATH"
 [[ ":$PATH:" != *":$HOME/.local/share/forgit/bin:"* ]] && export PATH="$HOME/.local/share/forgit/bin:$PATH"
 export FORGIT_INSTALL_DIR="$HOME/.local/share/forgit"
@@ -1485,15 +1486,27 @@ _apply_overrides() {
     command -v fco.sh >/dev/null 2>&1 && alias fco='fco.sh'
     [[ -n "$BASH_VERSION" && $- == *i* ]] && bind -x '"\eh": fhist' 2>/dev/null
 
-    # Antigravity CLI auto-approve alias (universal)
-    if command -v agy.exe >/dev/null 2>&1; then
-        alias agy='agy.exe --dangerously-skip-permissions'
-    elif command -v antigravity.exe >/dev/null 2>&1; then
-        alias agy='antigravity.exe --dangerously-skip-permissions'
-    elif command -v antigravity >/dev/null 2>&1; then
-        alias agy='antigravity --dangerously-skip-permissions'
-    elif command -v agy >/dev/null 2>&1; then
-        alias agy='agy --dangerously-skip-permissions'
+    # Antigravity CLI auto-approve alias (prioritize native binaries on Linux/macOS/WSL)
+    if $_IS_WINDOWS; then
+        if command -v agy.exe >/dev/null 2>&1; then
+            alias agy='agy.exe --dangerously-skip-permissions'
+        elif command -v antigravity.exe >/dev/null 2>&1; then
+            alias agy='antigravity.exe --dangerously-skip-permissions'
+        elif command -v agy >/dev/null 2>&1; then
+            alias agy='agy --dangerously-skip-permissions'
+        elif command -v antigravity >/dev/null 2>&1; then
+            alias agy='antigravity --dangerously-skip-permissions'
+        fi
+    else
+        if command -v agy >/dev/null 2>&1; then
+            alias agy='agy --dangerously-skip-permissions'
+        elif command -v antigravity >/dev/null 2>&1; then
+            alias agy='antigravity --dangerously-skip-permissions'
+        elif command -v agy.exe >/dev/null 2>&1; then
+            alias agy='agy.exe --dangerously-skip-permissions'
+        elif command -v antigravity.exe >/dev/null 2>&1; then
+            alias agy='antigravity.exe --dangerously-skip-permissions'
+        fi
     fi
 }
 _apply_overrides
