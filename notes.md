@@ -372,7 +372,7 @@ eval "$(fzf --bash)"
 #### Environment
 ```bash
 export FZF_DEFAULT_COMMAND="fd --follow --hidden --ignore-file ~/.fdignore"
-# on Windows: fd --no-ignore-vcs --type file --follow --hidden --ignore-file c:\users\zliu\.fdignore
+# on Windows: fd --no-ignore-vcs --type file --follow --hidden --ignore-file %USERPROFILE%\.fdignore
 
 export FZF_DEFAULT_OPTS="--preview 'bat --color=always {}'"
 
@@ -1059,7 +1059,7 @@ lsof
 
 ## Remote Desktop (RDP) & VNC Setup (centre / Laptop)
 
-Independent concurrent sessions for user `zliu` on Ubuntu 24.04 LTS:
+Independent concurrent sessions for `$USER` on Ubuntu 24.04 LTS:
 * **VNC**: Display `:1` (Port `5901`) — Persistent background session
 * **RDP**: Display `:10` (Port `3389`) — Dynamic isolated session
 

@@ -1,4 +1,4 @@
-# /home/zliu/.config/tmuxp/dev.yaml
+# ~/.config/tmuxp/dev.yaml
 
 session_name: dev
 start_directory: $REPOS_DIR
