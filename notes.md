@@ -1044,8 +1044,84 @@ netsh advfirewall firewall delete rule name="SSH_PortProxy_2222"
 
 ### Linux
 ```bash
-# RDP login
-rm ~/.Xauthority
+# -----------------------------------------------------------------------------
+# Remote Desktop & VNC Server Setup (Ubuntu 24.04 / Debian - e.g. centre1)
+# Independent concurrent sessions: VNC on :1 (5901), XRDP on :10 (3389)
+# -----------------------------------------------------------------------------
+
+# 1. Install desktop environment & servers
+sudo apt update
+sudo apt install -y xrdp xorgxrdp tigervnc-standalone-server tigervnc-common xfce4 xfce4-goodies
+sudo adduser xrdp ssl-cert
+echo "xfce4-session" > ~/.xsession
+
+# 2. Fix headless boot freeze (Plymouth deadlock)
+# Headless machines have no physical monitor; GDM never tells Plymouth to quit,
+# causing plymouth-quit-wait.service to hang forever and timing out xrdp on boot.
+sudo systemctl mask plymouth-quit-wait.service
+
+# 3. XRDP systemd boot override (start after network-online & multi-user)
+sudo mkdir -p /etc/systemd/system/xrdp.service.d
+sudo tee /etc/systemd/system/xrdp.service.d/override.conf << 'EOF'
+[Unit]
+After=multi-user.target network-online.target xrdp-sesman.service
+Wants=network-online.target
+EOF
+
+# 4. Isolate XRDP D-Bus session (allows simultaneous VNC + RDP without conflict)
+# In /etc/xrdp/startwm.sh, insert before 'test -x /etc/X11/Xsession':
+sudo sed -i '/test -x \/etc\/X11\/Xsession/i \
+# Isolate D-Bus and session variables to prevent collision with concurrent VNC/local sessions\n\
+unset DBUS_SESSION_BUS_ADDRESS\n\
+unset SESSION_MANAGER\n\
+export XDG_SESSION_TYPE=x11\n\
+export XDG_CURRENT_DESKTOP=XFCE\n\
+export DESKTOP_SESSION=xfce\n' /etc/xrdp/startwm.sh
+
+# 5. Suppress Polkit color manager authentication popups on remote login
+sudo tee /etc/polkit-1/rules.d/45-xrdp-colord.rules << 'EOF'
+polkit.addRule(function(action, subject) {
+    if ((action.id == "org.freedesktop.color-manager.create-device" ||
+         action.id == "org.freedesktop.color-manager.create-profile" ||
+         action.id == "org.freedesktop.color-manager.delete-device" ||
+         action.id == "org.freedesktop.color-manager.delete-profile" ||
+         action.id == "org.freedesktop.color-manager.modify-device" ||
+         action.id == "org.freedesktop.color-manager.modify-profile") &&
+        subject.isInGroup("sudo")) {
+        return polkit.Result.YES;
+    }
+});
+EOF
+
+# 6. TigerVNC setup (Display :1, Port 5901)
+vncpasswd
+mkdir -p ~/.vnc
+cat << 'EOF' > ~/.vnc/config
+session=xfce
+geometry=1920x1080
+localhost=no
+alwaysshared
+securitytypes=VncAuth,TLSVnc
+EOF
+
+cat << 'EOF' > ~/.vnc/xstartup
+#!/bin/sh
+unset SESSION_MANAGER
+unset DBUS_SESSION_BUS_ADDRESS
+export XDG_SESSION_TYPE=x11
+export XDG_CURRENT_DESKTOP=XFCE
+[ -r /home/$USER/.Xresources ] && xrdb /home/$USER/.Xresources
+exec startxfce4
+EOF
+chmod +x ~/.vnc/xstartup
+
+echo ":1=$USER" | sudo tee -a /etc/tigervnc/vncserver.users
+sudo systemctl daemon-reload
+sudo systemctl enable --now tigervncserver@:1.service xrdp-sesman xrdp
+
+# 7. Verify
+ss -tlpn | grep -E "3389|5901"
+systemctl is-system-running
 
 # core dumps
 sudo sysctl -w kernel.core_pattern=core
