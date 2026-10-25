@@ -94,16 +94,26 @@ For every change, consider how to prove correctness before concluding:
 
 ## Request & Issue Workflow
 
-When the user asks about an issue, problem, feature, or modification, the agent MUST:
+### 1. User Questions, Checks & Diagnostic Inquiries
+When the user asks a question, requests a health check, asks for current behavior, or inquires about best practices (e.g., *"check ... server"*, *"is X good?"*, *"what is the current behavior?"*, *"what is the best practice?"*, *"should I change X to Y?"*), the agent MUST:
+*   **Non-Destructive Ground-Truth Inspection**: Inspect the live environment, services, sockets, and configurations using read-only commands before answering. Never guess or hallucinate state.
+*   **Direct & Transparent Answers**: Answer the user's specific question directly at the start. State clearly whether the system is healthy, failing, or partially degraded.
+*   **Root Cause & Objective Analysis**: Clearly explain *why* things behave the way they do, backed by log output or concrete technical facts.
+*   **Professional Recommendation & Options**: Present industry best practices with realistic tradeoffs (pros, cons, side effects) and actionable recommendations.
+*   **No Unrequested Modifications**: Present potential solutions or improvements as options/proposals. Do NOT modify files or system state during pure diagnostic/question inquiries unless the user explicitly asks to fix or change them.
+
+### 2. Modification, Feature & Fix Requests
+When the user asks to implement, modify, fix, or update something (e.g., *"fix ..."*, *"make X do Y"*, *"update ..."*), the agent MUST:
 
 1.  **Think & Analyze**: Explain the root cause or understand the requirement clearly.
 2.  **Propose a Solution & Design**: Explain what needs to change, the plan of action, and why. Ensure error handling and user-facing error messages are defined.
 3.  **Define Verification / Validation Plan**: Explicitly state how the change will be tested and validated (commands to run, expected results, edge cases).
 4.  **Show Mockup UI / Command Output**: If the request involves TUI, GUI, or command output, provide a realistic mockup or sample output preview (including error states if applicable).
 5.  **Give Recommendation**: Provide your professional recommendation and options.
-6.  **Show Code Comparison**: Present a before/after diff so the user can see exactly what changes.
+6.  **Show Code Comparison / Draft**: Present a before/after diff or draft so the user can see exactly what changes before writing to disk.
 7.  **Approval Mode**:
     *   If the user has indicated **"approve always"**, **"do it"**, **"auto approve"**, or explicitly asks to fix/implement directly: proceed immediately with implementation and verification without asking for confirmation.
+    *   If the user requests to see a draft or review first (e.g., *"show me the draft"*, *"let me review before commit/modify"*): **display the draft and WAIT for user approval before writing or modifying any files.**
     *   Otherwise: **WAIT for user approval before applying changes or starting implementation.**
 
 ## Commit Workflow
