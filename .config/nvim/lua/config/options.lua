@@ -149,6 +149,7 @@ vim.api.nvim_create_autocmd("FileType", {
 vim.filetype.add({
   -- Built-in generic log syntax; specific patterns below take priority.
   extension = {
+    t = "terra",
     log = function(_, bufnr)
       local filetype = vim.bo[bufnr].filetype
       return filetype ~= "" and filetype or "log"
@@ -204,6 +205,14 @@ vim.api.nvim_create_autocmd("FileType", {
   pattern = "python",
   callback = function()
     vim.opt_local.foldmethod = "indent"
+  end,
+})
+
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = "terra",
+  callback = function()
+    vim.opt_local.commentstring = "-- %s"
+    vim.opt_local.comments = ":--"
   end,
 })
 

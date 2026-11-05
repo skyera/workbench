@@ -389,6 +389,12 @@ augroup sh_indent
   autocmd FileType python setlocal foldmethod=indent
 augroup END
 
+augroup terra_files
+  autocmd!
+  autocmd BufRead,BufNewFile *.t setlocal filetype=terra
+  autocmd FileType terra setlocal commentstring=--\ %s comments=:--
+augroup END
+
 " --- Tagbar TypeScript ---
 let g:tagbar_type_typescript = {
   \ 'ctagstype': 'typescript',
