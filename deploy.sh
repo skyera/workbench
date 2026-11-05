@@ -84,9 +84,11 @@ deploy_file "$REPO_DIR/myvimrc"    "$HOME/.vimrc"
 if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" || "$OSTYPE" == "win32" ]]; then
     deploy_file "$REPO_DIR/.config/nvim/syntax/computesanitizer.vim" "$HOME/vimfiles/syntax/computesanitizer.vim"
     deploy_file "$REPO_DIR/.config/nvim/syntax/terra.vim"            "$HOME/vimfiles/syntax/terra.vim"
+    deploy_file "$REPO_DIR/.config/nvim/indent/terra.vim"            "$HOME/vimfiles/indent/terra.vim"
 else
     deploy_file "$REPO_DIR/.config/nvim/syntax/computesanitizer.vim" "$HOME/.vim/syntax/computesanitizer.vim"
     deploy_file "$REPO_DIR/.config/nvim/syntax/terra.vim"            "$HOME/.vim/syntax/terra.vim"
+    deploy_file "$REPO_DIR/.config/nvim/indent/terra.vim"            "$HOME/.vim/indent/terra.vim"
 fi
 
 # Neovim configuration
@@ -106,6 +108,7 @@ else
     deploy_file "$REPO_DIR/myvimrc" "$HOME/.config/nvim/init.vim"
     deploy_file "$REPO_DIR/.config/nvim/syntax/computesanitizer.vim" "$HOME/.config/nvim/syntax/computesanitizer.vim"
     deploy_file "$REPO_DIR/.config/nvim/syntax/terra.vim"            "$HOME/.config/nvim/syntax/terra.vim"
+    deploy_file "$REPO_DIR/.config/nvim/indent/terra.vim"            "$HOME/.config/nvim/indent/terra.vim"
 fi
 
 deploy_file "$REPO_DIR/.tigrc"      "$HOME/.tigrc"

@@ -211,6 +211,7 @@ vim.api.nvim_create_autocmd("FileType", {
 vim.api.nvim_create_autocmd("FileType", {
   pattern = "terra",
   callback = function()
+    vim.opt_local.cindent = false
     vim.opt_local.commentstring = "-- %s"
     vim.opt_local.comments = ":--"
   end,
