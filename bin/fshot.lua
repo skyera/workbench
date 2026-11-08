@@ -2448,6 +2448,24 @@ function editor_support.remove_last_char(text)
     return text:sub(1, index - 1)
 end
 
+-- WM_CHAR code for Backspace. Kept on editor_support rather than as a file
+-- local because the main chunk is close to LuaJIT's 200-local limit.
+editor_support.BACKSPACE_CODE = 0x08
+
+-- Applies one WM_CHAR code to a label buffer: Backspace removes the last code
+-- point, printable characters append, and other control codes are ignored.
+function editor_support.apply_text_code(buffer, code)
+    if code == editor_support.BACKSPACE_CODE then
+        return editor_support.remove_last_char(buffer)
+    end
+
+    if code >= 32 and code ~= 127 then
+        return buffer .. editor_support.utf16_to_utf8(code)
+    end
+
+    return buffer
+end
+
 -- The last crop annotation wins; everything before it is just history.
 function editor_support.crop_bounds(annotations, width, height)
     local crop = nil
@@ -2703,7 +2721,7 @@ local EDITOR_KEYS = {
     WM_CHAR = 0x0102,
     WM_CLOSE = WM_CLOSE,
     WM_DESTROY = WM_DESTROY,
-    VK_BACK = 0x08,
+    VK_BACK = editor_support.BACKSPACE_CODE,
     VK_ESCAPE = VK_ESCAPE,
     VK_E = 0x45,
     VK_RETURN = VK_RETURN,
@@ -3273,11 +3291,7 @@ local function win_edit_image(image, options)
             return
         end
 
-        if code == VK_BACK then
-            editing.buffer = editor_support.remove_last_char(editing.buffer)
-        elseif code >= 32 and code ~= 127 then
-            editing.buffer = editing.buffer .. editor_support.utf16_to_utf8(code)
-        end
+        editing.buffer = editor_support.apply_text_code(editing.buffer, code)
         text_editor.status()
     end
 
@@ -5994,6 +6008,17 @@ local function run_tests()
 
     check("remove_last_char handles an empty label",
         editor_support.remove_last_char("") == "")
+
+    check("apply_text_code treats Backspace as delete",
+        editor_support.apply_text_code("caf\195\169", 8) == "caf",
+        editor_support.apply_text_code("caf\195\169", 8))
+
+    check("apply_text_code Backspace on an empty label stays empty",
+        editor_support.apply_text_code("", 8) == "")
+
+    check("apply_text_code ignores other control codes",
+        editor_support.apply_text_code("ab", 9) == "ab"
+            and editor_support.apply_text_code("ab", 127) == "ab")
 
     local crop_annotations = {
         { tool = "crop", x1 = 2, y1 = 3, x2 = 10, y2 = 12 },
