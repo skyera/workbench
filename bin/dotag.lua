@@ -565,6 +565,11 @@ function Term.init()
     end
 end
 
+-- Win32 console input mode flags (SetConsoleMode).
+local WIN32_ENABLE_PROCESSED_INPUT = 0x0001  -- console handles Ctrl+C itself
+local WIN32_ENABLE_LINE_INPUT = 0x0002
+local WIN32_ENABLE_ECHO_INPUT = 0x0004
+
 function Term.enable_raw()
     if Term.is_raw then return end
     if IS_WINDOWS then
@@ -572,7 +577,15 @@ function Term.enable_raw()
             local mode = ffi.new("DWORD[1]")
             if ffi.C.GetConsoleMode(Term.hIn, mode) ~= 0 then
                 Term.orig_in_mode = mode[0]
-                local raw_mode = bit.band(mode[0], bit.bnot(bit.bor(0x0002, 0x0004))) -- DISABLE LINE & ECHO INPUT
+
+                -- Clear processed input too, so Ctrl+C reaches the key handler as
+                -- byte 3 and quits cleanly instead of killing the process unrestored.
+                local cooked_flags = bit.bor(
+                    WIN32_ENABLE_PROCESSED_INPUT,
+                    WIN32_ENABLE_LINE_INPUT,
+                    WIN32_ENABLE_ECHO_INPUT
+                )
+                local raw_mode = bit.band(mode[0], bit.bnot(cooked_flags))
                 ffi.C.SetConsoleMode(Term.hIn, raw_mode)
             end
         end
@@ -2954,6 +2967,24 @@ local function enter_target_directory(target_dir)
     os.exit(EXIT_RUNTIME_ERROR)
 end
 
+-- Runs the TUI and always restores the terminal, even when a Lua error
+-- escapes. Without this, a crash leaves the shell in raw mode with no echo,
+-- the cursor hidden and the alternate screen still active.
+local function run_tui_safely()
+    local succeeded, error_trace = xpcall(TUI.run, debug.traceback)
+    Term.restore()
+    if succeeded then
+        return
+    end
+
+    io.stderr:write(string.format(
+        "dotag: internal error: %s\n"
+            .. "The terminal was restored. Please report this error with the trace above.\n",
+        tostring(error_trace)
+    ))
+    os.exit(EXIT_RUNTIME_ERROR)
+end
+
 local function main(args)
     args = args or {}
 
@@ -2991,9 +3022,9 @@ local function main(args)
 
     if is_batch then
         os.exit(run_cli_batch(options))
-    else
-        TUI.run()
     end
+
+    run_tui_safely()
 end
 
 main(arg)
