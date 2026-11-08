@@ -1371,10 +1371,9 @@ local TUI = {
     modal_scroll = 0,
     modal_filter = "",
     
-    -- Verification modal state
+    -- Verification modal state (the selection is the shared modal_selection)
     verify_items = {},
-    verify_selection = 1,
-    verify_filter = "",
+    verify_load_error = nil,
 }
 
 function TUI.init_config()
@@ -1964,6 +1963,50 @@ function TUI.render()
     io.flush()
 end
 
+local VERIFY_TAG_COLUMN_WIDTH = 20
+
+-- Reads filenametags for the verify browser.
+-- Returns the list of { tag, path } items, plus an error message when the
+-- file could not be opened (nil when it was read, even if empty).
+local function load_verify_items()
+    local items = {}
+    local file, open_error = io.open(FILENAMETAG_FILE_NAME, "r")
+    if not file then
+        return items, open_error
+    end
+
+    for line in file:lines() do
+        if not line:find("^!") then
+            local tag, path = line:match("^([^\t]+)\t([^\t]+)")
+            if tag and path then
+                table.insert(items, { tag = tag, path = path })
+            end
+        end
+    end
+    file:close()
+    return items, nil
+end
+
+-- Status line for the verify browser, including why it is empty.
+local function describe_verify_status()
+    if #TUI.verify_items > 0 then
+        return string.format(
+            " Tag %d of %d indexed  [PgUp/PgDn/j/k]  [v/Esc] Close",
+            TUI.modal_selection,
+            #TUI.verify_items
+        )
+    end
+
+    local load_error = TUI.verify_load_error or ""
+    if load_error:find("No such file", 1, true) then
+        return " No tags: filenametags not found. Close with [v/Esc], press Space."
+    end
+    if load_error ~= "" then
+        return " Cannot read filenametags: " .. load_error
+    end
+    return " No tags: filenametags is empty. Close with [v/Esc], press Space."
+end
+
 function TUI.render_modal(cols, rows, buf)
     local mw = math.min(72, cols - 4)
     local mh = math.min(18, rows - 4)
@@ -2037,14 +2080,21 @@ function TUI.render_modal(cols, rows, buf)
             local idx = TUI.modal_scroll + i
             local item = TUI.verify_items[idx]
             if item then
-                local is_sel = (idx == TUI.verify_selection)
-                local sel = is_sel and (C.reverse .. "> ") or "  "
-                local tag_str = is_sel and (C.b_white .. truncate_str(item.tag or "", 20) .. C.reset) or truncate_str(item.tag or "", 20)
-                local line = string.format("%s%-20s %s", sel, tag_str, truncate_str(item.path or "", mw - 28))
+                local is_selected = (idx == TUI.modal_selection)
+                local marker = is_selected and (C.reverse .. "> ") or "  "
+                local tag_text = truncate_str(item.tag or "", VERIFY_TAG_COLUMN_WIDTH)
+                if is_selected then
+                    tag_text = C.b_white .. tag_text .. C.reset
+                end
+
+                -- pad_string measures visible width, so escape codes don't shift columns
+                local tag_cell = pad_string(tag_text, VERIFY_TAG_COLUMN_WIDTH)
+                local path_text = truncate_str(item.path or "", mw - 28)
+                local line = marker .. tag_cell .. " " .. path_text
                 mwrite(i + 1, C.b_yellow .. BOX.v .. " " .. pad_right(line, mw - 4) .. " " .. C.b_yellow .. BOX.v .. C.reset)
             end
         end
-        local status_msg = string.format(" Tag %d of %d indexed  [PgUp/PgDn/j/k]  [v/Esc] Close", TUI.verify_selection, #TUI.verify_items)
+        local status_msg = describe_verify_status()
         mwrite(mh - 2, C.b_yellow .. BOX.v .. C.gray .. pad_right(status_msg, mw - 4) .. C.b_yellow .. BOX.v .. C.reset)
 
     elseif TUI.modal == "help" then
@@ -2290,20 +2340,7 @@ function TUI.run(options)
                     TUI.modal_selection = 1
                     TUI.modal_scroll = 0
                 elseif key == "v" then
-                    -- Load filenametags for quick verification
-                    TUI.verify_items = {}
-                    local f = io.open(FILENAMETAG_FILE_NAME, "r")
-                    if f then
-                        for line in f:lines() do
-                            if not line:find("^!") then
-                                local tag, path = line:match("^([^\t]+)\t([^\t]+)")
-                                if tag and path then
-                                    table.insert(TUI.verify_items, { tag = tag, path = path })
-                                end
-                            end
-                        end
-                        f:close()
-                    end
+                    TUI.verify_items, TUI.verify_load_error = load_verify_items()
                     TUI.modal = "verify"
                     TUI.modal_selection = 1
                     TUI.modal_scroll = 0
