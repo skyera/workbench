@@ -679,26 +679,23 @@ local function build_ext_set(ext_list)
     return set
 end
 
+-- Exclusion rules are whole directory names, compared case-insensitively.
+-- A rule such as "out" skips every directory named "out" at any depth, but
+-- not "layout" or "output". This matches how fd's --exclude treats bare names.
 local function build_excluded_set(excl_list)
-    local list = {}
-    for _, e in ipairs(excl_list) do
-        table.insert(list, e:lower())
+    local set = {}
+    for _, excluded_name in ipairs(excl_list) do
+        set[excluded_name:lower()] = true
     end
-    return list
+    return set
 end
 
-local function is_dir_excluded(dir_name, excl_list)
-    local lower = dir_name:lower()
-    for _, pat in ipairs(excl_list) do
-        if lower:find(pat, 1, true) then
-            return true
-        end
-    end
-    return false
+local function is_dir_excluded(dir_name, excluded_set)
+    return excluded_set[dir_name:lower()] == true
 end
 
 -- Win32 High-Speed Crawler via FindFirstFileW
-local function crawl_win32(dir_path, excl_list, ext_set, files_out, warnings_out)
+local function crawl_win32(dir_path, excluded_set, ext_set, files_out, warnings_out)
     local pattern = dir_path .. "\\*"
     local wpattern = to_wide(pattern)
     local find_data = ffi.new("WIN32_FIND_DATAW")
@@ -710,8 +707,8 @@ local function crawl_win32(dir_path, excl_list, ext_set, files_out, warnings_out
         if name ~= "." and name ~= ".." then
             local is_dir = bit.band(find_data.dwFileAttributes, 0x10) ~= 0
             if is_dir then
-                if not is_dir_excluded(name, excl_list) then
-                    crawl_win32(dir_path .. "\\" .. name, excl_list, ext_set, files_out, warnings_out)
+                if not is_dir_excluded(name, excluded_set) then
+                    crawl_win32(dir_path .. "\\" .. name, excluded_set, ext_set, files_out, warnings_out)
                 end
             else
                 local ext = name:match("(%.[^.]+)$")
@@ -733,7 +730,7 @@ local function crawl_win32(dir_path, excl_list, ext_set, files_out, warnings_out
 end
 
 -- POSIX High-Speed Crawler via opendir/readdir
-local function crawl_posix(dir_path, excl_list, ext_set, files_out, warnings_out)
+local function crawl_posix(dir_path, excluded_set, ext_set, files_out, warnings_out)
     local dir = ffi.C.opendir(dir_path)
     if dir == nil then return end
 
@@ -752,8 +749,8 @@ local function crawl_posix(dir_path, excl_list, ext_set, files_out, warnings_out
             end
 
             if is_dir then
-                if not is_dir_excluded(name, excl_list) then
-                    crawl_posix(full_path, excl_list, ext_set, files_out, warnings_out)
+                if not is_dir_excluded(name, excluded_set) then
+                    crawl_posix(full_path, excluded_set, ext_set, files_out, warnings_out)
                 end
             else
                 local ext = name:match("(%.[^.]+)$")
@@ -778,7 +775,7 @@ end
 local function crawl_directory(method, root_dir, excl_list, ext_list, no_ignore, warnings_out)
     local files_out = {}
     local ext_set = build_ext_set(ext_list)
-    local excl_patterns = build_excluded_set(excl_list)
+    local excluded_set = build_excluded_set(excl_list)
 
     if method == "fd" then
         local cmd = "fd --type f --ignore-case"
@@ -808,9 +805,9 @@ local function crawl_directory(method, root_dir, excl_list, ext_list, no_ignore,
 
     -- Default: Native FFI crawler
     if IS_WINDOWS then
-        crawl_win32(root_dir, excl_patterns, ext_set, files_out, warnings_out)
+        crawl_win32(root_dir, excluded_set, ext_set, files_out, warnings_out)
     else
-        crawl_posix(root_dir, excl_patterns, ext_set, files_out, warnings_out)
+        crawl_posix(root_dir, excluded_set, ext_set, files_out, warnings_out)
     end
 
     return files_out
@@ -1946,6 +1943,18 @@ local function run_test_suite()
     assert_eq(utf8_col_width(padded), 20, "pad_string visual column width")
     local truncated = truncate_string("very long path that exceeds twenty cols", 20)
     assert_eq(utf8_col_width(truncated), 20, "truncate_string visual column width")
+
+    -- Test 5b: Excluded directories match whole names only
+    print("\n[Test 5b] Excluded Directory Name Matching...")
+    local excluded_set = build_excluded_set({ "out", "env", "Build", "node_modules" })
+    assert_eq(is_dir_excluded("out", excluded_set), true, "Exact name 'out' is excluded")
+    assert_eq(is_dir_excluded("OUT", excluded_set), true, "Name match is case-insensitive")
+    assert_eq(is_dir_excluded("build", excluded_set), true, "Mixed-case rule 'Build' matches")
+    assert_eq(is_dir_excluded("node_modules", excluded_set), true, "Exact 'node_modules'")
+    assert_eq(is_dir_excluded("layout", excluded_set), false, "'layout' not excluded by 'out'")
+    assert_eq(is_dir_excluded("output", excluded_set), false, "'output' not excluded by 'out'")
+    assert_eq(is_dir_excluded("environment", excluded_set), false, "'environment' kept")
+    assert_eq(is_dir_excluded("buildscripts", excluded_set), false, "'buildscripts' kept")
 
     -- Test 6: Monotonic Clock
     print("\n[Test 6] High-Resolution Monotonic Clock...")
