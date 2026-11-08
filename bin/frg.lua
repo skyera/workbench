@@ -606,13 +606,30 @@ function Engine.detect_editor()
     return "vim"
 end
 
+-- Exit statuses a shell reports when the command could not be found. LuaJIT's
+-- os.execute returns either the exit code or the raw wait status (code * 256)
+-- depending on the platform; cmd.exe reports a missing command as 1.
+local function editor_was_not_found(status, editor)
+    if status == 127 or status == 127 * 256 then
+        return true
+    end
+    if IS_WINDOWS and status == 1 then
+        local where_status = os.execute(string.format("where %s >nul 2>nul", editor))
+        return not (where_status == 0 or where_status == true)
+    end
+    return false
+end
+
+-- Run the editor on the given matches and wait for it to exit.
+-- Returns nil on success, or an error message when the editor could not start.
 function Engine.open_in_editor(matches)
-    if not matches or #matches == 0 then return end
+    if not matches or #matches == 0 then return nil end
     local editor = Engine.detect_editor()
+
+    local cmd
     if #matches == 1 then
         local m = matches[1]
-        local cmd = string.format('%s +%d %s', editor, m.line, shell_quote(m.file))
-        os.execute(cmd)
+        cmd = string.format('%s +%d %s', editor, m.line, shell_quote(m.file))
     else
         local seen = {}
         local files = {}
@@ -622,9 +639,16 @@ function Engine.open_in_editor(matches)
                 table.insert(files, shell_quote(m.file))
             end
         end
-        local cmd = string.format('%s -p %s', editor, table.concat(files, " "))
-        os.execute(cmd)
+        cmd = string.format('%s -p %s', editor, table.concat(files, " "))
     end
+
+    local status = os.execute(cmd)
+    if editor_was_not_found(status, editor) then
+        return string.format(
+            "Could not start '%s': command not found. Install it or set it on PATH, then retry.",
+            editor)
+    end
+    return nil
 end
 
 --------------------------------------------------------------------------------
@@ -873,6 +897,8 @@ local function run_tui(initial_pattern, search_path, init_opts)
         elseif state.mode == "filter" then
             footer = C.b_magenta .. " Filter Matches (f): " .. C.b_white .. state.filter .. "█"
                 .. C.gray .. "   [Enter] Lock Filter  [Esc] Cancel" .. C.reset
+        elseif #state.status_msg > 0 then
+            footer = C.b_red .. " " .. state.status_msg .. C.reset
         else
             footer = C.gray ..
                 " [Enter] Open Editor  [/] Pattern  [f] Filter  [Space/Tab] Multi-Select  [i] Case  [F] Literal  [w] Word  [H] Hidden  [?] Help  [q] Quit"
@@ -895,7 +921,55 @@ local function run_tui(initial_pattern, search_path, init_opts)
         end
     end
 
-    local to_open = nil
+    -- Pick the new cursor row after a re-search: same file, nearest line.
+    -- Edits shift line numbers, so an exact match cannot be relied on.
+    local function find_row_near(anchor)
+        if not anchor then return 1 end
+        local best_row = 1
+        local best_distance = nil
+        for row, m in ipairs(state.filtered) do
+            if m.file == anchor.file then
+                local distance = math.abs(m.line - anchor.line)
+                if not best_distance or distance < best_distance then
+                    best_row = row
+                    best_distance = distance
+                end
+            end
+        end
+        return best_row
+    end
+
+    -- Drop keystrokes typed while the editor was open so they do not replay
+    -- into the search UI.
+    local function discard_pending_keys()
+        for _ = 1, 256 do
+            if not Term.read_key() then return end
+        end
+    end
+
+    -- Run the editor, then return to this search UI with the same pattern,
+    -- options and cursor. The terminal is handed back for the editor's
+    -- lifetime and re-acquired afterwards.
+    local function open_editor_and_resume(picked)
+        local anchor = state.filtered[state.cursor]
+
+        Term.restore()
+        local launch_err = Engine.open_in_editor(picked)
+        Term.init()
+        Term.enable_raw()
+        discard_pending_keys()
+
+        -- The edit may have changed file contents and line numbers.
+        for _, m in ipairs(picked) do
+            Engine.file_cache[m.file] = nil
+        end
+        execute_search()
+        state.cursor = find_row_near(anchor)
+        state.status_msg = launch_err or ""
+
+        prev_cols = 0 -- forces a full repaint of the alternate screen
+        render()
+    end
 
     Term.enable_raw()
     local ok, err = pcall(function()
@@ -905,6 +979,7 @@ local function run_tui(initial_pattern, search_path, init_opts)
             if not key then
                 Term.sleep_ms(16)
             else
+                state.status_msg = "" -- a notice lasts until the next keypress
                 if state.mode == "help" then
                     state.mode = "normal"
                     render()
@@ -1049,8 +1124,7 @@ local function run_tui(initial_pattern, search_path, init_opts)
                             table.insert(picked, state.filtered[state.cursor])
                         end
                         if #picked > 0 then
-                            to_open = picked
-                            break
+                            open_editor_and_resume(picked)
                         end
                     end
                 end
@@ -1061,9 +1135,6 @@ local function run_tui(initial_pattern, search_path, init_opts)
     if not ok then
         io.stderr:write("[frg error] " .. tostring(err) .. "\n")
         os.exit(1)
-    end
-    if to_open then
-        Engine.open_in_editor(to_open)
     end
 end
 
@@ -1206,6 +1277,47 @@ local function run_tests()
     assert_eq("describe_rg_failure explains a missing rg on POSIX",
         describe_rg_failure({ "sh: 1: rg: not found" }):find("not installed", 1, true) ~= nil, true)
     os.remove(fixture_path)
+
+    -- Editor launch: a stub editor records its arguments; a missing editor is
+    -- reported rather than silently ignored.
+    local original_detect_editor = Engine.detect_editor
+    local stub_log_path = temp_dir .. (IS_WINDOWS and "\\" or "/") .. "frg_stub_editor.log"
+    local stub_script_path = temp_dir .. (IS_WINDOWS and "\\" or "/")
+        .. (IS_WINDOWS and "frg_stub_editor.bat" or "frg_stub_editor.sh")
+    local stub_file = assert(io.open(stub_script_path, "wb"))
+    if IS_WINDOWS then
+        stub_file:write('@echo %* > "' .. stub_log_path .. '"\r\n')
+    else
+        stub_file:write('#!/bin/sh\necho "$@" > "' .. stub_log_path .. '"\n')
+    end
+    stub_file:close()
+    if not IS_WINDOWS then
+        os.execute('chmod +x "' .. stub_script_path .. '"')
+    end
+
+    -- cmd.exe mishandles a command line that starts with a quoted program path
+    -- and also quotes an argument, so only quote the stub path when it needs it.
+    local stub_command = stub_script_path:find("%s") and ('"' .. stub_script_path .. '"')
+        or stub_script_path
+    Engine.detect_editor = function() return stub_command end
+    local open_err = Engine.open_in_editor({ { file = "some file.txt", line = 7 } })
+    local log_file = io.open(stub_log_path, "rb")
+    local log_text = log_file and log_file:read("*a") or ""
+    if log_file then log_file:close() end
+    assert_eq("open_in_editor runs the editor without error", open_err, nil)
+    assert_eq("open_in_editor passes +line and the quoted file",
+        log_text:find("+7", 1, true) ~= nil and log_text:find("some file.txt", 1, true) ~= nil, true)
+
+    Engine.detect_editor = function() return "frg_no_such_editor_xyz" end
+    local missing_editor_err = Engine.open_in_editor({ { file = "a.txt", line = 1 } })
+    assert_eq("open_in_editor reports a missing editor",
+        tostring(missing_editor_err):find("command not found", 1, true) ~= nil, true)
+    assert_eq("open_in_editor names the missing editor",
+        tostring(missing_editor_err):find("frg_no_such_editor_xyz", 1, true) ~= nil, true)
+
+    Engine.detect_editor = original_detect_editor
+    os.remove(stub_script_path)
+    os.remove(stub_log_path)
 
     print(string.format("\nSelf-test summary: %d passed, %d failed.", passed, failed))
     if failed > 0 then os.exit(1) end
