@@ -84,6 +84,9 @@ if IS_WINDOWS then
         int SetEnvironmentVariableA(const char* lpName, const char* lpValue);
         DWORD GetCurrentDirectoryA(DWORD nBufferLength, char* lpBuffer);
         BOOL SetCurrentDirectoryA(const char* lpPathName);
+        BOOL CreateDirectoryA(const char* lpPathName, void* lpSecurityAttributes);
+        BOOL RemoveDirectoryA(const char* lpPathName);
+        DWORD GetLastError(void);
         unsigned long long GetTickCount64(void);
 
         // Win32 Directory Traversal
@@ -181,6 +184,9 @@ else
         int clock_gettime(int clk_id, struct timespec *tp);
         int open(const char *pathname, int flags, ...);
         int chdir(const char *path);
+        int mkdir(const char *pathname, unsigned int mode);
+        int rmdir(const char *pathname);
+        char *strerror(int errnum);
         int ioctl(int fd, unsigned long request, ...);
         int read(int fd, void *buf, size_t count);
         int isatty(int fd);
@@ -333,6 +339,62 @@ local function get_cwd()
         if res ~= nil then return clean_path(ffi.string(res)) end
     end
     return clean_path(os.getenv("PWD") or ".")
+end
+
+-- Returns a readable description of the last failed OS call.
+-- Must be called immediately after the failing call, before any other C call.
+local function describe_last_os_error()
+    if IS_WINDOWS then
+        return "Win32 error " .. tonumber(ffi.C.GetLastError())
+    end
+    return ffi.string(ffi.C.strerror(ffi.errno()))
+end
+
+-- Creates one directory (parents must exist).
+-- Returns true, or false plus the OS error text.
+local function make_directory(path, posix_mode)
+    local succeeded
+    if IS_WINDOWS then
+        succeeded = ffi.C.CreateDirectoryA(path, nil) ~= 0
+    else
+        succeeded = ffi.C.mkdir(path, posix_mode or 493) == 0 -- 493 = octal 0755
+    end
+
+    if succeeded then
+        return true
+    end
+    return false, describe_last_os_error()
+end
+
+-- Removes one empty directory. Returns true, or false plus the OS error text.
+local function remove_directory(path)
+    local succeeded
+    if IS_WINDOWS then
+        succeeded = ffi.C.RemoveDirectoryA(path) ~= 0
+    else
+        succeeded = ffi.C.rmdir(path) == 0
+    end
+
+    if succeeded then
+        return true
+    end
+    return false, describe_last_os_error()
+end
+
+-- Changes the process working directory.
+-- Returns true, or false plus the OS error text.
+local function change_directory(path)
+    local succeeded
+    if IS_WINDOWS then
+        succeeded = ffi.C.SetCurrentDirectoryA(path) ~= 0
+    else
+        succeeded = ffi.C.chdir(path) == 0
+    end
+
+    if succeeded then
+        return true
+    end
+    return false, describe_last_os_error()
 end
 
 local function utf8_col_width(s)
@@ -1872,44 +1934,174 @@ end
 --------------------------------------------------------------------------------
 -- Automated Self-Test Suite (--test)
 --------------------------------------------------------------------------------
-local function run_test_suite()
-    print("=== Running dotag.lua Automated Test Suite ===")
-    local failed = 0
-    local passed = 0
+-- Private sandbox permissions on POSIX: owner read/write/search only.
+local TEST_SANDBOX_POSIX_MODE = 448 -- octal 0700
 
-    local function assert_eq(actual, expected, desc)
+-- Files that tests or the code under test may create inside the sandbox.
+-- destroy_test_sandbox removes these even if a test crashed before cleanup.
+local TEST_GENERATED_FILE_NAMES = {
+    CSCOPE_FILE_NAME,
+    FILENAMETAG_FILE_NAME,
+    TAGS_FILE_NAME,
+    "cscope.out",
+    "cscope.in.out",
+    "cscope.po.out",
+    "_test_cscope.files",
+    "_test_filenametags",
+}
+
+-- Creates a pass/fail counter with assertion and reporting helpers.
+local function new_tester()
+    local tester = {
+        passed = 0,
+        failed = 0,
+    }
+
+    function tester.assert_eq(actual, expected, description)
         if actual == expected then
-            print(string.format("  [PASS] %s", desc))
-            passed = passed + 1
+            print(string.format("  [PASS] %s", description))
+            tester.passed = tester.passed + 1
+            return
+        end
+
+        print(string.format(
+            "  [FAIL] %s: expected '%s', got '%s'",
+            description,
+            tostring(expected),
+            tostring(actual)
+        ))
+        tester.failed = tester.failed + 1
+    end
+
+    function tester.fail(description)
+        print(string.format("  [FAIL] %s", description))
+        tester.failed = tester.failed + 1
+    end
+
+    -- Prints the summary and returns the process exit code.
+    function tester.report()
+        print(string.format(
+            "\nTest Results: %d Passed, %d Failed.",
+            tester.passed,
+            tester.failed
+        ))
+        if tester.failed == 0 then
+            return 0
+        end
+        return 1
+    end
+
+    return tester
+end
+
+--------------------------------------------------------------------------------
+-- Test Sandbox (keeps --test away from the user's real databases)
+--------------------------------------------------------------------------------
+
+-- Returns the platform temp directory with forward slashes and no trailing slash.
+local function get_temp_root()
+    local temp_root = os.getenv("TMPDIR") or os.getenv("TEMP") or os.getenv("TMP")
+    if not temp_root or temp_root == "" then
+        if IS_WINDOWS then
+            temp_root = "C:/Windows/Temp"
         else
-            print(string.format("  [FAIL] %s: expected '%s', got '%s'", desc, tostring(expected), tostring(actual)))
-            failed = failed + 1
+            temp_root = "/tmp"
         end
     end
 
-    -- Test 1: Foldcase sorting
-    print("\n[Test 1] Filename Foldcase Sort...")
-    local test_cscope = "_test_cscope.files"
-    local test_tags   = "_test_filenametags"
-    local f = io.open(test_cscope, "w")
-    f:write("src/B.c\nsrc/a.c\nsrc/c.C\n")
-    f:close()
+    local normalized = clean_path(temp_root):gsub("/+$", "")
+    return normalized
+end
 
-    local ok_fn, count_fn = generate_filenametags(test_cscope, test_tags)
-    assert_eq(ok_fn, true, "generate_filenametags status")
-    assert_eq(count_fn, 3, "generate_filenametags item count")
+-- Creates a fresh, uniquely named directory under the temp root.
+-- Returns a sandbox record, or nil plus the attempted path and the OS error.
+local function create_test_sandbox()
+    local microseconds = math.floor((get_time_sec() % 1) * 1e6)
+    local sandbox_name = string.format("dotag-test-%d-%06d", os.time(), microseconds)
+    local sandbox_path = get_temp_root() .. "/" .. sandbox_name
 
-    local lines = {}
-    for line in io.lines(test_tags) do
-        table.insert(lines, line)
+    local created, create_error = make_directory(sandbox_path, TEST_SANDBOX_POSIX_MODE)
+    if not created then
+        return nil, sandbox_path, create_error
     end
-    assert_eq(lines[1], "!_TAG_FILE_SORTED\t2\t/2=foldcase/", "Foldcase tag header")
-    assert_eq(lines[2], "a.c\tsrc/a.c\t1", "Foldcase sort order item 1 (a.c)")
-    assert_eq(lines[3], "B.c\tsrc/B.c\t1", "Foldcase sort order item 2 (B.c)")
-    assert_eq(lines[4], "c.C\tsrc/c.C\t1", "Foldcase sort order item 3 (c.C)")
 
-    os.remove(test_cscope)
-    os.remove(test_tags)
+    return {
+        path = sandbox_path,
+        directories = {}, -- relative paths, in creation order
+        files = {},       -- relative paths of fixture files
+    }
+end
+
+-- Creates every missing parent directory of `relative_path` inside the sandbox.
+local function sandbox_make_parents(sandbox, relative_path)
+    local parent_path = ""
+    for directory_name in relative_path:gmatch("([^/]+)/") do
+        parent_path = parent_path .. directory_name
+
+        local already_created = false
+        for _, existing in ipairs(sandbox.directories) do
+            if existing == parent_path then
+                already_created = true
+                break
+            end
+        end
+
+        if not already_created then
+            local created, create_error = make_directory(sandbox.path .. "/" .. parent_path)
+            if not created then
+                error(string.format("cannot create '%s': %s", parent_path, create_error))
+            end
+            table.insert(sandbox.directories, parent_path)
+        end
+
+        parent_path = parent_path .. "/"
+    end
+end
+
+-- Writes a fixture file inside the sandbox and records it for cleanup.
+-- Raises an error (caught by run_test_suite) if the file cannot be written.
+local function sandbox_write_file(sandbox, relative_path, content)
+    sandbox_make_parents(sandbox, relative_path)
+
+    local full_path = sandbox.path .. "/" .. relative_path
+    local file, open_error = io.open(full_path, "wb")
+    if not file then
+        error(string.format("cannot write fixture '%s': %s", relative_path, open_error))
+    end
+
+    file:write(content or "")
+    file:close()
+    table.insert(sandbox.files, relative_path)
+end
+
+-- Removes fixture files, generated outputs, sub-directories (deepest first),
+-- and finally the sandbox itself. Returns true, or false plus an error message.
+local function destroy_test_sandbox(sandbox)
+    for _, relative_path in ipairs(sandbox.files) do
+        os.remove(sandbox.path .. "/" .. relative_path)
+    end
+    for _, file_name in ipairs(TEST_GENERATED_FILE_NAMES) do
+        os.remove(sandbox.path .. "/" .. file_name)
+    end
+
+    for index = #sandbox.directories, 1, -1 do
+        remove_directory(sandbox.path .. "/" .. sandbox.directories[index])
+    end
+
+    local removed, remove_error = remove_directory(sandbox.path)
+    if not removed then
+        return false, remove_error
+    end
+    return true
+end
+
+--------------------------------------------------------------------------------
+-- Test Cases
+--------------------------------------------------------------------------------
+
+-- Tests that need no filesystem access; safe to run from any directory.
+local function run_pure_tests(tester)
+    local assert_eq = tester.assert_eq
 
     -- Test 2: Space warning & exclusion
     print("\n[Test 2] Space-in-Path Filtering...")
@@ -1921,18 +2113,6 @@ local function run_test_suite()
         end
     end
     assert_eq(#filtered, 2, "Filtered out paths with spaces")
-
-    -- Test 3: Win32/POSIX Directory Crawler
-    print("\n[Test 3] Native FFI Directory Crawler...")
-    local crawl_res = crawl_directory("ffi", ".", { ".git", "node_modules" }, { ".lua" }, false, {})
-    assert_eq(#crawl_res > 0, true, "Crawl discovered Lua source files in repository")
-
-    -- Test 4: Database Clean
-    print("\n[Test 4] Database Cleanup Mechanism...")
-    local f_dummy = io.open("cscope.out", "w")
-    if f_dummy then f_dummy:write("dummy"); f_dummy:close() end
-    local cleaned = clean_all_databases()
-    assert_eq(file_exists("cscope.out"), false, "Cleaned cscope.out successfully")
 
     -- Test 5: TUI Unicode & ANSI Layout Geometry
     print("\n[Test 5] TUI Unicode & ANSI Layout Geometry...")
@@ -1989,9 +2169,151 @@ local function run_test_suite()
     for _, frame in ipairs(SPINNER_FRAMES) do
         assert_eq(utf8_col_width(frame), 1, string.format("Spinner frame '%s' width is 1", frame))
     end
+end
 
-    print(string.format("\nTest Results: %d Passed, %d Failed.", passed, failed))
-    return failed == 0 and 0 or 1
+-- Test 1: filenametags generation and foldcase ordering.
+local function test_filenametags_sort(tester, sandbox)
+    local assert_eq = tester.assert_eq
+    print("\n[Test 1] Filename Foldcase Sort...")
+
+    local test_cscope = "_test_cscope.files"
+    local test_tags = "_test_filenametags"
+    sandbox_write_file(sandbox, test_cscope, "src/B.c\nsrc/a.c\nsrc/c.C\n")
+
+    local ok_fn, count_fn = generate_filenametags(test_cscope, test_tags)
+    assert_eq(ok_fn, true, "generate_filenametags status")
+    assert_eq(count_fn, 3, "generate_filenametags item count")
+
+    local lines = {}
+    for line in io.lines(test_tags) do
+        table.insert(lines, line)
+    end
+    assert_eq(lines[1], "!_TAG_FILE_SORTED\t2\t/2=foldcase/", "Foldcase tag header")
+    assert_eq(lines[2], "a.c\tsrc/a.c\t1", "Foldcase sort order item 1 (a.c)")
+    assert_eq(lines[3], "B.c\tsrc/B.c\t1", "Foldcase sort order item 2 (B.c)")
+    assert_eq(lines[4], "c.C\tsrc/c.C\t1", "Foldcase sort order item 3 (c.C)")
+end
+
+-- Test 3: the native crawler finds sources and honors exclusions,
+-- using its own fixture tree so it does not depend on the caller's directory.
+local function test_native_crawler(tester, sandbox)
+    local assert_eq = tester.assert_eq
+    print("\n[Test 3] Native FFI Directory Crawler (sandbox fixture)...")
+
+    sandbox_write_file(sandbox, "src/main.lua", "return 1\n")
+    sandbox_write_file(sandbox, "layout/view.lua", "return 2\n")
+    sandbox_write_file(sandbox, "node_modules/dep.lua", "return 3\n")
+    sandbox_write_file(sandbox, "out/generated.lua", "return 4\n")
+
+    local found_files = crawl_directory(
+        "ffi",
+        ".",
+        { "node_modules", "out" },
+        { ".lua" },
+        false,
+        {}
+    )
+    local found_set = {}
+    for _, path in ipairs(found_files) do
+        found_set[path] = true
+    end
+
+    assert_eq(found_set["src/main.lua"], true, "Crawler found src/main.lua")
+    assert_eq(found_set["layout/view.lua"], true, "Crawler found layout/view.lua")
+    assert_eq(found_set["node_modules/dep.lua"], nil, "Crawler skipped node_modules/dep.lua")
+    assert_eq(found_set["out/generated.lua"], nil, "Crawler skipped out/generated.lua")
+end
+
+-- Test 4: clean_all_databases removes every database file and nothing else.
+local function test_database_cleanup(tester, sandbox)
+    local assert_eq = tester.assert_eq
+    print("\n[Test 4] Database Cleanup Mechanism (sandbox)...")
+
+    local database_files = {
+        CSCOPE_FILE_NAME,
+        FILENAMETAG_FILE_NAME,
+        TAGS_FILE_NAME,
+        "cscope.out",
+        "cscope.in.out",
+        "cscope.po.out",
+    }
+    for _, file_name in ipairs(database_files) do
+        sandbox_write_file(sandbox, file_name, "dummy")
+    end
+    sandbox_write_file(sandbox, "notes.txt", "keep me")
+
+    local removed_count = clean_all_databases()
+    assert_eq(removed_count, #database_files, "clean_all_databases removed count")
+    for _, file_name in ipairs(database_files) do
+        assert_eq(file_exists(file_name), false, "clean_all_databases removed " .. file_name)
+    end
+    assert_eq(file_exists("notes.txt"), true, "clean_all_databases kept unrelated notes.txt")
+end
+
+-- Tests that read or write files. Must run with the sandbox as working directory.
+local function run_filesystem_tests(tester, sandbox)
+    test_filenametags_sort(tester, sandbox)
+    test_native_crawler(tester, sandbox)
+    test_database_cleanup(tester, sandbox)
+end
+
+-- Runs filesystem tests inside the sandbox, always restoring the original
+-- working directory and removing the sandbox, even when a test raises an error.
+local function run_sandboxed_tests(tester)
+    local sandbox, attempted_path, create_error = create_test_sandbox()
+    if not sandbox then
+        io.stderr:write(string.format(
+            "[ERROR] Cannot create test sandbox '%s': %s.\n"
+                .. "        Set TMPDIR (or TEMP on Windows) to a writable directory"
+                .. " and re-run --test.\n",
+            attempted_path,
+            create_error
+        ))
+        tester.fail("Test sandbox could not be created; filesystem tests skipped")
+        return
+    end
+    print("\nTest sandbox: " .. sandbox.path)
+
+    local original_directory = get_cwd()
+    local entered, enter_error = change_directory(sandbox.path)
+    if entered then
+        local tests_ok, test_error = pcall(run_filesystem_tests, tester, sandbox)
+        if not tests_ok then
+            tester.fail("Filesystem tests crashed: " .. tostring(test_error))
+        end
+    else
+        tester.fail(string.format("Cannot enter test sandbox: %s", enter_error))
+    end
+
+    -- Always return to the caller's directory before deleting the sandbox.
+    local restored, restore_error = change_directory(original_directory)
+    if not restored then
+        tester.fail(string.format(
+            "Cannot return to '%s': %s",
+            original_directory,
+            restore_error
+        ))
+    end
+
+    local destroyed, destroy_error = destroy_test_sandbox(sandbox)
+    if not destroyed then
+        io.stderr:write(string.format(
+            "[WARN] Could not remove test sandbox '%s': %s. Delete it manually.\n",
+            sandbox.path,
+            destroy_error
+        ))
+    end
+end
+
+-- Entry point for --test. Returns the process exit code.
+local function run_test_suite()
+    print("=== Running dotag.lua Automated Test Suite ===")
+    local tester = new_tester()
+
+    run_pure_tests(tester)
+    run_sandboxed_tests(tester)
+
+    return tester.report()
 end
 
 --------------------------------------------------------------------------------
