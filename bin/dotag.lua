@@ -598,6 +598,7 @@ local Term = {
     hIn = nil,
     hOut = nil,
     is_raw = false,
+    pending_input = "", -- POSIX bytes read but not yet parsed into keys
 }
 
 function Term.init()
@@ -710,6 +711,122 @@ function Term.get_size()
     return cols, rows
 end
 
+local ESC_BYTE = 27
+local CSI_INTRODUCER = 91   -- '['
+local SS3_INTRODUCER = 79   -- 'O'
+local IGNORED_KEY = "ignored"
+local INPUT_READ_SIZE = 256
+
+-- The final byte alone picks the key, so modified forms such as
+-- ESC [ 1 ; 5 A (Ctrl+Up) still map to "up".
+local CSI_FINAL_KEYS = {
+    A = "up",
+    B = "down",
+    C = "right",
+    D = "left",
+    H = "home",
+    F = "end",
+}
+
+-- ESC [ <number> ~ forms.
+local CSI_TILDE_KEYS = {
+    ["1"] = "home",
+    ["3"] = "delete",
+    ["4"] = "end",
+    ["5"] = "pageup",
+    ["6"] = "pagedown",
+    ["7"] = "home",
+    ["8"] = "end",
+}
+
+local PLAIN_KEY_NAMES = {
+    [13] = "enter",
+    [10] = "enter",
+    [9] = "tab",
+    [127] = "backspace",
+    [8] = "backspace",
+    [32] = "space",
+    [3] = "ctrl_c",
+}
+
+-- Parses a sequence that starts with ESC. Returns key_name, bytes_consumed.
+-- Unrecognised sequences are consumed whole and reported as IGNORED_KEY, so
+-- keys such as F5 can no longer be mistaken for Esc.
+local function parse_escape_sequence(input)
+    local introducer = input:byte(2)
+
+    if introducer == CSI_INTRODUCER then
+        local _, last, params, final = input:find("^\27%[([0-9;]*)([@-~])")
+        if not last then
+            return IGNORED_KEY, #input -- incomplete or malformed
+        end
+        if final == "~" then
+            return CSI_TILDE_KEYS[params:match("^(%d+)")] or IGNORED_KEY, last
+        end
+        return CSI_FINAL_KEYS[final] or IGNORED_KEY, last
+    end
+
+    if introducer == SS3_INTRODUCER and #input >= 3 then
+        return CSI_FINAL_KEYS[input:sub(3, 3)] or IGNORED_KEY, 3
+    end
+
+    -- A lone Esc, or Esc followed by ordinary text: just the Esc key.
+    return "esc", 1
+end
+
+-- Parses one key from the front of the non-empty byte string `input`.
+-- Returns key_name, bytes_consumed.
+local function parse_next_key(input)
+    local first = input:byte(1)
+    if first == ESC_BYTE then
+        return parse_escape_sequence(input)
+    end
+
+    local named_key = PLAIN_KEY_NAMES[first]
+    if named_key then
+        return named_key, 1
+    end
+
+    if first >= 128 then
+        -- One whole UTF-8 character; no binding matches it. string.char would
+        -- raise an error for the negative values a signed char produces.
+        local character = input:match("^[\194-\244][\128-\191]*")
+        if character then
+            return character, #character
+        end
+        return IGNORED_KEY, 1
+    end
+    return string.char(first), 1
+end
+
+local input_read_buffer = ffi.new("unsigned char[?]", INPUT_READ_SIZE)
+
+-- Returns the next key name, or nil when no input is waiting. Bytes read
+-- together stay queued in Term.pending_input instead of being discarded.
+local function read_key_posix()
+    if #Term.pending_input == 0 then
+        local count = ffi.C.read(0, input_read_buffer, INPUT_READ_SIZE)
+        if count > 0 then
+            Term.pending_input = ffi.string(input_read_buffer, count)
+        end
+    end
+
+    while #Term.pending_input > 0 do
+        local key, consumed = parse_next_key(Term.pending_input)
+        Term.pending_input = Term.pending_input:sub(consumed + 1)
+        if key ~= IGNORED_KEY then
+            return key
+        end
+    end
+    return nil
+end
+
+-- True while typed-ahead keys are queued (POSIX only; Windows reads one key
+-- per call and never queues).
+function Term.has_pending_input()
+    return #Term.pending_input > 0
+end
+
 function Term.read_key()
     if IS_WINDOWS then
         local m = _G.msvcrt
@@ -737,32 +854,7 @@ function Term.read_key()
             return string.char(ch)
         end
     else
-        local buf = ffi.new("char[8]")
-        local n = ffi.C.read(0, buf, 8)
-        if n <= 0 then return nil end
-        local ch = buf[0]
-        if ch == 27 then
-            if n == 1 then return "esc" end
-            if buf[1] == 91 then -- '['
-                if buf[2] == 65 then return "up"
-                elseif buf[2] == 66 then return "down"
-                elseif buf[2] == 67 then return "right"
-                elseif buf[2] == 68 then return "left"
-                elseif buf[2] == 53 and buf[3] == 126 then return "pageup"
-                elseif buf[2] == 54 and buf[3] == 126 then return "pagedown"
-                elseif buf[2] == 72 then return "home"
-                elseif buf[2] == 70 then return "end"
-                end
-            end
-            return "esc"
-        elseif ch == 13 or ch == 10 then return "enter"
-        elseif ch == 9 then return "tab"
-        elseif ch == 127 or ch == 8 then return "backspace"
-        elseif ch == 32 then return "space"
-        elseif ch == 3 then return "ctrl_c"
-        else
-            return string.char(ch)
-        end
+        return read_key_posix()
     end
 end
 
@@ -2601,10 +2693,14 @@ function TUI.run(options)
             end
         end
 
-        if IS_WINDOWS then
-            ffi.C.Sleep(20)
-        else
-            ffi.C.usleep(20000)
+        -- Skip the idle sleep while typed-ahead keys wait, so a burst is
+        -- handled at once instead of one key per 20 ms.
+        if not Term.has_pending_input() then
+            if IS_WINDOWS then
+                ffi.C.Sleep(20)
+            else
+                ffi.C.usleep(20000)
+            end
         end
     end
 
@@ -3190,6 +3286,59 @@ local function run_pure_tests(tester)
     should_run, detail = decide_auto_run("/home/me/Downloads", "/home/me", nil)
     assert_eq(should_run, false, "No project marker means no auto-run")
     assert_eq(detail:find("no .git", 1, true) ~= nil, true, "No-marker skip reason")
+
+    -- Test 16: Key parsing
+    print("\n[Test 16] Terminal Key Parsing...")
+    local key, consumed = parse_next_key("j")
+    assert_eq(key, "j", "Plain key")
+    assert_eq(consumed, 1, "Plain key consumes 1 byte")
+    key, consumed = parse_next_key("\27[B")
+    assert_eq(key, "down", "ESC [ B is down")
+    assert_eq(consumed, 3, "Arrow consumes 3 bytes")
+    key = parse_next_key("\27[5~")
+    assert_eq(key, "pageup", "ESC [ 5 ~ is pageup")
+    key = parse_next_key("\27[3~")
+    assert_eq(key, "delete", "ESC [ 3 ~ is delete")
+    key = parse_next_key("\27[1;5A")
+    assert_eq(key, "up", "Ctrl+Up still maps to up")
+    key = parse_next_key("\27OA")
+    assert_eq(key, "up", "ESC O A (application mode) is up")
+    key, consumed = parse_next_key("\27[15~")
+    assert_eq(key, IGNORED_KEY, "F5 is ignored, not Esc")
+    assert_eq(consumed, 5, "F5 is consumed whole")
+    key, consumed = parse_next_key("\27")
+    assert_eq(key, "esc", "Lone ESC is esc")
+    assert_eq(consumed, 1, "Lone ESC consumes 1 byte")
+    key, consumed = parse_next_key("\27q")
+    assert_eq(key, "esc", "ESC followed by text is esc")
+    assert_eq(consumed, 1, "...and leaves the next key alone")
+    key, consumed = parse_next_key("\27[")
+    assert_eq(key, IGNORED_KEY, "Incomplete CSI is ignored")
+    key, consumed = parse_next_key("\195\169x")
+    assert_eq(key, "\195\169", "UTF-8 character is one key")
+    assert_eq(consumed, 2, "UTF-8 character consumes both bytes")
+    key = parse_next_key("\169")
+    assert_eq(key, IGNORED_KEY, "Stray continuation byte is ignored")
+    key = parse_next_key(" ")
+    assert_eq(key, "space", "Space")
+    key = parse_next_key("\3")
+    assert_eq(key, "ctrl_c", "Ctrl+C")
+
+    -- A burst delivered in one read yields every key, in order.
+    local burst = "jj\27[Bk\27[15~l\195\169\27q"
+    local drained = {}
+    while #burst > 0 do
+        local next_key, next_consumed = parse_next_key(burst)
+        burst = burst:sub(next_consumed + 1)
+        if next_key ~= IGNORED_KEY then
+            table.insert(drained, next_key)
+        end
+    end
+    assert_eq(
+        table.concat(drained, ","),
+        "j,j,down,k,l,\195\169,esc,q",
+        "Burst drains to every key in order"
+    )
 end
 
 -- Test 1: filenametags generation and foldcase ordering.
