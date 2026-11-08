@@ -725,29 +725,47 @@ local function apply_setpath_windows()
     end
 end
 
-local function detect_tools()
-    local tools = {
-        cscope = false,
-        ctags  = false,
-        fd     = false,
-        find   = false,
-    }
-    
-    local function check_cmd(cmd)
-        local test_cmd = cmd .. " --version"
-        if IS_WINDOWS then
-            test_cmd = test_cmd .. " >nul 2>nul"
-        else
-            test_cmd = test_cmd .. " >/dev/null 2>&1"
-        end
-        return os.execute(test_cmd) == 0
+-- Returns true when `cmd --version` runs successfully, i.e. the tool is on PATH.
+local function command_exists(cmd)
+    local test_cmd = cmd .. " --version"
+    if IS_WINDOWS then
+        test_cmd = test_cmd .. " >nul 2>nul"
+    else
+        test_cmd = test_cmd .. " >/dev/null 2>&1"
     end
 
-    tools.cscope = check_cmd("cscope")
-    tools.ctags  = check_cmd("ctags")
-    tools.fd     = check_cmd("fd")
-    tools.find   = check_cmd("find")
-    return tools
+    -- LuaJIT returns 0 on success; Lua 5.2-compatible builds return true.
+    local result = os.execute(test_cmd)
+    return result == 0 or result == true
+end
+
+local function detect_tools()
+    return {
+        cscope = command_exists("cscope"),
+        ctags = command_exists("ctags"),
+        fd = command_exists("fd"),
+        find = command_exists("find"),
+    }
+end
+
+-- Checks that the external program a discovery method needs is installed.
+-- Call before cleaning so a missing tool never costs the user their databases.
+-- Returns true, or false plus a short reason.
+local function check_find_method_available(method)
+    if method == "fd" and not command_exists("fd") then
+        return false, "fd not found in PATH (needed for -f fd)"
+    end
+    return true
+end
+
+-- Explains why a crawl found nothing, for batch and TUI error messages.
+local function describe_empty_crawl(method, extension_count)
+    return string.format(
+        "no source files found in %s (method: %s, %d extensions)",
+        get_cwd(),
+        method,
+        extension_count
+    )
 end
 
 --------------------------------------------------------------------------------
@@ -1403,6 +1421,17 @@ function TUI.start_pipeline()
         step.failure = nil
     end
 
+    -- Check the discovery tool before cleaning, so a missing fd keeps old databases.
+    local method_ok, method_error = check_find_method_available(TUI.method)
+    if not method_ok then
+        TUI.log(string.format(
+            "[ERROR] %s. Install fd (https://github.com/sharkdp/fd) or press 'm' to switch method.",
+            method_error
+        ))
+        TUI.fail_crawl_step(method_error)
+        return
+    end
+
     -- Step 0: Clean old databases if requested
     if TUI.clean_before then
         TUI.log("[CLEAN] Cleaning existing indexing database files...")
@@ -1433,6 +1462,17 @@ function TUI.start_pipeline()
 
     for _, warn_msg in ipairs(warnings) do
         TUI.log("[WARN] " .. warn_msg)
+    end
+
+    -- Nothing to index: stop before overwriting cscope.files or running tools.
+    if #files == 0 then
+        local reason = describe_empty_crawl(TUI.method, #TUI.get_active_extensions())
+        TUI.log(string.format(
+            "[ERROR] %s. Check the directory, or enable more extensions with 'e'.",
+            reason
+        ))
+        TUI.fail_crawl_step("no source files found")
+        return
     end
 
     -- Write cscope.files
@@ -1499,6 +1539,13 @@ function TUI.start_pipeline()
     TUI.log("[INFO] Running cscope and ctags in foreground...")
     TUI.run_step_sync(TUI.steps.cscope, cscope_command)
     TUI.run_step_sync(TUI.steps.ctags, ctags_command)
+    TUI.finish_pipeline()
+end
+
+-- Marks the discovery step as failed and ends the run with an ERROR status.
+function TUI.fail_crawl_step(reason)
+    TUI.steps.crawl.status = "ERROR"
+    TUI.steps.crawl.failure = reason
     TUI.finish_pipeline()
 end
 
@@ -2324,24 +2371,54 @@ local function run_cli_batch(options)
     local no_ignore = options.no_ignore
 
     print("find method: " .. method)
+    if IS_WINDOWS then
+        apply_setpath_windows()
+    end
+
+    -- Check the discovery tool before cleaning, so a missing fd keeps old databases.
+    local method_ok, method_error = check_find_method_available(method)
+    if not method_ok then
+        io.stdout:flush()
+        io.stderr:write(string.format(
+            "dotag: error: %s.\n"
+                .. "Install fd (https://github.com/sharkdp/fd)"
+                .. " or use the built-in crawler: -f ffi\n",
+            method_error
+        ))
+        return EXIT_RUNTIME_ERROR
+    end
+
     if clean then
         print("Cleaning old database files...")
         clean_all_databases()
     end
 
-    if IS_WINDOWS then
-        apply_setpath_windows()
-    end
-
     local t_start = get_time_sec()
     print("finding files...")
     local warnings = {}
-    local files = crawl_directory(method, ".", DEFAULT_EXCLUDED_DIRS, DEFAULT_FILE_EXTS, no_ignore, warnings)
+    local files = crawl_directory(
+        method,
+        ".",
+        DEFAULT_EXCLUDED_DIRS,
+        DEFAULT_FILE_EXTS,
+        no_ignore,
+        warnings
+    )
     local t_found = get_time_sec() - t_start
     print(string.format("find files: number of files %d elapsed %.3f seconds", #files, t_found))
 
     for _, w in ipairs(warnings) do
         io.stderr:write(w .. "\n")
+    end
+
+    -- Nothing to index: stop before overwriting cscope.files or running tools.
+    if #files == 0 then
+        io.stdout:flush()
+        io.stderr:write(string.format(
+            "dotag: error: %s.\nCheck the directory, or try another method with -f.\n",
+            describe_empty_crawl(method, #DEFAULT_FILE_EXTS)
+        ))
+        return EXIT_RUNTIME_ERROR
     end
 
     local ok_w, count_w = write_cscope_files(files)
