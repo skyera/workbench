@@ -2294,6 +2294,30 @@ end
 --------------------------------------------------------------------------------
 -- Non-Interactive Batch / CLI Mode
 --------------------------------------------------------------------------------
+
+-- Runs one external indexing tool in batch mode and prints its outcome.
+-- The tool's own stderr goes straight to the terminal.
+-- Returns nil on success, or a failure summary such as "ctags (exit 1)".
+local function run_batch_tool(tool_name, command)
+    print(command)
+    io.stdout:flush()
+
+    local succeeded, elapsed, outcome = ProcessRunner.run_command_sync(command)
+    if succeeded then
+        print(string.format("%s elapsed %.3f seconds", tool_name, elapsed))
+        return nil
+    end
+
+    io.stdout:flush()
+    io.stderr:write(string.format(
+        "%s FAILED after %.3f seconds: %s\n",
+        tool_name,
+        elapsed,
+        outcome
+    ))
+    return string.format("%s (%s)", tool_name, outcome)
+end
+
 local function run_cli_batch(options)
     local method = options.method
     local clean = options.clean
@@ -2326,28 +2350,43 @@ local function run_cli_batch(options)
         return 1
     end
 
-    print("Starting post-processing (parallel)...")
-    local t_post = get_time_sec()
+    print("Starting post-processing...")
+    local failures = {}
 
     -- 1. In-memory filenametags
     local t_fn_0 = get_time_sec()
     local ok_fn, count_fn = generate_filenametags(CSCOPE_FILE_NAME, FILENAMETAG_FILE_NAME)
-    print(string.format("filenametags elapsed %.3f seconds", get_time_sec() - t_fn_0))
+    if ok_fn then
+        print(string.format("filenametags elapsed %.3f seconds", get_time_sec() - t_fn_0))
+    else
+        io.stderr:write("filenametags FAILED: " .. tostring(count_fn) .. "\n")
+        table.insert(failures, "filenametags (" .. tostring(count_fn) .. ")")
+    end
 
-    -- 2. cscope
-    local t_cs_0 = get_time_sec()
-    print("cscope -b -q -k -i " .. CSCOPE_FILE_NAME)
-    os.execute("cscope -b -q -k -i " .. CSCOPE_FILE_NAME)
-    print(string.format("cscope elapsed %.3f seconds", get_time_sec() - t_cs_0))
-
-    -- 3. ctags
-    local t_ct_0 = get_time_sec()
-    print("ctags -L " .. CSCOPE_FILE_NAME)
-    os.execute("ctags -L " .. CSCOPE_FILE_NAME)
-    print(string.format("ctags elapsed %.3f seconds", get_time_sec() - t_ct_0))
+    -- 2. cscope and 3. ctags
+    local tool_runs = {
+        { name = "cscope", command = "cscope -b -q -k -i " .. CSCOPE_FILE_NAME },
+        { name = "ctags", command = "ctags -L " .. CSCOPE_FILE_NAME },
+    }
+    for _, tool_run in ipairs(tool_runs) do
+        local failure = run_batch_tool(tool_run.name, tool_run.command)
+        if failure then
+            table.insert(failures, failure)
+        end
+    end
 
     print(string.format("Total elapsed %.3f seconds", get_time_sec() - t_start))
-    return 0
+    if #failures == 0 then
+        return 0
+    end
+
+    io.stdout:flush()
+    io.stderr:write(string.format(
+        "dotag: error: %d of 3 databases failed: %s\n",
+        #failures,
+        table.concat(failures, ", ")
+    ))
+    return EXIT_RUNTIME_ERROR
 end
 
 --------------------------------------------------------------------------------
