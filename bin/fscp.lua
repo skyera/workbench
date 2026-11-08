@@ -903,6 +903,38 @@ local function shell_command(args)
     return table.concat(escaped, " ")
 end
 
+-- Build a POSIX sh statement that assigns `text` to `variable_name` on the
+-- remote host. Remote names come from the server's own `ls` output, so they
+-- are untrusted. Every byte is sent as a printf octal escape: the command line
+-- then holds only letters, digits, backslashes and our own punctuation, so
+-- neither the local shell (sh or cmd.exe, including %VAR% expansion) nor the
+-- remote shell can interpret quotes, `$(...)`, `;` or `&` inside the name.
+-- Command substitution drops trailing newlines; such names cannot be picked
+-- from line-based `ls` output anyway.
+local function posix_assign_literal(variable_name, text)
+    local octal_escapes = {}
+    for index = 1, #text do
+        octal_escapes[index] = string.format("\\%03o", text:byte(index))
+    end
+    return string.format("%s=$(printf '%s')", variable_name, table.concat(octal_escapes))
+end
+
+-- Return the local command line that lists `remote_dir` over `ssh_base`.
+-- The remote script is quoted once more for the local shell. On Windows the
+-- script's only double quotes are our own balanced pair, so cmd.exe quote
+-- parity cannot be broken by the directory name.
+local function build_remote_listing_command(ssh_base, remote_dir)
+    local remote_script = posix_assign_literal("dir", remote_dir)
+        .. '; ls -1ap -- "$dir" 2>/dev/null'
+
+    if IS_WINDOWS then
+        local crt_quoted_script = remote_script:gsub('"', '\\"')
+        return string.format('%s "%s"', ssh_base, crt_quoted_script)
+    end
+
+    return string.format("%s %s", ssh_base, shell_escape(remote_script))
+end
+
 -- The Windows CRT joins spawn arguments into a command line. Escape quotes and
 -- trailing backslashes for its argv parser, without invoking cmd.exe.
 local function windows_quote_arg(value)
@@ -2779,13 +2811,7 @@ local function run_fzf_remote_file_picker(host, override_user, override_port, ov
 
     while true do
         local dir_display = (current_remote_dir == ".") and "~/" or (current_remote_dir .. "/")
-        local remote_cmd
-        if IS_WINDOWS then
-            local escaped_dir = current_remote_dir:gsub('"', '\\"')
-            remote_cmd = string.format('%s "ls -1ap \\"%s\\" 2>/dev/null"', ssh_base, escaped_dir)
-        else
-            remote_cmd = string.format("%s 'ls -1ap %s 2>/dev/null'", ssh_base, shell_escape(current_remote_dir))
-        end
+        local remote_cmd = build_remote_listing_command(ssh_base, current_remote_dir)
 
         local pipe = io.popen(remote_cmd, "r")
         local lines = {}
@@ -3873,6 +3899,55 @@ local function main(...)
             local custom_host = { name = "[Direct Connect]", hostname = "10.0.0.1", user = "root", port = "22", source = "custom" }
             assert(get_ssh_target(custom_host) == "root@10.0.0.1", "Custom host must include user@hostname")
             print("  [PASS] get_ssh_target alias and host resolution unit tests")
+
+            -- 11b. Remote picker listing command must not let remote names
+            -- reach any shell unescaped (local sh/cmd.exe or the remote sh).
+            local hostile_dir_names = {
+                "my dir",
+                "x;echo FSCP_PWNED;",
+                "$(echo FSCP_PWNED)",
+                'a" & echo FSCP_PWNED & "',
+                "%OS%",
+                "it's",
+                "-rf",
+                "d\195\175r \195\188nicode",
+            }
+
+            for _, dir_name in ipairs(hostile_dir_names) do
+                local assignment = posix_assign_literal("dir", dir_name)
+                assert(assignment:match("^dir=%$%(printf '[\\0-7]+'%)$"),
+                    "posix_assign_literal leaked raw characters for: " .. dir_name)
+            end
+
+            -- End to end: a stub ssh joins its arguments and evals them like a
+            -- remote login shell, with `ls` replaced by an argv printer. The
+            -- command passes through the real local shell (sh or cmd.exe), so
+            -- local injection, word splitting and remote expansion all show up
+            -- as a mismatch against the single expected `ls` argument.
+            local sh_status = os.execute(IS_WINDOWS and "sh -c true >nul 2>&1" or "sh -c true >/dev/null 2>&1")
+            local sh_available = (sh_status == 0 or sh_status == true)
+            if sh_available then
+                local temp_dir = os.getenv("TEMP") or os.getenv("TMPDIR") or "/tmp"
+                local stub_path = (temp_dir .. "/fscp_fake_ssh_selftest.sh"):gsub("\\", "/")
+                local stub_file = assert(io.open(stub_path, "wb"))
+                stub_file:write("ls() { printf '[%s]\\n' \"$@\"; }\n", 'eval "$*"\n')
+                stub_file:close()
+
+                local fake_ssh_base = 'sh "' .. stub_path .. '"'
+                for _, dir_name in ipairs(hostile_dir_names) do
+                    local listing_cmd = build_remote_listing_command(fake_ssh_base, dir_name)
+                    local listing_pipe = assert(io.popen(listing_cmd .. " 2>&1", "r"))
+                    local listing_output = listing_pipe:read("*a"):gsub("\r", "")
+                    listing_pipe:close()
+
+                    local expected_output = "[-1ap]\n[--]\n[" .. dir_name .. "]\n"
+                    assert(listing_output == expected_output, string.format(
+                        "Remote ls received the wrong argv for %q: %q", dir_name, listing_output))
+                end
+                os.remove(stub_path)
+            end
+            print(string.format("  [PASS] Remote picker listing command quoting (%d hostile names%s)",
+                #hostile_dir_names, sh_available and "" or "; end-to-end check skipped: sh not on PATH"))
 
             -- 12. Test expand_glob
             local glob_res = expand_glob("bin/fscp*")
