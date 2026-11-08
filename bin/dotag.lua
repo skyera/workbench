@@ -681,8 +681,13 @@ function Term.restore()
     Term.is_raw = false
 end
 
+-- Returns the terminal size in columns and rows. A size reported by the OS
+-- always wins; COLUMNS/LINES are only a fallback for when the OS has none
+-- (output is not a terminal), because shells often export stale values.
+-- The size is not clamped: TUI.render shows a "too small" notice instead.
 function Term.get_size()
     local cols, rows = 90, 26
+    local os_reported_size = false
     if IS_WINDOWS then
         local hCon = ffi.C.CreateFileA("CONOUT$", 0xC0000000, 3, nil, 3, 0, nil)
         if hCon ~= nil and hCon ~= ffi.cast("HANDLE", -1) then
@@ -690,6 +695,7 @@ function Term.get_size()
             if ffi.C.GetConsoleScreenBufferInfo(hCon, csbi) ~= 0 then
                 cols = csbi.srWindow.Right - csbi.srWindow.Left + 1
                 rows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1
+                os_reported_size = true
             end
             ffi.C.CloseHandle(hCon)
         end
@@ -698,16 +704,22 @@ function Term.get_size()
         if ffi.C.ioctl(0, 0x5413, ws) == 0 and ws.ws_col > 0 and ws.ws_row > 0 then
             cols = ws.ws_col
             rows = ws.ws_row
+            os_reported_size = true
         end
     end
 
-    local env_c = tonumber(os.getenv("COLUMNS"))
-    local env_r = tonumber(os.getenv("LINES"))
-    if env_c and env_c > 20 then cols = env_c end
-    if env_r and env_r > 10 then rows = env_r end
+    if os_reported_size then
+        return cols, rows
+    end
 
-    if cols < 60 then cols = 60 end
-    if rows < 15 then rows = 15 end
+    local env_cols = tonumber(os.getenv("COLUMNS"))
+    local env_rows = tonumber(os.getenv("LINES"))
+    if env_cols and env_cols > 0 then
+        cols = env_cols
+    end
+    if env_rows and env_rows > 0 then
+        rows = env_rows
+    end
     return cols, rows
 end
 
@@ -2075,8 +2087,124 @@ local function colorize_log_entry(entry, max_w)
     end
 end
 
+--------------------------------------------------------------------------------
+-- Terminal Size Requirements & Modal Geometry
+--------------------------------------------------------------------------------
+local MIN_TERMINAL_COLS = 60
+local MIN_TERMINAL_ROWS = 23 -- 20 fixed layout lines + at least 3 log lines
+local MODAL_MAX_HEIGHT = 18
+local MODAL_VERTICAL_MARGIN = 4
+
+local function terminal_too_small(cols, rows)
+    return cols < MIN_TERMINAL_COLS or rows < MIN_TERMINAL_ROWS
+end
+
+-- Draws a short notice instead of a layout that would not fit. Each line is
+-- short enough to fit even a very small window.
+local function render_too_small_screen(cols, rows)
+    local lines = {
+        "Terminal too small",
+        string.format(
+            "have %dx%d, need %dx%d",
+            cols,
+            rows,
+            MIN_TERMINAL_COLS,
+            MIN_TERMINAL_ROWS
+        ),
+        "Resize, or press q to quit",
+    }
+
+    local buf = { "\27[?25l\27[0m" }
+    for index, line in ipairs(lines) do
+        if index <= rows then
+            table.insert(buf, string.format(
+                "\27[%d;1H%s\27[0m\27[K",
+                index,
+                truncate_string(line, cols)
+            ))
+        end
+    end
+    io.write(table.concat(buf))
+    io.flush()
+end
+
+-- Visible list rows for each modal. Both the renderer and the key handlers
+-- use this, so what is drawn and what is scrolled can never disagree.
+local function modal_visible_rows(modal_kind, rows, total_items)
+    local height = math.min(MODAL_MAX_HEIGHT, rows - MODAL_VERTICAL_MARGIN)
+    local list_rows = height - 4
+    if modal_kind == "verify" then
+        list_rows = height - 5
+    elseif modal_kind == "exts" then
+        -- Two-column grid: the visible rows are grid rows.
+        list_rows = math.min(list_rows, math.ceil(total_items / 2))
+    end
+    return math.max(1, list_rows)
+end
+
+-- Returns the scroll offset (count of hidden items above the window) that keeps
+-- `selection` (1-based) visible in a window of `visible` rows over `total`
+-- items, with no blank rows left at the end of the list.
+local function scroll_to_show(scroll, selection, visible, total)
+    if selection <= scroll then
+        scroll = selection - 1
+    end
+    if selection > scroll + visible then
+        scroll = selection - visible
+    end
+
+    local max_scroll = math.max(0, total - visible)
+    return math.max(0, math.min(scroll, max_scroll))
+end
+
+function TUI.modal_item_count()
+    if TUI.modal == "exts" then
+        return #TUI.extensions
+    end
+    if TUI.modal == "excludes" then
+        return #TUI.excluded_dirs
+    end
+    if TUI.modal == "verify" then
+        return #TUI.verify_items
+    end
+    return 0
+end
+
+-- PgUp/PgDn distance: one page, keeping one row of overlap.
+function TUI.modal_page_size()
+    local _, rows = Term.get_size()
+    local visible = modal_visible_rows(TUI.modal, rows, TUI.modal_item_count())
+    return math.max(1, visible - 1)
+end
+
+-- Moves the modal selection by `delta` (clamped to the list) and keeps it on
+-- screen. The extensions grid does not scroll.
+function TUI.move_modal_selection(delta)
+    local total = TUI.modal_item_count()
+    if total == 0 then
+        return
+    end
+
+    TUI.modal_selection = math.max(1, math.min(total, TUI.modal_selection + delta))
+    if TUI.modal == "excludes" or TUI.modal == "verify" then
+        local _, rows = Term.get_size()
+        local visible = modal_visible_rows(TUI.modal, rows, total)
+        TUI.modal_scroll = scroll_to_show(
+            TUI.modal_scroll,
+            TUI.modal_selection,
+            visible,
+            total
+        )
+    end
+end
+
 function TUI.render()
     local cols, rows = Term.get_size()
+    if terminal_too_small(cols, rows) then
+        render_too_small_screen(cols, rows)
+        return
+    end
+
     local buf = {}
 
     local function write_str(s) table.insert(buf, s) end
@@ -2337,7 +2465,7 @@ end
 
 function TUI.render_modal(cols, rows, buf)
     local mw = math.min(72, cols - 4)
-    local mh = math.min(18, rows - 4)
+    local mh = math.min(MODAL_MAX_HEIGHT, rows - MODAL_VERTICAL_MARGIN)
     local mx = math.floor((cols - mw) / 2)
     local my = math.floor((rows - mh) / 2)
 
@@ -2357,7 +2485,7 @@ function TUI.render_modal(cols, rows, buf)
         local num_items = #TUI.extensions
         local num_cols = 2
         local num_rows = math.ceil(num_items / num_cols)
-        local visible_rows = math.min(mh - 4, num_rows)
+        local visible_rows = modal_visible_rows("exts", rows, num_items)
         local col_w = math.floor((mw - 5) / num_cols)
 
         for r = 1, visible_rows do
@@ -2383,7 +2511,14 @@ function TUI.render_modal(cols, rows, buf)
 
     elseif TUI.modal == "excludes" then
         mwrite(0, C.b_yellow .. BOX.tl .. C.b_white .. " Manage Excluded Directories " .. C.b_yellow .. string.rep(BOX.h, math.max(0, mw - 33)) .. BOX.tr .. C.reset)
-        local visible_rows = mh - 4
+        local visible_rows = modal_visible_rows("excludes", rows, #TUI.excluded_dirs)
+        -- Re-apply every frame so a resize cannot strand the selection.
+        TUI.modal_scroll = scroll_to_show(
+            TUI.modal_scroll,
+            TUI.modal_selection,
+            visible_rows,
+            #TUI.excluded_dirs
+        )
         for i = 1, visible_rows do
             local idx = TUI.modal_scroll + i
             local item = TUI.excluded_dirs[idx]
@@ -2403,7 +2538,13 @@ function TUI.render_modal(cols, rows, buf)
         mwrite(0, C.b_yellow .. BOX.tl .. C.b_white .. " Quick Index Verification Browser " .. C.b_yellow .. string.rep(BOX.h, math.max(0, mw - 37)) .. BOX.tr .. C.reset)
         local hdr = string.format("   %-20s %s", "TAG NAME", "TARGET FILE PATH")
         mwrite(1, C.b_yellow .. BOX.v .. C.dim .. pad_right(hdr, mw - 4) .. C.reset .. C.b_yellow .. BOX.v .. C.reset)
-        local visible_rows = mh - 5
+        local visible_rows = modal_visible_rows("verify", rows, #TUI.verify_items)
+        TUI.modal_scroll = scroll_to_show(
+            TUI.modal_scroll,
+            TUI.modal_selection,
+            visible_rows,
+            #TUI.verify_items
+        )
         for i = 1, visible_rows do
             local idx = TUI.modal_scroll + i
             local item = TUI.verify_items[idx]
@@ -2556,6 +2697,10 @@ function TUI.run(options)
     while running do
         local cols, rows = Term.get_size()
         if cols ~= last_cols or rows ~= last_rows then
+            -- Erase leftovers of the previous size (old layout, "too small" notice).
+            if last_cols ~= 0 then
+                io.write("\27[0m\27[2J")
+            end
             last_cols, last_rows = cols, rows
             needs_render = true
         end
@@ -2584,6 +2729,14 @@ function TUI.run(options)
         end
 
         local key = Term.read_key()
+        if key and terminal_too_small(cols, rows) then
+            -- Only quitting works while the layout cannot be shown.
+            if key == "q" or key == "ctrl_c" then
+                running = false
+            end
+            key = nil
+        end
+
         if key then
             needs_render = true
             if TUI.modal then
@@ -2594,29 +2747,13 @@ function TUI.run(options)
                     or (TUI.modal == "verify" and key == "v") then
                     TUI.modal = nil
                 elseif key == "pageup" then
-                    local step = 8
-                    TUI.modal_selection = math.max(1, TUI.modal_selection - step)
-                    TUI.modal_scroll = math.max(0, TUI.modal_scroll - step)
+                    TUI.move_modal_selection(-TUI.modal_page_size())
                 elseif key == "pagedown" then
-                    local max_items = (TUI.modal == "exts" and #TUI.extensions) or (TUI.modal == "excludes" and #TUI.excluded_dirs) or #TUI.verify_items
-                    local step = 8
-                    TUI.modal_selection = math.min(max_items, TUI.modal_selection + step)
-                    TUI.modal_scroll = math.min(math.max(0, max_items - 12), TUI.modal_scroll + step)
+                    TUI.move_modal_selection(TUI.modal_page_size())
                 elseif key == "up" or key == "k" then
-                    if TUI.modal_selection > 1 then
-                        TUI.modal_selection = TUI.modal_selection - 1
-                        if TUI.modal_selection <= TUI.modal_scroll then
-                            TUI.modal_scroll = TUI.modal_selection - 1
-                        end
-                    end
+                    TUI.move_modal_selection(-1)
                 elseif key == "down" or key == "j" then
-                    local max_items = (TUI.modal == "exts" and #TUI.extensions) or (TUI.modal == "excludes" and #TUI.excluded_dirs) or #TUI.verify_items
-                    if TUI.modal_selection < max_items then
-                        TUI.modal_selection = TUI.modal_selection + 1
-                        if TUI.modal_selection > TUI.modal_scroll + 12 then
-                            TUI.modal_scroll = TUI.modal_selection - 12
-                        end
-                    end
+                    TUI.move_modal_selection(1)
                 elseif key == "space" then
                     if TUI.modal == "exts" then
                         local item = TUI.extensions[TUI.modal_selection]
@@ -3339,6 +3476,29 @@ local function run_pure_tests(tester)
         "j,j,down,k,l,\195\169,esc,q",
         "Burst drains to every key in order"
     )
+
+    -- Test 17: Terminal size & modal scrolling
+    print("\n[Test 17] Terminal Size & Modal Scrolling...")
+    assert_eq(terminal_too_small(60, 23), false, "60x23 is the minimum that fits")
+    assert_eq(terminal_too_small(59, 23), true, "59 columns is too narrow")
+    assert_eq(terminal_too_small(60, 22), true, "22 rows is too short")
+    assert_eq(terminal_too_small(200, 50), false, "Large terminals fit")
+
+    assert_eq(modal_visible_rows("excludes", 23, 35), 14, "Excludes list rows at 23 rows")
+    assert_eq(modal_visible_rows("verify", 23, 28), 13, "Verify list rows at 23 rows")
+    assert_eq(modal_visible_rows("exts", 23, 22), 11, "Extensions grid rows at 23 rows")
+    assert_eq(modal_visible_rows("excludes", 60, 35), 14, "Modal height is capped at 18")
+    assert_eq(modal_visible_rows("excludes", 12, 35), 4, "Small windows still get rows")
+
+    assert_eq(scroll_to_show(0, 1, 14, 35), 0, "Selection at top: no scroll")
+    assert_eq(scroll_to_show(0, 14, 14, 35), 0, "Last visible row: no scroll yet")
+    assert_eq(scroll_to_show(0, 15, 14, 35), 1, "One past the window scrolls by 1")
+    assert_eq(scroll_to_show(0, 35, 14, 35), 21, "End of list fills the window")
+    assert_eq(scroll_to_show(21, 30, 14, 35), 21, "Inside the window: unchanged")
+    assert_eq(scroll_to_show(21, 20, 14, 35), 19, "Above the window scrolls up")
+    assert_eq(scroll_to_show(30, 5, 14, 35), 4, "Resize cannot strand the selection")
+    assert_eq(scroll_to_show(0, 3, 14, 5), 0, "Short list never scrolls")
+    assert_eq(scroll_to_show(0, 1, 14, 0), 0, "Empty list")
 end
 
 -- Test 1: filenametags generation and foldcase ordering.
