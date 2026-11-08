@@ -95,6 +95,10 @@ if IS_WINDOWS then
         BOOL ReadConsoleInputW(HANDLE hConsoleInput, INPUT_RECORD* lpBuffer, DWORD nLength, DWORD* lpNumberOfEventsRead);
         BOOL PeekConsoleInputW(HANDLE hConsoleInput, INPUT_RECORD* lpBuffer, DWORD nLength, DWORD* lpNumberOfEventsRead);
         void Sleep(DWORD dwMilliseconds);
+        unsigned int GetConsoleOutputCP(void);
+        unsigned int GetConsoleCP(void);
+        BOOL SetConsoleOutputCP(unsigned int wCodePageID);
+        BOOL SetConsoleCP(unsigned int wCodePageID);
     ]]
 else
     ffi.cdef[[
@@ -181,8 +185,12 @@ local Term = {
     initialized = false,
     orig_mode_in = nil,
     orig_mode_out = nil,
+    orig_mode_err = nil,
+    orig_output_code_page = nil,
+    orig_input_code_page = nil,
     hIn = nil,
     hOut = nil,
+    hErr = nil,
     orig_termios = nil,
     tty_fd = -1,
     tty_out = nil,
@@ -200,23 +208,84 @@ function Term.write_tui(s)
     Term.tty_out:flush()
 end
 
+local CP_UTF8 = 65001
+local ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+-- ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT
+local COOKED_INPUT_FLAGS = 0x0007
+
+-- Windows only. Returns true when the handle refers to a console (not a file,
+-- pipe, or invalid handle).
+function Term.is_console_handle(handle)
+    if handle == nil or handle == ffi.cast("HANDLE", -1) then
+        return false
+    end
+    local mode = ffi.new("DWORD[1]")
+    return ffi.C.GetConsoleMode(handle, mode) ~= 0
+end
+
+-- Windows only. Turns on VT processing for a console output handle so ANSI
+-- sequences are interpreted instead of printed. Returns the previous mode, or
+-- nil when the handle is not a console (for example, redirected to a pipe).
+function Term.enable_virtual_terminal(handle)
+    if handle == nil or handle == ffi.cast("HANDLE", -1) then
+        return nil
+    end
+
+    local mode = ffi.new("DWORD[1]")
+    if ffi.C.GetConsoleMode(handle, mode) == 0 then
+        return nil
+    end
+
+    local original_mode = mode[0]
+    ffi.C.SetConsoleMode(handle, bit.bor(original_mode, ENABLE_VIRTUAL_TERMINAL_PROCESSING))
+    return original_mode
+end
+
+-- Windows only. The UI draws UTF-8 glyphs (box lines, arrows, icons), which
+-- render as mojibake under legacy code pages such as 437 or 936. The original
+-- code pages are saved so Term.restore() can put them back.
+function Term.enable_utf8_code_page()
+    if Term.orig_output_code_page == nil then
+        Term.orig_output_code_page = ffi.C.GetConsoleOutputCP()
+        Term.orig_input_code_page = ffi.C.GetConsoleCP()
+    end
+    ffi.C.SetConsoleOutputCP(CP_UTF8)
+    ffi.C.SetConsoleCP(CP_UTF8)
+end
+
+function Term.restore_code_page()
+    if Term.orig_output_code_page and Term.orig_output_code_page ~= 0 then
+        ffi.C.SetConsoleOutputCP(Term.orig_output_code_page)
+    end
+    if Term.orig_input_code_page and Term.orig_input_code_page ~= 0 then
+        ffi.C.SetConsoleCP(Term.orig_input_code_page)
+    end
+    Term.orig_output_code_page = nil
+    Term.orig_input_code_page = nil
+end
+
 function Term.init()
     if Term.initialized then return end
     if IS_WINDOWS then
+        Term.enable_utf8_code_page()
+
         Term.hIn = ffi.C.GetStdHandle(-10)   -- STD_INPUT_HANDLE
         Term.hOut = ffi.C.GetStdHandle(-11)  -- STD_OUTPUT_HANDLE
-        local mIn = ffi.new("DWORD[1]")
-        local mOut = ffi.new("DWORD[1]")
-        ffi.C.GetConsoleMode(Term.hIn, mIn)
-        ffi.C.GetConsoleMode(Term.hOut, mOut)
-        Term.orig_mode_in = mIn[0]
-        Term.orig_mode_out = mOut[0]
+        Term.hErr = ffi.C.GetStdHandle(-12)  -- STD_ERROR_HANDLE
 
-        local raw_in = bit.band(Term.orig_mode_in, bit.bnot(0x0007))
-        raw_in = bit.bor(raw_in, 0x0008) -- ENABLE_WINDOW_INPUT
-        local raw_out = bit.bor(Term.orig_mode_out, 0x0004) -- ENABLE_VIRTUAL_TERMINAL_PROCESSING
-        ffi.C.SetConsoleMode(Term.hIn, raw_in)
-        ffi.C.SetConsoleMode(Term.hOut, raw_out)
+        -- Raw input: no line buffering, echo, or Ctrl+C processing. Window
+        -- input events are left off; only key events are needed.
+        local mode_in = ffi.new("DWORD[1]")
+        if ffi.C.GetConsoleMode(Term.hIn, mode_in) ~= 0 then
+            Term.orig_mode_in = mode_in[0]
+            local raw_in = bit.band(Term.orig_mode_in, bit.bnot(COOKED_INPUT_FLAGS))
+            ffi.C.SetConsoleMode(Term.hIn, raw_in)
+        end
+
+        -- The TUI is drawn on stderr, and stdout may be redirected when the
+        -- selected command is captured, so enable VT on both streams.
+        Term.orig_mode_out = Term.enable_virtual_terminal(Term.hOut)
+        Term.orig_mode_err = Term.enable_virtual_terminal(Term.hErr)
     else
         Term.tty_fd = ffi.C.open("/dev/tty", 2)
         if Term.tty_fd < 0 then Term.tty_fd = 0 end
@@ -245,6 +314,10 @@ function Term.restore()
         if Term.orig_mode_out and Term.hOut then
             ffi.C.SetConsoleMode(Term.hOut, Term.orig_mode_out)
         end
+        if Term.orig_mode_err and Term.hErr then
+            ffi.C.SetConsoleMode(Term.hErr, Term.orig_mode_err)
+        end
+        Term.restore_code_page()
     else
         if Term.orig_termios and Term.tty_fd >= 0 then
             ffi.C.tcsetattr(Term.tty_fd, 0, Term.orig_termios)
@@ -260,8 +333,14 @@ end
 
 function Term.get_size()
     if IS_WINDOWS then
+        -- Query the stream the TUI is drawn on; stdout may be redirected.
+        local size_handle = Term.hErr or ffi.C.GetStdHandle(-12)
+        if not Term.is_console_handle(size_handle) then
+            size_handle = Term.hOut or ffi.C.GetStdHandle(-11)
+        end
+
         local csbi = ffi.new("CONSOLE_SCREEN_BUFFER_INFO")
-        if ffi.C.GetConsoleScreenBufferInfo(Term.hOut or ffi.C.GetStdHandle(-11), csbi) ~= 0 then
+        if ffi.C.GetConsoleScreenBufferInfo(size_handle, csbi) ~= 0 then
             local cols = csbi.srWindow.Right - csbi.srWindow.Left + 1
             local rows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1
             if cols > 0 and rows > 0 then return cols, rows end
@@ -1512,6 +1591,31 @@ local function run_tests()
 
     Term.peek_input_record = original_peek
     Term.discard_input_record = original_discard
+
+    -- Test 5: Windows console helpers must tolerate non-console handles, since
+    -- stdout is redirected whenever the selected command is captured.
+    if IS_WINDOWS then
+        local invalid_handle = ffi.cast("HANDLE", -1)
+        assert_eq("is_console_handle rejects nil", Term.is_console_handle(nil), false)
+        assert_eq("is_console_handle rejects INVALID_HANDLE_VALUE",
+            Term.is_console_handle(invalid_handle), false)
+        assert_eq("enable_virtual_terminal returns nil for nil handle",
+            Term.enable_virtual_terminal(nil), nil)
+        assert_eq("enable_virtual_terminal returns nil for INVALID_HANDLE_VALUE",
+            Term.enable_virtual_terminal(invalid_handle), nil)
+
+        local output_code_page_before = ffi.C.GetConsoleOutputCP()
+        Term.enable_utf8_code_page()
+        local output_code_page_during = ffi.C.GetConsoleOutputCP()
+        Term.restore_code_page()
+        local output_code_page_after = ffi.C.GetConsoleOutputCP()
+        if output_code_page_before ~= 0 then
+            assert_eq("enable_utf8_code_page switches output to UTF-8",
+                output_code_page_during, CP_UTF8)
+        end
+        assert_eq("restore_code_page restores the original output code page",
+            output_code_page_after, output_code_page_before)
+    end
 
     print(string.format("\nSelf-test summary: %d passed, %d failed.", passed, failed))
     if failed > 0 then os.exit(1) end
