@@ -896,8 +896,58 @@ local function add_candidate_file(rel_path, file_name, rules, files_out, warning
     table.insert(files_out, rel_path)
 end
 
+-- readdir() d_type values (Linux <dirent.h>).
+local DT_UNKNOWN = 0
+local DT_DIR = 4
+
+-- Deepest directory level either crawler descends to. Real trees are far
+-- shallower; hitting it almost always means a symlink or junction loop.
+local MAX_CRAWL_DEPTH = 64
+
+-- Returns true when a readdir entry is a directory. Some filesystems report
+-- DT_UNKNOWN (readdir(3): "All applications must properly handle a return of
+-- DT_UNKNOWN"); probe with opendir then, since guessing from the name skipped
+-- directories such as "v1.2". opendir avoids declaring the per-architecture
+-- struct stat layout.
+local function posix_entry_is_directory(entry_type, full_path)
+    if entry_type == DT_DIR then
+        return true
+    end
+    if entry_type ~= DT_UNKNOWN then
+        return false
+    end
+
+    local probe = ffi.C.opendir(full_path)
+    if probe == nil then
+        return false
+    end
+    ffi.C.closedir(probe)
+    return true
+end
+
+-- Returns true (after recording a warning) when `depth` is past the limit.
+local function crawl_depth_exceeded(dir_path, depth, warnings_out)
+    if depth <= MAX_CRAWL_DEPTH then
+        return false
+    end
+
+    if warnings_out then
+        table.insert(warnings_out, string.format(
+            "%s: deeper than %d levels (symlink loop?); skipped",
+            clean_path(dir_path),
+            MAX_CRAWL_DEPTH
+        ))
+    end
+    return true
+end
+
 -- Win32 High-Speed Crawler via FindFirstFileW
-local function crawl_win32(dir_path, rules, files_out, warnings_out)
+local function crawl_win32(dir_path, rules, files_out, warnings_out, depth)
+    depth = depth or 0
+    if crawl_depth_exceeded(dir_path, depth, warnings_out) then
+        return
+    end
+
     local pattern = dir_path .. "\\*"
     local wpattern = to_wide(pattern)
     local find_data = ffi.new("WIN32_FIND_DATAW")
@@ -912,7 +962,8 @@ local function crawl_win32(dir_path, rules, files_out, warnings_out)
             local is_dir = bit.band(find_data.dwFileAttributes, 0x10) ~= 0
             if is_dir then
                 if should_descend_into(name, rules) then
-                    crawl_win32(dir_path .. "\\" .. name, rules, files_out, warnings_out)
+                    local child_path = dir_path .. "\\" .. name
+                    crawl_win32(child_path, rules, files_out, warnings_out, depth + 1)
                 end
             else
                 local rel_path = clean_path(dir_path .. "/" .. name):gsub("^%./", "")
@@ -925,7 +976,12 @@ local function crawl_win32(dir_path, rules, files_out, warnings_out)
 end
 
 -- POSIX High-Speed Crawler via opendir/readdir
-local function crawl_posix(dir_path, rules, files_out, warnings_out)
+local function crawl_posix(dir_path, rules, files_out, warnings_out, depth)
+    depth = depth or 0
+    if crawl_depth_exceeded(dir_path, depth, warnings_out) then
+        return
+    end
+
     local dir = ffi.C.opendir(dir_path)
     if dir == nil then
         return
@@ -940,17 +996,11 @@ local function crawl_posix(dir_path, rules, files_out, warnings_out)
         local name = ffi.string(entry.d_name)
         if name ~= "." and name ~= ".." then
             local full_path = dir_path .. "/" .. name
-            local is_dir = false
-            if entry.d_type == 4 then -- DT_DIR
-                is_dir = true
-            elseif entry.d_type == 0 then -- DT_UNKNOWN, fallback to stat
-                -- simple folder heuristic
-                is_dir = not name:find("%.")
-            end
+            local is_dir = posix_entry_is_directory(entry.d_type, full_path)
 
             if is_dir then
                 if should_descend_into(name, rules) then
-                    crawl_posix(full_path, rules, files_out, warnings_out)
+                    crawl_posix(full_path, rules, files_out, warnings_out, depth + 1)
                 end
             else
                 local rel_path = clean_path(full_path):gsub("^%./", "")
@@ -3301,6 +3351,56 @@ local function test_git_discovery(tester, sandbox)
     assert_eq(found_set[".github/ci.lua"], true, "Tracked file in hidden dir listed")
 end
 
+-- Test 15: unknown entry types are probed, and runaway depth is capped.
+local function test_crawler_directory_probe(tester, sandbox)
+    local assert_eq = tester.assert_eq
+    print("\n[Test 15] DT_UNKNOWN Probe & Depth Limit (sandbox)...")
+    if IS_WINDOWS then
+        print("  [SKIP] POSIX readdir only")
+        return
+    end
+
+    sandbox_write_file(sandbox, "v1.2/inside.lua", "return 1\n")
+    sandbox_write_file(sandbox, "Makefile", "all:\n")
+    local DT_REG = 8
+    assert_eq(posix_entry_is_directory(DT_UNKNOWN, "v1.2"), true, "Unknown 'v1.2' is a directory")
+    assert_eq(
+        posix_entry_is_directory(DT_UNKNOWN, "Makefile"),
+        false,
+        "Unknown 'Makefile' is a file"
+    )
+    assert_eq(posix_entry_is_directory(DT_DIR, "Makefile"), true, "DT_DIR is trusted")
+    assert_eq(posix_entry_is_directory(DT_REG, "v1.2"), false, "DT_REG is trusted")
+
+    if is_inside_git_work_tree() then
+        print("  [SKIP] depth check: TMPDIR is inside a git work tree")
+        return
+    end
+
+    local deep_dirs = {}
+    for _ = 1, MAX_CRAWL_DEPTH + 6 do
+        table.insert(deep_dirs, "d")
+    end
+    local deep_file = "deep/" .. table.concat(deep_dirs, "/") .. "/too_deep.lua"
+    sandbox_write_file(sandbox, deep_file, "return 2\n")
+
+    local warnings = {}
+    local found_files = crawl_directory("ffi", ".", {}, { ".lua" }, false, warnings)
+    local found_set = {}
+    for _, path in ipairs(found_files) do
+        found_set[path] = true
+    end
+    local depth_warning_found = false
+    for _, warning in ipairs(warnings) do
+        if warning:find("deeper than " .. MAX_CRAWL_DEPTH .. " levels", 1, true) then
+            depth_warning_found = true
+        end
+    end
+    assert_eq(found_set[deep_file], nil, "File past the depth limit is not indexed")
+    assert_eq(depth_warning_found, true, "Depth limit reports a warning")
+    assert_eq(found_set["v1.2/inside.lua"], true, "Dotted directory is crawled")
+end
+
 -- Tests that read or write files. Must run with the sandbox as working directory.
 local function run_filesystem_tests(tester, sandbox)
     test_filenametags_sort(tester, sandbox)
@@ -3308,6 +3408,7 @@ local function run_filesystem_tests(tester, sandbox)
     test_database_cleanup(tester, sandbox)
     test_error_line_capture(tester, sandbox)
     test_git_discovery(tester, sandbox)
+    test_crawler_directory_probe(tester, sandbox)
 end
 
 -- Runs filesystem tests inside the sandbox, always restoring the original
