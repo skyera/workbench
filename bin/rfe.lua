@@ -501,6 +501,22 @@ local function shell_escape(s)
     end
 end
 
+-- Build a POSIX sh statement that assigns `text` to `variable_name` on the
+-- remote host. Remote paths are built from the server's own `ls` output, so
+-- they are untrusted. shell_escape() chooses quotes for the LOCAL shell, which
+-- on Windows means double quotes, where the remote sh still runs `$(...)` and
+-- backticks. Sending every byte as a printf octal escape keeps quotes, `$`,
+-- backticks, `;`, `&` and `%VAR%` in a name away from both cmd.exe/sh locally
+-- and sh remotely. Command substitution drops trailing newlines; such names
+-- cannot come from line-based `ls` output anyway.
+local function posix_assign_literal(variable_name, text)
+    local octal_escapes = {}
+    for index = 1, #text do
+        octal_escapes[index] = string.format("\\%03o", text:byte(index))
+    end
+    return string.format("%s=$(printf '%s')", variable_name, table.concat(octal_escapes))
+end
+
 local function format_size(bytes)
     if not bytes or bytes < 0 then return "-" end
     if bytes < 1024 then
@@ -2366,8 +2382,8 @@ function Crawler.list_directory(host_cfg, remote_dir)
     end
 
     local ssh_base = Crawler.get_ssh_cmd(host_cfg)
-    local esc_dir = shell_escape(remote_dir)
-    local remote_sh = string.format([=[d=%s; if [ -z "$d" ] || [ "$d" = "~" ]; then cd ~ 2>/dev/null || cd /; elif [ "${d#\~/}" != "$d" ]; then sub="${d#\~/}"; cd ~/"$sub" 2>/dev/null || cd ~/"${sub}s" 2>/dev/null || cd ~/"$sub"* 2>/dev/null || cd "$d" 2>/dev/null || cd /; else cd "$d" 2>/dev/null || cd "${d}s" 2>/dev/null || cd "$d"* 2>/dev/null || cd /; fi; echo "PWD:$(pwd)"; LC_ALL=C ls -la --time-style=+%%Y-%%m-%%d\ %%H:%%M:%%S . 2>/dev/null || LC_ALL=C ls -la .]=], esc_dir)
+    local dir_assignment = posix_assign_literal("d", remote_dir)
+    local remote_sh = string.format([=[%s; if [ -z "$d" ] || [ "$d" = "~" ]; then cd ~ 2>/dev/null || cd /; elif [ "${d#\~/}" != "$d" ]; then sub="${d#\~/}"; cd ~/"$sub" 2>/dev/null || cd ~/"${sub}s" 2>/dev/null || cd ~/"$sub"* 2>/dev/null || cd "$d" 2>/dev/null || cd /; else cd "$d" 2>/dev/null || cd "${d}s" 2>/dev/null || cd "$d"* 2>/dev/null || cd /; fi; echo "PWD:$(pwd)"; LC_ALL=C ls -la --time-style=+%%Y-%%m-%%d\ %%H:%%M:%%S . 2>/dev/null || LC_ALL=C ls -la .]=], dir_assignment)
     local full_cmd = string.format("%s %s", ssh_base, shell_escape(remote_sh))
 
     local pipe = io.popen(full_cmd, "r")
@@ -2442,13 +2458,16 @@ function Crawler.get_file_preview(host_cfg, remote_path, is_image)
     end
 
     local ssh_base = Crawler.get_ssh_cmd(host_cfg)
-    local esc_path = shell_escape(remote_path)
-    local cmd
+    local path_assignment = posix_assign_literal("p", remote_path)
+    local expand_home = [=[if [ "${p#\~/}" != "$p" ]; then p=~/"${p#\~/}"; fi]=]
+    local read_command
     if is_image then
-        cmd = string.format("%s %s", ssh_base, shell_escape(string.format([=[p=%s; if [ "${p#\~/}" != "$p" ]; then p=~/"${p#\~/}"; fi; base64 -w 0 "$p" 2>/dev/null || base64 "$p" 2>/dev/null || cat "$p" 2>/dev/null]=], esc_path)))
+        read_command = [=[base64 -w 0 "$p" 2>/dev/null || base64 "$p" 2>/dev/null || cat "$p" 2>/dev/null]=]
     else
-        cmd = string.format("%s %s", ssh_base, shell_escape(string.format([=[p=%s; if [ "${p#\~/}" != "$p" ]; then p=~/"${p#\~/}"; fi; head -n 250 "$p" 2>/dev/null]=], esc_path)))
+        read_command = [=[head -n 250 "$p" 2>/dev/null]=]
     end
+    local remote_sh = table.concat({ path_assignment, expand_home, read_command }, "; ")
+    local cmd = string.format("%s %s", ssh_base, shell_escape(remote_sh))
 
     local pipe = io.popen(cmd, "r")
     if not pipe then return "Failed to retrieve remote preview" end
@@ -3211,6 +3230,94 @@ local function run_tests()
     local esc = shell_escape("path with spaces & 'quotes'")
     assert(esc:find("path with spaces"), "Escaped path should contain original content")
     print(C.bright_green .. "  [PASS] Shell quote escaping and path hygiene" .. C.reset)
+
+    -- 7b. Remote listing and preview must deliver hostile names intact to the
+    -- remote sh, without running anything locally (cmd.exe/sh) or remotely.
+    local hostile_names = {
+        "my dir",
+        "it's",
+        "-rf",
+        "%OS%",
+        "$(echo PWNED >rfe_canary) x",
+        "`echo PWNED >rfe_canary`",
+        'a" & echo PWNED >rfe_canary & "',
+        "x;echo PWNED >rfe_canary;",
+        "d\195\175r \195\188nicode",
+    }
+    for _, hostile_name in ipairs(hostile_names) do
+        local assignment = posix_assign_literal("d", hostile_name)
+        assert(assignment:match("^d=%$%(printf '[\\0-7]+'%)$"),
+            "posix_assign_literal leaked raw characters for: " .. hostile_name)
+    end
+
+    -- The stub ssh evals its joined arguments like a remote login shell, with
+    -- cd/pwd/ls/head replaced by printers of the argument they receive. The
+    -- command still passes through the real local shell, so local injection,
+    -- word splitting and remote expansion all change the observed output.
+    local sh_status = os.execute(IS_WINDOWS and "sh -c true >nul 2>&1" or "sh -c true >/dev/null 2>&1")
+    local sh_available = (sh_status == 0 or sh_status == true)
+    if sh_available then
+        local temp_dir = os.getenv("TEMP") or os.getenv("TMPDIR") or "/tmp"
+        local stub_path = (temp_dir .. "/rfe_fake_ssh_selftest.sh"):gsub("\\", "/")
+        local stub_file = assert(io.open(stub_path, "wb"))
+        stub_file:write(table.concat({
+            'cd() { RFE_CD_ARG=$1; }',
+            'pwd() { printf "%s\\n" "$RFE_CD_ARG"; }',
+            'ls() { printf "drwxr-xr-x 2 u g 4096 2026-01-01 00:00:00 %s\\n" "$RFE_CD_ARG"; }',
+            'head() { printf "HEAD[%s]\\n" "$3"; }',
+            'eval "$*"',
+            '',
+        }, "\n"))
+        stub_file:close()
+
+        local original_get_ssh_cmd = Crawler.get_ssh_cmd
+        Crawler.get_ssh_cmd = function()
+            return 'sh "' .. stub_path .. '"'
+        end
+        local stub_host = { name = "selftest-stub", hostname = "selftest-stub" }
+        local canary_path = "rfe_canary"
+
+        for _, hostile_name in ipairs(hostile_names) do
+            local remote_path = "/srv/" .. hostile_name
+
+            local listed_items, resolved_dir = Crawler.list_directory(stub_host, remote_path)
+            local listed_names = {}
+            for _, listed_item in ipairs(listed_items or {}) do
+                listed_names[#listed_names + 1] = listed_item.name
+            end
+            local preview = Crawler.get_file_preview(stub_host, remote_path, false)
+
+            local canary_file = io.open(canary_path, "r")
+            if canary_file then
+                canary_file:close()
+                os.remove(canary_path)
+            end
+            assert(not canary_file, "A shell ran a command injected through: " .. hostile_name)
+            assert(resolved_dir == remote_path, string.format(
+                "Remote cd received the wrong path for %q: %q", hostile_name, tostring(resolved_dir)))
+            assert(table.concat(listed_names, "|") == "..|" .. remote_path, string.format(
+                "Remote listing returned the wrong entries for %q: %q",
+                hostile_name, table.concat(listed_names, "|")))
+            assert(preview == "HEAD[" .. remote_path .. "]\n", string.format(
+                "Remote head received the wrong path for %q: %q", hostile_name, tostring(preview)))
+        end
+
+        Crawler.get_ssh_cmd = original_get_ssh_cmd
+        for cache_key in pairs(Crawler.dir_cache) do
+            if cache_key:find("^selftest%-stub:") then
+                Crawler.dir_cache[cache_key] = nil
+            end
+        end
+        for cache_key in pairs(Crawler.preview_cache) do
+            if cache_key:find("^selftest%-stub:") then
+                Crawler.preview_cache[cache_key] = nil
+            end
+        end
+        os.remove(stub_path)
+    end
+    print(C.bright_green .. string.format(
+        "  [PASS] Remote listing/preview quoting (%d hostile names%s)",
+        #hostile_names, sh_available and "" or "; end-to-end check skipped: sh not on PATH") .. C.reset)
 
     -- 8. Terminal Size Query Test
     Term.init()
