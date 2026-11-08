@@ -218,6 +218,8 @@ else
         int kill(int pid, int sig);
         int close(int fd);
         int dup2(int oldfd, int newfd);
+        void _exit(int status);
+        int getpid(void);
     ]]
 end
 
@@ -382,6 +384,21 @@ local function remove_directory(path)
         return true
     end
     return false, describe_last_os_error()
+end
+
+-- Returns the platform temp directory with forward slashes and no trailing slash.
+local function get_temp_root()
+    local temp_root = os.getenv("TMPDIR") or os.getenv("TEMP") or os.getenv("TMP")
+    if not temp_root or temp_root == "" then
+        if IS_WINDOWS then
+            temp_root = "C:/Windows/Temp"
+        else
+            temp_root = "/tmp"
+        end
+    end
+
+    local normalized = clean_path(temp_root):gsub("/+$", "")
+    return normalized
 end
 
 -- Changes the process working directory.
@@ -967,22 +984,195 @@ end
 --------------------------------------------------------------------------------
 local ProcessRunner = {}
 
-function ProcessRunner.run_command_sync(cmd_str)
-    local t0 = get_time_sec()
-    local ok = os.execute(cmd_str)
-    local elapsed = get_time_sec() - t0
-    return (ok == 0 or ok == true), elapsed
+-- POSIX values are Linux-specific, matching the FFI struct layouts above.
+local O_WRONLY = 1
+local O_RDWR = 2
+local O_CREAT = 64              -- octal 0100
+local O_TRUNC = 512             -- octal 01000
+local STDERR_FILE_MODE = 384    -- octal 0600: captured errors may contain paths
+local STDOUT_FD = 1
+local STDERR_FD = 2
+local WNOHANG = 1
+local EXIT_COMMAND_NOT_FOUND = 127
+local SHELL_SIGNAL_EXIT_BASE = 128
+local MAX_LOGGED_ERROR_LINES = 5
+
+local WIN32_CREATE_NO_WINDOW = 0x08000000
+local WIN32_WAIT_OBJECT_0 = 0
+
+local SIGNAL_NAMES = {
+    [6] = "SIGABRT",
+    [9] = "SIGKILL",
+    [11] = "SIGSEGV",
+    [15] = "SIGTERM",
+}
+
+-- Splits a POSIX wait() status into (exit_code, nil) for a normal exit,
+-- or (nil, signal_number) when the process was killed by a signal.
+local function decode_wait_status(raw_status)
+    local signal_number = bit.band(raw_status, 0x7f)
+    if signal_number ~= 0 then
+        return nil, signal_number
+    end
+    return bit.band(bit.rshift(raw_status, 8), 0xff), nil
 end
 
-function ProcessRunner.spawn_async(cmd_str, log_file)
+-- Describes how a tool ended, e.g. "exit 1" or "killed by signal 11 (SIGSEGV)".
+local function describe_exit(exit_code, signal_number)
+    if signal_number then
+        local signal_name = SIGNAL_NAMES[signal_number] or "unknown"
+        return string.format("killed by signal %d (%s)", signal_number, signal_name)
+    end
+    if exit_code == EXIT_COMMAND_NOT_FOUND then
+        return "exit 127: command not found; install it or add it to PATH"
+    end
+
+    -- `sh -c` reports a child killed by signal N as exit status 128 + N.
+    local shell_signal_name = exit_code and SIGNAL_NAMES[exit_code - SHELL_SIGNAL_EXIT_BASE]
+    if shell_signal_name then
+        return string.format("exit %d (killed by %s)", exit_code, shell_signal_name)
+    end
+    return "exit " .. tostring(exit_code)
+end
+
+-- Returns true when a finished worker exited normally with status 0.
+local function process_succeeded(proc)
+    return proc.exit_code == 0 and not proc.signal and not proc.wait_error
+end
+
+-- Describes a finished worker's outcome for logs and error summaries.
+local function describe_process_outcome(proc)
+    if proc.wait_error then
+        return "could not read exit status: " .. proc.wait_error
+    end
+    return describe_exit(proc.exit_code, proc.signal)
+end
+
+-- Returns a unique temp file path for one tool's captured stderr (POSIX only).
+local function make_stderr_capture_path(tool_name)
+    local microseconds = math.floor((get_time_sec() % 1) * 1e6)
+    return string.format(
+        "%s/dotag-%s-%d-%d-%06d.err",
+        get_temp_root(),
+        tool_name,
+        ffi.C.getpid(),
+        os.time(),
+        microseconds
+    )
+end
+
+-- Reads up to `max_lines` non-empty lines from a captured stderr file, then
+-- deletes the file. Returns the lines and how many further lines were left out.
+local function read_and_remove_error_lines(path, max_lines)
+    local lines = {}
+    local omitted_count = 0
+    if not path then
+        return lines, omitted_count
+    end
+
+    local file = io.open(path, "r")
+    if file then
+        for line in file:lines() do
+            local trimmed = line:gsub("%s+$", "")
+            if trimmed ~= "" then
+                if #lines < max_lines then
+                    table.insert(lines, trimmed)
+                else
+                    omitted_count = omitted_count + 1
+                end
+            end
+        end
+        file:close()
+    end
+
+    os.remove(path)
+    return lines, omitted_count
+end
+
+-- Runs in the forked child only: discards stdout and sends stderr to
+-- `stderr_path` (or /dev/null when no path is given or it cannot be opened).
+local function redirect_child_output(stderr_path)
+    local devnull_fd = ffi.C.open("/dev/null", O_RDWR)
+    if devnull_fd >= 0 then
+        ffi.C.dup2(devnull_fd, STDOUT_FD)
+        ffi.C.dup2(devnull_fd, STDERR_FD)
+    end
+
+    if stderr_path then
+        -- open() is variadic: pass the mode as a C integer, not a Lua double.
+        local stderr_fd = ffi.C.open(
+            stderr_path,
+            bit.bor(O_WRONLY, O_CREAT, O_TRUNC),
+            ffi.new("unsigned int", STDERR_FILE_MODE)
+        )
+        if stderr_fd >= 0 then
+            ffi.C.dup2(stderr_fd, STDERR_FD)
+            ffi.C.close(stderr_fd)
+        end
+    end
+
+    if devnull_fd > STDERR_FD then
+        ffi.C.close(devnull_fd)
+    end
+end
+
+-- os.execute returns a raw wait status in LuaJIT (the exit code on Windows);
+-- Lua 5.2-compatible builds return true/nil, "exit"/"signal", code instead.
+-- Returns (exit_code, nil) or (nil, signal_number).
+local function decode_os_execute_result(result, exit_kind, compat_code)
+    if type(result) == "number" then
+        if IS_WINDOWS then
+            return result, nil
+        end
+        return decode_wait_status(result)
+    end
+
+    if exit_kind == "signal" then
+        return nil, compat_code
+    end
+    if compat_code then
+        return compat_code, nil
+    end
+    if result then
+        return 0, nil
+    end
+    return 1, nil
+end
+
+-- Runs a shell command and waits for it.
+-- Returns succeeded, elapsed_seconds, and an outcome description.
+function ProcessRunner.run_command_sync(cmd_str)
+    local start_seconds = get_time_sec()
+    local result, exit_kind, compat_code = os.execute(cmd_str)
+    local elapsed = get_time_sec() - start_seconds
+
+    local exit_code, signal_number = decode_os_execute_result(result, exit_kind, compat_code)
+    local succeeded = exit_code == 0 and not signal_number
+    return succeeded, elapsed, describe_exit(exit_code, signal_number)
+end
+
+-- Starts `cmd_str` without waiting. On POSIX the tool's stderr is written to
+-- `stderr_path` for later display; Windows does not capture it yet.
+-- Returns a process record for ProcessRunner.poll, or nil if it could not start.
+function ProcessRunner.spawn_async(cmd_str, stderr_path)
     if IS_WINDOWS then
         local si = ffi.new("STARTUPINFOA")
         si.cb = ffi.sizeof("STARTUPINFOA")
         local pi = ffi.new("PROCESS_INFORMATION")
-        
-        -- CREATE_NO_WINDOW = 0x08000000
+
         local cmd_buf = ffi.new("char[?]", #cmd_str + 1, cmd_str)
-        local ok = ffi.C.CreateProcessA(nil, cmd_buf, nil, nil, 0, 0x08000000, nil, nil, si, pi)
+        local ok = ffi.C.CreateProcessA(
+            nil,
+            cmd_buf,
+            nil,
+            nil,
+            0,
+            WIN32_CREATE_NO_WINDOW,
+            nil,
+            nil,
+            si,
+            pi
+        )
         if ok ~= 0 then
             return {
                 type = "win32",
@@ -998,18 +1188,18 @@ function ProcessRunner.spawn_async(cmd_str, log_file)
     elseif IS_POSIX then
         local pid = ffi.C.fork()
         if pid == 0 then
-            local devnull = ffi.C.open("/dev/null", 2) -- O_RDWR = 2
-            if devnull >= 0 then
-                ffi.C.dup2(devnull, 1)
-                ffi.C.dup2(devnull, 2)
-                ffi.C.close(devnull)
-            end
+            -- Child: stdout is discarded; stderr goes to `stderr_path` so the
+            -- parent can show the tool's own error message after it exits.
+            redirect_child_output(stderr_path)
             ffi.C.execlp("sh", "sh", "-c", cmd_str, nil)
-            os.exit(127)
+
+            -- exec failed: leave without running the parent's Lua/stdio cleanup.
+            ffi.C._exit(EXIT_COMMAND_NOT_FOUND)
         elseif pid > 0 then
             return {
                 type = "posix",
                 pid = pid,
+                stderr_path = stderr_path,
                 start_time = get_time_sec(),
                 cmd = cmd_str,
                 done = false,
@@ -1020,39 +1210,54 @@ function ProcessRunner.spawn_async(cmd_str, log_file)
     return nil
 end
 
-function ProcessRunner.poll(proc)
-    if not proc or proc.done then return true, proc.exit_code or 0 end
-    if proc.type == "win32" then
-        local res = ffi.C.WaitForSingleObject(proc.hProcess, 0)
-        if res == 0 then -- WAIT_OBJECT_0
-            local code = ffi.new("DWORD[1]")
-            ffi.C.GetExitCodeProcess(proc.hProcess, code)
-            ffi.C.CloseHandle(proc.hProcess)
-            ffi.C.CloseHandle(proc.hThread)
-            proc.done = true
-            proc.exit_code = tonumber(code[0])
-            proc.elapsed = get_time_sec() - proc.start_time
-            return true, proc.exit_code
-        end
-        return false, nil
-    elseif proc.type == "posix" then
-        local status = ffi.new("int[1]")
-        local res = ffi.C.waitpid(proc.pid, status, 1) -- WNOHANG = 1
-        if res == proc.pid then
-            proc.done = true
-            local raw_st = status[0]
-            proc.exit_code = bit.band(bit.rshift(raw_st, 8), 0xff)
-            proc.elapsed = get_time_sec() - proc.start_time
-            return true, proc.exit_code
-        elseif res == -1 then
-            proc.done = true
-            proc.exit_code = -1
-            proc.elapsed = get_time_sec() - proc.start_time
-            return true, -1
-        end
-        return false, nil
+-- Non-blocking check of a Win32 worker. Returns true once it has exited.
+local function poll_win32_process(proc)
+    if ffi.C.WaitForSingleObject(proc.hProcess, 0) ~= WIN32_WAIT_OBJECT_0 then
+        return false
     end
-    return true, 0
+
+    local exit_code_buffer = ffi.new("DWORD[1]")
+    ffi.C.GetExitCodeProcess(proc.hProcess, exit_code_buffer)
+    ffi.C.CloseHandle(proc.hProcess)
+    ffi.C.CloseHandle(proc.hThread)
+
+    proc.done = true
+    proc.exit_code = tonumber(exit_code_buffer[0])
+    proc.elapsed = get_time_sec() - proc.start_time
+    return true
+end
+
+-- Non-blocking check of a POSIX worker. Returns true once it has exited.
+local function poll_posix_process(proc)
+    local status = ffi.new("int[1]")
+    local wait_result = ffi.C.waitpid(proc.pid, status, WNOHANG)
+    if wait_result == 0 then
+        return false
+    end
+
+    if wait_result == proc.pid then
+        proc.exit_code, proc.signal = decode_wait_status(status[0])
+    else
+        -- waitpid failed (e.g. the child was already reaped): outcome unknown.
+        proc.wait_error = describe_last_os_error()
+    end
+
+    proc.done = true
+    proc.elapsed = get_time_sec() - proc.start_time
+    return true
+end
+
+-- Returns true once the worker has exited; its outcome is then available via
+-- process_succeeded(proc) and describe_process_outcome(proc).
+function ProcessRunner.poll(proc)
+    if not proc or proc.done then
+        return true
+    end
+
+    if proc.type == "win32" then
+        return poll_win32_process(proc)
+    end
+    return poll_posix_process(proc)
 end
 
 --------------------------------------------------------------------------------
@@ -1073,11 +1278,37 @@ local TUI = {
     total_build_time = 0,
     
     -- Pipeline Steps Status
+    -- `label` names the step in failure summaries; `failure` holds the reason
+    -- text (e.g. "exit 1") while status is "ERROR".
     steps = {
-        crawl  = { status = "READY", elapsed = 0, start_time = 0, msg = "Native FFI crawler" },
-        cscope = { status = "READY", elapsed = 0, start_time = 0, msg = "cscope -b -q -k -i cscope.files" },
-        ctags  = { status = "READY", elapsed = 0, start_time = 0, msg = "ctags -L cscope.files" },
-        tags_f = { status = "READY", elapsed = 0, start_time = 0, msg = "In-memory foldcase sort" },
+        crawl = {
+            label = "crawl",
+            status = "READY",
+            elapsed = 0,
+            start_time = 0,
+            msg = "Native FFI crawler",
+        },
+        cscope = {
+            label = "cscope",
+            status = "READY",
+            elapsed = 0,
+            start_time = 0,
+            msg = "cscope -b -q -k -i cscope.files",
+        },
+        ctags = {
+            label = "ctags",
+            status = "READY",
+            elapsed = 0,
+            start_time = 0,
+            msg = "ctags -L cscope.files",
+        },
+        tags_f = {
+            label = "filenametags",
+            status = "READY",
+            elapsed = 0,
+            start_time = 0,
+            msg = "In-memory foldcase sort",
+        },
     },
     
     -- Active background workers
@@ -1167,10 +1398,10 @@ function TUI.start_pipeline()
     TUI.status = "RUNNING"
     TUI.pipeline_start_time = get_time_sec()
 
-    TUI.steps.crawl.status = "READY"
-    TUI.steps.tags_f.status = "READY"
-    TUI.steps.cscope.status = "READY"
-    TUI.steps.ctags.status = "READY"
+    for _, step in pairs(TUI.steps) do
+        step.status = "READY"
+        step.failure = nil
+    end
 
     -- Step 0: Clean old databases if requested
     if TUI.clean_before then
@@ -1226,6 +1457,7 @@ function TUI.start_pipeline()
         TUI.log(string.format("[2/4] filenametags generated (%d entries sorted in %.3fs).", count_fn, t_fn_elapsed))
     else
         TUI.steps.tags_f.status = "ERROR"
+        TUI.steps.tags_f.failure = tostring(count_fn)
         TUI.log("[ERROR] filenametags failed: " .. tostring(count_fn))
     end
 
@@ -1240,58 +1472,149 @@ function TUI.start_pipeline()
 
     local cs_bin = IS_WINDOWS and "cscope.exe" or "cscope"
     local ct_bin = IS_WINDOWS and "ctags.exe" or "ctags"
-    local p_cscope = ProcessRunner.spawn_async(cs_bin .. " -b -q -k -i " .. CSCOPE_FILE_NAME)
-    local p_ctags  = ProcessRunner.spawn_async(ct_bin .. " -L " .. CSCOPE_FILE_NAME)
+    local cscope_command = cs_bin .. " -b -q -k -i " .. CSCOPE_FILE_NAME
+    local ctags_command = ct_bin .. " -L " .. CSCOPE_FILE_NAME
+
+    -- Each tool's stderr is captured to its own temp file (POSIX only).
+    local cscope_stderr_path = nil
+    local ctags_stderr_path = nil
+    if IS_POSIX then
+        cscope_stderr_path = make_stderr_capture_path("cscope")
+        ctags_stderr_path = make_stderr_capture_path("ctags")
+    end
+
+    local p_cscope = ProcessRunner.spawn_async(cscope_command, cscope_stderr_path)
+    local p_ctags = ProcessRunner.spawn_async(ctags_command, ctags_stderr_path)
 
     if p_cscope and p_ctags then
-        TUI.workers = { cscope = p_cscope, ctags = p_ctags }
+        TUI.workers = {
+            cscope = p_cscope,
+            ctags = p_ctags,
+        }
+        return
+    end
+
+    -- Fallback synchronous execution
+    TUI.render()
+    TUI.log("[INFO] Running cscope and ctags in foreground...")
+    TUI.run_step_sync(TUI.steps.cscope, cscope_command)
+    TUI.run_step_sync(TUI.steps.ctags, ctags_command)
+    TUI.finish_pipeline()
+end
+
+-- Runs one tool in the foreground (fallback path) and records its outcome.
+function TUI.run_step_sync(step, command)
+    local succeeded, elapsed, outcome = ProcessRunner.run_command_sync(command)
+    step.elapsed = elapsed
+    if succeeded then
+        step.status = "DONE"
+        TUI.log(string.format("[%s] Completed in %.3fs.", step.label, elapsed))
+        return
+    end
+
+    step.status = "ERROR"
+    step.failure = outcome
+    TUI.log(string.format("[ERROR] %s failed after %.3fs: %s", step.label, elapsed, outcome))
+end
+
+-- Records a finished background worker on its pipeline step, then logs the
+-- outcome followed by the tool's own stderr lines (errors or warnings).
+function TUI.record_worker_result(step, worker)
+    step.elapsed = worker.elapsed or 0
+    local error_lines, omitted_count = read_and_remove_error_lines(
+        worker.stderr_path,
+        MAX_LOGGED_ERROR_LINES
+    )
+
+    local succeeded = process_succeeded(worker)
+    if succeeded then
+        step.status = "DONE"
+        TUI.log(string.format("[%s] Completed in %.3fs.", step.label, step.elapsed))
     else
-        -- Fallback synchronous execution
-        TUI.render()
-        TUI.log("[INFO] Running cscope and ctags in foreground...")
-        local ok_cs, el_cs = ProcessRunner.run_command_sync(cs_bin .. " -b -q -k -i " .. CSCOPE_FILE_NAME)
-        TUI.steps.cscope.status = ok_cs and "DONE" or "ERROR"
-        TUI.steps.cscope.elapsed = el_cs
-        TUI.log(string.format("[cscope] Finished in %.3fs (exit %s)", el_cs, tostring(ok_cs)))
+        step.status = "ERROR"
+        step.failure = describe_process_outcome(worker)
+        TUI.log(string.format(
+            "[ERROR] %s failed after %.3fs: %s",
+            step.label,
+            step.elapsed,
+            step.failure
+        ))
+    end
 
-        local ok_ct, el_ct = ProcessRunner.run_command_sync(ct_bin .. " -L " .. CSCOPE_FILE_NAME)
-        TUI.steps.ctags.status = ok_ct and "DONE" or "ERROR"
-        TUI.steps.ctags.elapsed = el_ct
-        TUI.log(string.format("[ctags] Finished in %.3fs (exit %s)", el_ct, tostring(ok_ct)))
-
-        TUI.pipeline_running = false
-        TUI.total_build_time = get_time_sec() - TUI.pipeline_start_time
-        TUI.status = "DONE"
-        TUI.log(string.format("[DONE] All 3 databases created successfully in %.3fs!", TUI.total_build_time))
+    -- On success these are warnings; on failure they explain the error.
+    local line_tag = succeeded and "WARN" or step.label
+    for _, line in ipairs(error_lines) do
+        TUI.log(string.format("[%s] %s", line_tag, line))
+    end
+    if omitted_count > 0 then
+        TUI.log(string.format("[%s] (+%d more lines)", line_tag, omitted_count))
+    end
+    if not succeeded and IS_WINDOWS then
+        TUI.log(string.format("[%s] (error output not captured on Windows)", step.label))
     end
 end
 
-function TUI.poll_workers()
-    if not TUI.pipeline_running or not TUI.workers.cscope then return false end
+-- Returns "label (reason)" for every step that ended in ERROR, in pipeline order.
+local PIPELINE_STEP_ORDER = { "crawl", "tags_f", "cscope", "ctags" }
 
-    local cs_done, cs_exit = ProcessRunner.poll(TUI.workers.cscope)
-    local ct_done, ct_exit = ProcessRunner.poll(TUI.workers.ctags)
+function TUI.collect_failed_steps()
+    local failures = {}
+    for _, step_key in ipairs(PIPELINE_STEP_ORDER) do
+        local step = TUI.steps[step_key]
+        if step.status == "ERROR" then
+            table.insert(failures, string.format("%s (%s)", step.label, step.failure or "failed"))
+        end
+    end
+    return failures
+end
+
+-- Ends a run: DONE only if every step succeeded; otherwise ERROR plus one
+-- summary line naming each failed step and why.
+function TUI.finish_pipeline()
+    TUI.pipeline_running = false
+    TUI.total_build_time = get_time_sec() - TUI.pipeline_start_time
+
+    local failures = TUI.collect_failed_steps()
+    if #failures == 0 then
+        TUI.status = "DONE"
+        TUI.log(string.format(
+            "[DONE] Tri-Engine indexing complete in %.3fs!",
+            TUI.total_build_time
+        ))
+        return
+    end
+
+    TUI.status = "ERROR"
+    TUI.log(string.format(
+        "[ERROR] Indexing finished with %d failed step(s): %s",
+        #failures,
+        table.concat(failures, ", ")
+    ))
+end
+
+-- Polls the background cscope/ctags workers. Returns true when the screen
+-- needs redrawing because a worker finished or the pipeline ended.
+function TUI.poll_workers()
+    if not TUI.pipeline_running or not TUI.workers.cscope then
+        return false
+    end
+
+    local cs_done = ProcessRunner.poll(TUI.workers.cscope)
+    local ct_done = ProcessRunner.poll(TUI.workers.ctags)
     local state_changed = false
 
     if cs_done and TUI.steps.cscope.status == "RUNNING" then
-        TUI.steps.cscope.status = (cs_exit == 0) and "DONE" or "ERROR"
-        TUI.steps.cscope.elapsed = TUI.workers.cscope.elapsed or 0
-        TUI.log(string.format("[cscope] Completed in %.3fs (code %d).", TUI.steps.cscope.elapsed, cs_exit or 0))
+        TUI.record_worker_result(TUI.steps.cscope, TUI.workers.cscope)
         state_changed = true
     end
 
     if ct_done and TUI.steps.ctags.status == "RUNNING" then
-        TUI.steps.ctags.status = (ct_exit == 0) and "DONE" or "ERROR"
-        TUI.steps.ctags.elapsed = TUI.workers.ctags.elapsed or 0
-        TUI.log(string.format("[ctags] Completed in %.3fs (code %d).", TUI.steps.ctags.elapsed, ct_exit or 0))
+        TUI.record_worker_result(TUI.steps.ctags, TUI.workers.ctags)
         state_changed = true
     end
 
     if cs_done and ct_done then
-        TUI.pipeline_running = false
-        TUI.total_build_time = get_time_sec() - TUI.pipeline_start_time
-        TUI.status = "DONE"
-        TUI.log(string.format("[DONE] Tri-Engine indexing complete in %.3fs!", TUI.total_build_time))
+        TUI.finish_pipeline()
         state_changed = true
     end
     return state_changed
@@ -1302,7 +1625,10 @@ end
 --------------------------------------------------------------------------------
 local SPINNER_FRAMES = { "◐", "◓", "◑", "◒" }
 
-local function make_bar(status, elapsed, start_time)
+-- Widest failure reason shown inline on a pipeline row; the full text is in the log.
+local MAX_INLINE_FAILURE_WIDTH = 34
+
+local function make_bar(status, elapsed, start_time, failure_text)
     if status == "DONE" then
         return C.b_green .. "[ DONE ]" .. C.reset .. string.format(" in %6.3fs", elapsed or 0)
     elseif status == "RUNNING" then
@@ -1310,7 +1636,8 @@ local function make_bar(status, elapsed, start_time)
         local frame = SPINNER_FRAMES[math.floor(get_time_sec() * 10) % #SPINNER_FRAMES + 1]
         return C.b_yellow .. "[ RUN  ]" .. C.reset .. " " .. C.b_cyan .. frame .. C.reset .. string.format(" %6.3fs", cur_elapsed)
     elseif status == "ERROR" then
-        return C.b_red .. "[ FAIL ]" .. C.reset .. C.red .. " error occurred" .. C.reset
+        local reason = truncate_string(failure_text or "error occurred", MAX_INLINE_FAILURE_WIDTH)
+        return C.b_red .. "[ FAIL ]" .. C.reset .. C.red .. " " .. reason .. C.reset
     else
         return C.dim .. "[ READY]" .. C.reset .. " waiting..."
     end
@@ -1467,8 +1794,9 @@ function TUI.render()
     if pipe_gap < 1 then pipe_gap = 1 end
     write_str(make_full_row(pipe_left .. string.rep(" ", pipe_gap) .. pipe_right))
 
-    local function make_pipeline_row(num, icon, name, status, elapsed, msg, start_time)
-        local bar = make_bar(status, elapsed, start_time)
+    local function make_pipeline_row(num, icon, name, step)
+        local bar = make_bar(step.status, step.elapsed, step.start_time, step.failure)
+        local msg = step.msg
         local left_part = string.format("  %d. %s %-15s %s", num, icon, name, bar)
         local left_w = utf8_col_width(left_part)
         local max_msg_w = inner_w - left_w - 4
@@ -1479,10 +1807,10 @@ function TUI.render()
         return make_full_row(left_part .. msg_part)
     end
 
-    write_str(make_pipeline_row(1, "🔍", "File Crawler", TUI.steps.crawl.status, TUI.steps.crawl.elapsed, TUI.steps.crawl.msg, TUI.steps.crawl.start_time))
-    write_str(make_pipeline_row(2, "📁", "filenametags", TUI.steps.tags_f.status, TUI.steps.tags_f.elapsed, TUI.steps.tags_f.msg, TUI.steps.tags_f.start_time))
-    write_str(make_pipeline_row(3, "🔎", "cscope Engine", TUI.steps.cscope.status, TUI.steps.cscope.elapsed, TUI.steps.cscope.msg, TUI.steps.cscope.start_time))
-    write_str(make_pipeline_row(4, "🏷️", "ctags Engine", TUI.steps.ctags.status, TUI.steps.ctags.elapsed, TUI.steps.ctags.msg, TUI.steps.ctags.start_time))
+    write_str(make_pipeline_row(1, "🔍", "File Crawler", TUI.steps.crawl))
+    write_str(make_pipeline_row(2, "📁", "filenametags", TUI.steps.tags_f))
+    write_str(make_pipeline_row(3, "🔎", "cscope Engine", TUI.steps.cscope))
+    write_str(make_pipeline_row(4, "🏷️", "ctags Engine", TUI.steps.ctags))
 
     -- 5. Activity Log Pane
     write_str(C.b_cyan .. BOX.vl .. string.rep(BOX.h, inner_w) .. BOX.vr .. C.reset .. "\n")
@@ -2089,21 +2417,6 @@ end
 -- Test Sandbox (keeps --test away from the user's real databases)
 --------------------------------------------------------------------------------
 
--- Returns the platform temp directory with forward slashes and no trailing slash.
-local function get_temp_root()
-    local temp_root = os.getenv("TMPDIR") or os.getenv("TEMP") or os.getenv("TMP")
-    if not temp_root or temp_root == "" then
-        if IS_WINDOWS then
-            temp_root = "C:/Windows/Temp"
-        else
-            temp_root = "/tmp"
-        end
-    end
-
-    local normalized = clean_path(temp_root):gsub("/+$", "")
-    return normalized
-end
-
 -- Creates a fresh, uniquely named directory under the temp root.
 -- Returns a sandbox record, or nil plus the attempted path and the OS error.
 local function create_test_sandbox()
@@ -2303,6 +2616,30 @@ local function run_pure_tests(tester)
     assert_eq(expand_home_directory("plain/path"), "plain/path", "Non-tilde path unchanged")
     local home = os.getenv("HOME") or os.getenv("USERPROFILE") or ""
     assert_eq(expand_home_directory("~/proj"), home .. "/proj", "~/ expands to home directory")
+
+    -- Test 11: Process exit decoding
+    print("\n[Test 11] Process Exit Decoding...")
+    local exit_code, signal_number = decode_wait_status(0)
+    assert_eq(exit_code, 0, "wait status 0 is exit 0")
+    assert_eq(signal_number, nil, "wait status 0 has no signal")
+    exit_code, signal_number = decode_wait_status(256)
+    assert_eq(exit_code, 1, "wait status 256 is exit 1")
+    exit_code, signal_number = decode_wait_status(11)
+    assert_eq(exit_code, nil, "SIGSEGV status is not an exit code")
+    assert_eq(signal_number, 11, "wait status 11 is signal 11")
+    exit_code, signal_number = decode_wait_status(9)
+    assert_eq(signal_number, 9, "wait status 9 is signal 9 (SIGKILL)")
+    assert_eq(describe_exit(nil, 11), "killed by signal 11 (SIGSEGV)", "Signal description")
+    assert_eq(describe_exit(1, nil), "exit 1", "Exit code description")
+    assert_eq(describe_exit(139, nil), "exit 139 (killed by SIGSEGV)", "sh -c signal exit")
+    assert_eq(
+        describe_exit(127, nil),
+        "exit 127: command not found; install it or add it to PATH",
+        "Command-not-found hint"
+    )
+    assert_eq(process_succeeded({ exit_code = 0 }), true, "exit 0 succeeded")
+    assert_eq(process_succeeded({ signal = 11 }), false, "Signal is a failure")
+    assert_eq(process_succeeded({ exit_code = 1 }), false, "exit 1 is a failure")
 end
 
 -- Test 1: filenametags generation and foldcase ordering.
@@ -2391,11 +2728,34 @@ local function test_database_cleanup(tester, sandbox)
     assert_eq(file_exists("notes.txt"), true, "clean_all_databases kept unrelated notes.txt")
 end
 
+-- Test 12: captured stderr is summarized and the capture file removed.
+local function test_error_line_capture(tester, sandbox)
+    local assert_eq = tester.assert_eq
+    print("\n[Test 12] Captured stderr Summary (sandbox)...")
+
+    local capture_lines = {}
+    for line_number = 1, 7 do
+        table.insert(capture_lines, "error line " .. line_number)
+    end
+    local capture_content = "\n" .. table.concat(capture_lines, "\n  \n") .. "\n"
+    sandbox_write_file(sandbox, "capture.err", capture_content)
+
+    local lines, omitted_count = read_and_remove_error_lines("capture.err", 5)
+    assert_eq(#lines, 5, "Keeps the first 5 non-empty lines")
+    assert_eq(lines[1], "error line 1", "Skips blank lines")
+    assert_eq(omitted_count, 2, "Counts the lines left out")
+    assert_eq(file_exists("capture.err"), false, "Removes the capture file")
+
+    lines, omitted_count = read_and_remove_error_lines(nil, 5)
+    assert_eq(#lines, 0, "No capture path gives no lines")
+end
+
 -- Tests that read or write files. Must run with the sandbox as working directory.
 local function run_filesystem_tests(tester, sandbox)
     test_filenametags_sort(tester, sandbox)
     test_native_crawler(tester, sandbox)
     test_database_cleanup(tester, sandbox)
+    test_error_line_capture(tester, sandbox)
 end
 
 -- Runs filesystem tests inside the sandbox, always restoring the original
