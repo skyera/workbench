@@ -1380,7 +1380,8 @@ end
 
 -- Starts `cmd_str` without waiting. On POSIX the tool's stderr is written to
 -- `stderr_path` for later display; Windows does not capture it yet.
--- Returns a process record for ProcessRunner.poll, or nil if it could not start.
+-- Returns a process record for ProcessRunner.poll, or nil plus the reason it
+-- could not start (e.g. "fork failed: Resource temporarily unavailable").
 function ProcessRunner.spawn_async(cmd_str, stderr_path)
     if IS_WINDOWS then
         local si = ffi.new("STARTUPINFOA")
@@ -1412,6 +1413,7 @@ function ProcessRunner.spawn_async(cmd_str, stderr_path)
                 exit_code = nil,
             }
         end
+        return nil, "CreateProcess failed: " .. describe_last_os_error()
     elseif IS_POSIX then
         local pid = ffi.C.fork()
         if pid == 0 then
@@ -1435,8 +1437,9 @@ function ProcessRunner.spawn_async(cmd_str, stderr_path)
                 exit_code = nil,
             }
         end
+        return nil, "fork failed: " .. describe_last_os_error()
     end
-    return nil
+    return nil, "background processes are not supported on this platform"
 end
 
 -- Non-blocking check of a Win32 worker. Returns true once it has exited.
@@ -1743,23 +1746,38 @@ function TUI.start_pipeline()
         ctags_stderr_path = make_stderr_capture_path("ctags")
     end
 
-    local p_cscope = ProcessRunner.spawn_async(cscope_command, cscope_stderr_path)
-    local p_ctags = ProcessRunner.spawn_async(ctags_command, ctags_stderr_path)
+    local p_cscope, cscope_spawn_error = ProcessRunner.spawn_async(
+        cscope_command,
+        cscope_stderr_path
+    )
+    local p_ctags, ctags_spawn_error = ProcessRunner.spawn_async(
+        ctags_command,
+        ctags_stderr_path
+    )
+    TUI.workers = {
+        cscope = p_cscope,
+        ctags = p_ctags,
+    }
 
-    if p_cscope and p_ctags then
-        TUI.workers = {
-            cscope = p_cscope,
-            ctags = p_ctags,
-        }
-        return
+    -- Only a tool that could not start runs in the foreground; the other keeps
+    -- running in the background, so no tool ever runs twice. poll_workers
+    -- finishes the pipeline once neither step is still RUNNING.
+    if not p_cscope then
+        TUI.run_step_in_foreground(
+            TUI.steps.cscope,
+            cscope_command,
+            cscope_spawn_error,
+            cscope_stderr_path
+        )
     end
-
-    -- Fallback synchronous execution
-    TUI.render()
-    TUI.log("[INFO] Running cscope and ctags in foreground...")
-    TUI.run_step_sync(TUI.steps.cscope, cscope_command)
-    TUI.run_step_sync(TUI.steps.ctags, ctags_command)
-    TUI.finish_pipeline()
+    if not p_ctags then
+        TUI.run_step_in_foreground(
+            TUI.steps.ctags,
+            ctags_command,
+            ctags_spawn_error,
+            ctags_stderr_path
+        )
+    end
 end
 
 -- Marks the discovery step as failed and ends the run with an ERROR status.
@@ -1769,19 +1787,43 @@ function TUI.fail_crawl_step(reason)
     TUI.finish_pipeline()
 end
 
--- Runs one tool in the foreground (fallback path) and records its outcome.
-function TUI.run_step_sync(step, command)
-    local succeeded, elapsed, outcome = ProcessRunner.run_command_sync(command)
+-- Runs one tool in the foreground because it could not start in the
+-- background (`spawn_error` says why), then records its outcome. When
+-- `stderr_path` is given, the tool's stderr is captured there and logged
+-- instead of being written over the TUI.
+function TUI.run_step_in_foreground(step, command, spawn_error, stderr_path)
+    TUI.log(string.format(
+        "[WARN] %s could not start in the background (%s); running it in the foreground.",
+        step.label,
+        spawn_error or "unknown reason"
+    ))
+    TUI.render()
+
+    local foreground_command = command
+    if stderr_path then
+        foreground_command = command .. ' 2>"' .. stderr_path .. '"'
+    end
+    local succeeded, elapsed, outcome = ProcessRunner.run_command_sync(foreground_command)
     step.elapsed = elapsed
     if succeeded then
         step.status = "DONE"
         TUI.log(string.format("[%s] Completed in %.3fs.", step.label, elapsed))
-        return
+    else
+        step.status = "ERROR"
+        step.failure = outcome
+        TUI.log(string.format(
+            "[ERROR] %s failed after %.3fs: %s",
+            step.label,
+            elapsed,
+            outcome
+        ))
     end
 
-    step.status = "ERROR"
-    step.failure = outcome
-    TUI.log(string.format("[ERROR] %s failed after %.3fs: %s", step.label, elapsed, outcome))
+    local line_tag = succeeded and "WARN" or step.label
+    local error_lines = read_and_remove_error_lines(stderr_path, MAX_LOGGED_ERROR_LINES)
+    for _, line in ipairs(error_lines) do
+        TUI.log(string.format("[%s] %s", line_tag, line))
+    end
 end
 
 -- Records a finished background worker on its pipeline step, then logs the
@@ -1862,25 +1904,24 @@ end
 -- Polls the background cscope/ctags workers. Returns true when the screen
 -- needs redrawing because a worker finished or the pipeline ended.
 function TUI.poll_workers()
-    if not TUI.pipeline_running or not TUI.workers.cscope then
+    if not TUI.pipeline_running then
         return false
     end
 
-    local cs_done = ProcessRunner.poll(TUI.workers.cscope)
-    local ct_done = ProcessRunner.poll(TUI.workers.ctags)
+    -- A worker may be missing when that tool ran in the foreground instead.
     local state_changed = false
-
-    if cs_done and TUI.steps.cscope.status == "RUNNING" then
-        TUI.record_worker_result(TUI.steps.cscope, TUI.workers.cscope)
-        state_changed = true
+    for _, tool_name in ipairs({ "cscope", "ctags" }) do
+        local step = TUI.steps[tool_name]
+        local worker = TUI.workers[tool_name]
+        if worker and step.status == "RUNNING" and ProcessRunner.poll(worker) then
+            TUI.record_worker_result(step, worker)
+            state_changed = true
+        end
     end
 
-    if ct_done and TUI.steps.ctags.status == "RUNNING" then
-        TUI.record_worker_result(TUI.steps.ctags, TUI.workers.ctags)
-        state_changed = true
-    end
-
-    if cs_done and ct_done then
+    local cscope_busy = TUI.steps.cscope.status == "RUNNING"
+    local ctags_busy = TUI.steps.ctags.status == "RUNNING"
+    if not cscope_busy and not ctags_busy then
         TUI.finish_pipeline()
         state_changed = true
     end
