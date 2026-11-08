@@ -482,9 +482,34 @@ local function write_pattern_file(pattern)
     return pattern_path
 end
 
+-- Keep only the first few diagnostic lines so one broken search cannot flood
+-- the preview pane.
+local MAX_DIAGNOSTIC_LINES = 12
+
+-- Turn the non-match lines rg printed into an error message, adding a hint
+-- for the failures a user can fix directly.
+local function describe_rg_failure(diagnostic_lines)
+    local message = table.concat(diagnostic_lines, "\n")
+
+    if message:find("is not recognized as an internal or external command", 1, true)
+        or message:find("rg: not found", 1, true)
+        or message:find("rg: command not found", 1, true) then
+        return "ripgrep (rg) is not installed or not on PATH.\n"
+            .. "Install it from https://github.com/BurntSushi/ripgrep and retry."
+    end
+
+    if message:find("regex parse error", 1, true) then
+        return message .. "\nHint: press F (or pass -F) to search for the text literally."
+    end
+    return message
+end
+
 -- Run ripgrep and parse its --vimgrep output.
 -- Returns the list of matches, plus an error message when the search could
--- not run.
+-- not run. rg's stderr is merged into the output: every match line follows
+-- the vimgrep format, so any other line is a diagnostic. Diagnostics only
+-- count as a failure when there are no matches, so a few unreadable files
+-- (for example "Access denied") do not hide real results.
 function Engine.run_rg(pattern, search_path, opts)
     if not pattern or #pattern == 0 then
         return {}
@@ -522,17 +547,22 @@ function Engine.run_rg(pattern, search_path, opts)
     end
 
     local target = (search_path and #search_path > 0) and (" " .. shell_quote(search_path)) or ""
-    local err_redir = IS_WINDOWS and " 2>nul" or " 2>/dev/null"
-    local cmd = "rg " .. table.concat(flags, " ") .. target .. err_redir
+    local cmd = "rg " .. table.concat(flags, " ") .. target .. " 2>&1"
 
     local results = {}
-    local p = io.popen(cmd, "r")
+    local diagnostic_lines = {}
+    local p, popen_err = io.popen(cmd, "r")
     if p then
         for line in p:lines() do
             local parsed = parse_vimgrep_line(line)
             if parsed then
                 table.insert(results, parsed)
                 if #results >= 1000 then break end
+            elseif #diagnostic_lines < MAX_DIAGNOSTIC_LINES then
+                local clean_line = line:gsub("\r$", "")
+                if clean_line:find("%S") then
+                    table.insert(diagnostic_lines, clean_line)
+                end
             end
         end
         p:close()
@@ -540,6 +570,13 @@ function Engine.run_rg(pattern, search_path, opts)
 
     if pattern_path then
         os.remove(pattern_path)
+    end
+
+    if not p then
+        return {}, "could not start rg: " .. tostring(popen_err)
+    end
+    if #results == 0 and #diagnostic_lines > 0 then
+        return {}, describe_rg_failure(diagnostic_lines)
     end
     return results
 end
@@ -759,20 +796,26 @@ local function run_tui(initial_pattern, search_path, init_opts)
             if #state.pattern == 0 then
                 table.insert(r_lines, C.gray .. " Type a search pattern and press Enter." .. C.reset)
             elseif state.search_error then
-                -- Word-wrap so the reason is not cut off by the pane width.
+                -- Word-wrap each message line so the reason is not cut off by
+                -- the pane width. Leading indentation is kept so rg's `^`
+                -- marker stays under the offending regex character.
                 local wrap_width = math.max(10, right_w - 2)
-                local current_line = ""
-                for word in ("Search failed: " .. state.search_error):gmatch("%S+") do
-                    if #current_line > 0 and #current_line + 1 + #word > wrap_width then
-                        table.insert(r_lines, C.b_red .. " " .. current_line .. C.reset)
-                        current_line = word
-                    elseif #current_line > 0 then
-                        current_line = current_line .. " " .. word
-                    else
-                        current_line = word
+                table.insert(r_lines, C.b_red .. " Search failed:" .. C.reset)
+                for message_line in (state.search_error .. "\n"):gmatch("(.-)\n") do
+                    local indent = message_line:match("^%s*")
+                    local current_line = indent
+                    for word in message_line:gmatch("%S+") do
+                        if #current_line > #indent and #current_line + 1 + #word > wrap_width then
+                            table.insert(r_lines, C.b_red .. " " .. current_line .. C.reset)
+                            current_line = indent .. word
+                        elseif #current_line > #indent then
+                            current_line = current_line .. " " .. word
+                        else
+                            current_line = current_line .. word
+                        end
                     end
+                    table.insert(r_lines, C.b_red .. " " .. current_line .. C.reset)
                 end
-                table.insert(r_lines, C.b_red .. " " .. current_line .. C.reset)
             else
                 table.insert(r_lines, C.gray .. " No matches found." .. C.reset)
             end
@@ -1030,7 +1073,7 @@ end
 local function cmd_list(pattern, search_path, opts)
     local results, search_err = Engine.run_rg(pattern, search_path, opts)
     if search_err then
-        io.stderr:write("frg: search failed: " .. search_err .. "\n")
+        io.stderr:write("frg: search failed:\n" .. search_err .. "\n")
         os.exit(2)
     end
     for _, r in ipairs(results) do
@@ -1135,6 +1178,33 @@ local function run_tests()
         assert_eq("run_rg rejects a pattern with a line break",
             #multiline_matches == 0 and tostring(multiline_err):find("line break") ~= nil, true)
     end
+
+    -- rg failures must be reported, not shown as "no matches".
+    local regex_matches_bad, regex_err = Engine.run_rg("a(b", fixture_path, {})
+    assert_eq("run_rg reports an invalid regex",
+        #regex_matches_bad == 0 and tostring(regex_err):find("regex parse error", 1, true) ~= nil, true)
+    assert_eq("run_rg suggests a literal search for an invalid regex",
+        tostring(regex_err):find("press F", 1, true) ~= nil, true)
+
+    local literal_matches, literal_err = Engine.run_rg("a(b", fixture_path, { fixed = true })
+    assert_eq("run_rg -F with regex characters is not an error",
+        #literal_matches == 0 and literal_err == nil, true)
+
+    local missing_path = fixture_path .. ".missing"
+    local missing_matches, missing_err = Engine.run_rg("x", missing_path, {})
+    assert_eq("run_rg reports a missing search path",
+        #missing_matches == 0 and tostring(missing_err):find("frg_pattern_selftest.txt.missing", 1, true) ~= nil,
+        true)
+
+    local nothing_matches, nothing_err = Engine.run_rg("no_such_text_xyz", fixture_path, {})
+    assert_eq("run_rg with no matches is not an error",
+        #nothing_matches == 0 and nothing_err == nil, true)
+
+    assert_eq("describe_rg_failure explains a missing rg",
+        describe_rg_failure({ "'rg' is not recognized as an internal or external command," })
+            :find("not installed or not on PATH", 1, true) ~= nil, true)
+    assert_eq("describe_rg_failure explains a missing rg on POSIX",
+        describe_rg_failure({ "sh: 1: rg: not found" }):find("not installed", 1, true) ~= nil, true)
     os.remove(fixture_path)
 
     print(string.format("\nSelf-test summary: %d passed, %d failed.", passed, failed))
