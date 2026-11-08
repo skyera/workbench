@@ -154,7 +154,8 @@ When the user asks to implement, modify, fix, or update something (e.g., *"fix .
     *   **"next"**: Move to the next open issue and present it for review only. Show, in order: (1) **Problem**: what the user sees, with a reproduction or evidence; (2) **Root Cause**: why it happens, with `file:line` references; (3) **Solution**: the proposed fix, error handling, and verification plan; (4) **Code Change**: a before/after diff of the exact code to change. Then ask for approval (*"Approve? Reply 'doit' or 'ship'."*). "next" is NOT approval: do not modify files.
     *   **"doit"** / **"do it"**: Treat as approval. Proceed immediately with implementation and verification without asking for confirmation. Do not commit or push unless also asked.
     *   **"ship"**: Treat as approval for the whole flow: implement, verify, commit, and push, without stopping to ask (see Commit Workflow).
-    *   If the user has indicated **"approve always"**, **"auto approve"**, or explicitly asks to fix/implement directly: proceed immediately with implementation and verification without asking for confirmation.
+    *   **"fix it"** / **"fix #N"**: Same as "ship": implement, verify, commit, and push, without stopping to ask.
+    *   If the user has indicated **"approve always"**, **"auto approve"**, or explicitly asks to implement directly: proceed immediately with implementation and verification without asking for confirmation.
     *   If the user requests to see a draft or review first (e.g., *"show me the draft"*, *"let me review before commit/modify"*): **display the draft and WAIT for user approval before writing or modifying any files.**
     *   Otherwise: **WAIT for user approval before applying changes or starting implementation.**
 
@@ -164,3 +165,13 @@ When the user asks to implement, modify, fix, or update something (e.g., *"fix .
 *   **"commit"**: When the user says "commit", create the commit(s) locally. Do NOT push.
 *   **"push"**: When the user says "push", push all local commits to the remote repository.
 *   **"ship"**: When the user says "ship", it means approve + implement + verify + commit + push. Implement the proposed change(s) if not yet applied, run the verification plan, and only if verification passes, create atomic commit(s) locally and push to the remote repository. If verification fails, stop, report the failure output, and do not commit or push.
+*   **"fix it"** / **"fix #N"**: Same as "ship".
+*   **Show the Result**: After any commit or push ("commit", "push", "ship", "fix it"), end the response with a short status block proving it happened, taken from real command output (never assumed):
+
+    ```
+    Committed: 061c9b2 fix(dotag): honor .gitignore by listing files with git ls-files
+    Pushed:    6363829..061c9b2  master -> master
+    Branch:    master...origin/master (in sync, working tree clean)
+    ```
+
+    If a step did not happen (e.g., commit only, push failed, verification failed), say so explicitly in the block with the error output.
