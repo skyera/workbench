@@ -87,6 +87,7 @@ if IS_WINDOWS then
         int SetEnvironmentVariableA(const char* lpName, const char* lpValue);
         DWORD GetCurrentDirectoryA(DWORD nBufferLength, char* lpBuffer);
         BOOL SetCurrentDirectoryA(const char* lpPathName);
+        DWORD GetFileAttributesA(const char* lpFileName);
         BOOL CreateDirectoryA(const char* lpPathName, void* lpSecurityAttributes);
         BOOL RemoveDirectoryA(const char* lpPathName);
         DWORD GetLastError(void);
@@ -187,6 +188,7 @@ else
         int clock_gettime(int clk_id, struct timespec *tp);
         int open(const char *pathname, int flags, ...);
         int chdir(const char *path);
+        int access(const char *pathname, int mode);
         int mkdir(const char *pathname, unsigned int mode);
         int rmdir(const char *pathname);
         char *strerror(int errnum);
@@ -399,6 +401,17 @@ local function get_temp_root()
 
     local normalized = clean_path(temp_root):gsub("/+$", "")
     return normalized
+end
+
+local POSIX_ACCESS_EXISTS = 0                 -- access() F_OK
+local WIN32_INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
+
+-- Returns true when `path` exists as a file or a directory.
+local function path_exists(path)
+    if IS_WINDOWS then
+        return ffi.C.GetFileAttributesA(path) ~= WIN32_INVALID_FILE_ATTRIBUTES
+    end
+    return ffi.C.access(path, POSIX_ACCESS_EXISTS) == 0
 end
 
 -- Changes the process working directory.
@@ -1296,7 +1309,7 @@ end
 --------------------------------------------------------------------------------
 local TUI = {
     method = "ffi", -- "ffi", "fd", "find"
-    clean_before = true,
+    clean_before = false, -- opt-in, like batch mode's -c
     no_ignore = false,
     extensions = {},
     excluded_dirs = {},
@@ -2061,13 +2074,101 @@ function TUI.render_modal(cols, rows, buf)
 end
 
 --------------------------------------------------------------------------------
+-- Launch Safety (auto-run only inside something that looks like a project)
+--------------------------------------------------------------------------------
+
+-- A directory containing any of these is treated as a project to index.
+local PROJECT_MARKERS = {
+    ".git",
+    ".svn",
+    ".hg",
+    CSCOPE_FILE_NAME,
+    TAGS_FILE_NAME,
+    FILENAMETAG_FILE_NAME,
+}
+
+-- Normalizes a directory path for comparison: forward slashes, no trailing
+-- slash (except a root), and lowercase on Windows where paths ignore case.
+local function normalize_dir_for_compare(path)
+    local normalized = clean_path(path or "")
+    if #normalized > 1 and not normalized:match("^%a:/$") then
+        normalized = normalized:gsub("/+$", "")
+    end
+    if IS_WINDOWS then
+        normalized = normalized:lower()
+    end
+    return normalized
+end
+
+-- Returns the first project marker present in the working directory, or nil.
+local function find_project_marker()
+    for _, marker in ipairs(PROJECT_MARKERS) do
+        if path_exists(marker) then
+            return marker
+        end
+    end
+    return nil
+end
+
+-- Decides whether the TUI may start indexing on launch without a key press.
+-- Pure function for testing: `project_marker` is nil when none was found.
+-- Returns true plus the marker, or false plus a reason for the activity log.
+local function decide_auto_run(cwd, home_dir, project_marker)
+    local normalized_cwd = normalize_dir_for_compare(cwd)
+    local is_root = normalized_cwd == "/" or normalized_cwd:match("^%a:/?$") ~= nil
+    if is_root then
+        return false, "the current directory is a filesystem root"
+    end
+
+    if home_dir and home_dir ~= "" then
+        if normalized_cwd == normalize_dir_for_compare(home_dir) then
+            return false, "the current directory is your home directory"
+        end
+    end
+
+    if not project_marker then
+        return false, "no .git/.svn/.hg or existing tags/cscope files here"
+    end
+    return true, project_marker
+end
+
+-- Copies command-line options into the TUI so `dotag -c`, `-f` and `-I`
+-- also apply in interactive mode.
+function TUI.apply_launch_options(options)
+    if not options then
+        return
+    end
+    TUI.clean_before = options.clean
+    TUI.method = options.method
+    TUI.no_ignore = options.no_ignore
+end
+
+-- Starts the first run automatically only when it is safe to do so.
+function TUI.auto_run_on_launch()
+    local home_dir = os.getenv("HOME") or os.getenv("USERPROFILE")
+    local should_run, detail = decide_auto_run(get_cwd(), home_dir, find_project_marker())
+    if should_run then
+        TUI.log(string.format("[INFO] Project detected (%s); starting indexing.", detail))
+        TUI.start_pipeline()
+        return
+    end
+
+    TUI.log(string.format(
+        "[INFO] Auto-run skipped: %s. Press Space to index %s.",
+        detail,
+        get_cwd()
+    ))
+end
+
+--------------------------------------------------------------------------------
 -- Interactive TUI Loop
 --------------------------------------------------------------------------------
-function TUI.run()
+function TUI.run(options)
+    TUI.apply_launch_options(options)
     Term.init()
     Term.enable_raw()
     TUI.init_config()
-    TUI.start_pipeline()
+    TUI.auto_run_on_launch()
 
     local running = true
     local needs_render = true
@@ -2769,6 +2870,28 @@ local function run_pure_tests(tester)
     assert_eq(process_succeeded({ exit_code = 0 }), true, "exit 0 succeeded")
     assert_eq(process_succeeded({ signal = 11 }), false, "Signal is a failure")
     assert_eq(process_succeeded({ exit_code = 1 }), false, "exit 1 is a failure")
+
+    -- Test 13: Launch auto-run safety
+    print("\n[Test 13] Launch Auto-Run Safety...")
+    local should_run, detail = decide_auto_run("/home/me/proj", "/home/me", ".git")
+    assert_eq(should_run, true, "Project with .git auto-runs")
+    assert_eq(detail, ".git", "Reports the marker that was found")
+    should_run = decide_auto_run("/home/me/proj", "/home/me", "tags")
+    assert_eq(should_run, true, "Directory with existing tags auto-runs")
+
+    should_run, detail = decide_auto_run("/home/me", "/home/me", ".git")
+    assert_eq(should_run, false, "Home directory never auto-runs, even with .git")
+    assert_eq(detail:find("home directory", 1, true) ~= nil, true, "Home skip reason")
+    should_run = decide_auto_run("/home/me/", "/home/me", ".git")
+    assert_eq(should_run, false, "Home with trailing slash is still home")
+    should_run = decide_auto_run("/", "/home/me", ".git")
+    assert_eq(should_run, false, "Filesystem root never auto-runs")
+    should_run = decide_auto_run("C:/", "C:/Users/me", ".git")
+    assert_eq(should_run, false, "Windows drive root never auto-runs")
+
+    should_run, detail = decide_auto_run("/home/me/Downloads", "/home/me", nil)
+    assert_eq(should_run, false, "No project marker means no auto-run")
+    assert_eq(detail:find("no .git", 1, true) ~= nil, true, "No-marker skip reason")
 end
 
 -- Test 1: filenametags generation and foldcase ordering.
@@ -2970,8 +3093,8 @@ end
 -- Runs the TUI and always restores the terminal, even when a Lua error
 -- escapes. Without this, a crash leaves the shell in raw mode with no echo,
 -- the cursor hidden and the alternate screen still active.
-local function run_tui_safely()
-    local succeeded, error_trace = xpcall(TUI.run, debug.traceback)
+local function run_tui_safely(options)
+    local succeeded, error_trace = xpcall(TUI.run, debug.traceback, options)
     Term.restore()
     if succeeded then
         return
@@ -3024,7 +3147,7 @@ local function main(args)
         os.exit(run_cli_batch(options))
     end
 
-    run_tui_safely()
+    run_tui_safely(options)
 end
 
 main(arg)
