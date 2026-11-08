@@ -214,8 +214,7 @@ else
         // POSIX Process Management
         int pipe(int pipefd[2]);
         int fork(void);
-        int execlp(const char *file, const char *arg0, ...);
-        int execvp(const char *file, char *const argv[]);
+        int execl(const char *path, const char *arg0, ...);
         int waitpid(int pid, int *status, int options);
         int kill(int pid, int sig);
         int close(int fd);
@@ -1249,6 +1248,7 @@ local STDOUT_FD = 1
 local STDERR_FD = 2
 local WNOHANG = 1
 local EXIT_COMMAND_NOT_FOUND = 127
+local POSIX_SHELL_PATH = "/bin/sh"  -- same shell as os.execute / system()
 local SHELL_SIGNAL_EXIT_BASE = 128
 local MAX_LOGGED_ERROR_LINES = 5
 
@@ -1418,7 +1418,9 @@ function ProcessRunner.spawn_async(cmd_str, stderr_path)
             -- Child: stdout is discarded; stderr goes to `stderr_path` so the
             -- parent can show the tool's own error message after it exits.
             redirect_child_output(stderr_path)
-            ffi.C.execlp("sh", "sh", "-c", cmd_str, nil)
+            -- Absolute path like system(): a PATH without sh must not make
+            -- every tool fail with exit 127.
+            ffi.C.execl(POSIX_SHELL_PATH, "sh", "-c", cmd_str, nil)
 
             -- exec failed: leave without running the parent's Lua/stdio cleanup.
             ffi.C._exit(EXIT_COMMAND_NOT_FOUND)
