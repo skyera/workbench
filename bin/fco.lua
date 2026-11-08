@@ -335,9 +335,11 @@ end
 local Term = {
     orig_in_mode = nil,
     orig_out_mode = nil,
+    orig_err_mode = nil,
     orig_termios = nil,
     hIn = nil,
     hOut = nil,
+    hErr = nil,
     is_raw = false,
 }
 
@@ -347,17 +349,32 @@ function Term.init()
             ffi.C.SetConsoleOutputCP(65001)
             ffi.C.SetConsoleCP(65001)
         end)
-        Term.hIn = ffi.C.GetStdHandle(ffi.cast("DWORD", -10))
-        Term.hOut = ffi.C.GetStdHandle(ffi.cast("DWORD", -11))
+        Term.hIn = ffi.C.GetStdHandle(ffi.cast("DWORD", -10))   -- STD_INPUT_HANDLE
+        Term.hOut = ffi.C.GetStdHandle(ffi.cast("DWORD", -11))  -- STD_OUTPUT_HANDLE
+        Term.hErr = ffi.C.GetStdHandle(ffi.cast("DWORD", -12))  -- STD_ERROR_HANDLE
 
-        if Term.hOut ~= nil and Term.hOut ~= ffi.cast("HANDLE", -1) then
-            local mode = ffi.new("DWORD[1]")
-            if ffi.C.GetConsoleMode(Term.hOut, mode) ~= 0 then
-                Term.orig_out_mode = mode[0]
-                ffi.C.SetConsoleMode(Term.hOut, bit.bor(mode[0], 0x0004)) -- ENABLE_VIRTUAL_TERMINAL_PROCESSING
-            end
-        end
+        -- Colored errors and hints go to stderr, so both streams need VT.
+        Term.orig_out_mode = Term.enable_virtual_terminal(Term.hOut)
+        Term.orig_err_mode = Term.enable_virtual_terminal(Term.hErr)
     end
+end
+
+-- Turns on ENABLE_VIRTUAL_TERMINAL_PROCESSING (0x0004) for a console output
+-- handle. Returns the previous mode, or nil when the handle is not a console
+-- (for example, redirected to a file or pipe).
+function Term.enable_virtual_terminal(handle)
+    if handle == nil or handle == ffi.cast("HANDLE", -1) then
+        return nil
+    end
+
+    local mode = ffi.new("DWORD[1]")
+    if ffi.C.GetConsoleMode(handle, mode) == 0 then
+        return nil
+    end
+
+    local original_mode = mode[0]
+    ffi.C.SetConsoleMode(handle, bit.bor(original_mode, 0x0004))
+    return original_mode
 end
 
 function Term.enable_raw()
@@ -399,6 +416,9 @@ function Term.restore()
         end
         if Term.orig_out_mode and Term.hOut ~= nil and Term.hOut ~= ffi.cast("HANDLE", -1) then
             ffi.C.SetConsoleMode(Term.hOut, Term.orig_out_mode)
+        end
+        if Term.orig_err_mode and Term.hErr ~= nil and Term.hErr ~= ffi.cast("HANDLE", -1) then
+            ffi.C.SetConsoleMode(Term.hErr, Term.orig_err_mode)
         end
     else
         if Term.orig_termios then
@@ -1780,6 +1800,10 @@ local function run_cli_list(force, filter_type, submodule)
 end
 
 local function run_cli_checkout(target_name, force, submodule)
+    -- Batch mode never starts the TUI, so enable VT here for the colored
+    -- [SUCCESS]/[ERROR]/[HINT] lines written to stdout and stderr.
+    Term.init()
+
     local items = Git.fetch_all_refs()
     local matched = nil
 
