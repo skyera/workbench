@@ -892,6 +892,18 @@ local function write_cscope_files(files, target_file)
     return true, #files
 end
 
+-- Orders filenametags entries for "!_TAG_FILE_SORTED 2" (foldcase).
+-- Vim's binary search and GNU `sort -f` compare with ASCII letters folded to
+-- UPPERCASE, so "[ \ ] ^ _ `" (0x5B-0x60) sort after "Z". Folding to
+-- lowercase would put "_init.py" before "a.c", and Vim could not find it.
+-- Ties fall back to raw bytes, which reproduces `LC_ALL=C sort -f` exactly.
+local function compare_foldcase_entries(left, right)
+    if left.folded_line ~= right.folded_line then
+        return left.folded_line < right.folded_line
+    end
+    return left.line < right.line
+end
+
 local function generate_filenametags(cscope_file, output_file)
     cscope_file = cscope_file or CSCOPE_FILE_NAME
     output_file = output_file or FILENAMETAG_FILE_NAME
@@ -905,23 +917,19 @@ local function generate_filenametags(cscope_file, output_file)
         local path = line:gsub('^"(.*)"$', "%1"):gsub("[\r\n]", "")
         if #path > 0 then
             local filename = path:match("([^/\\]+)$") or path
+            local tag_line = filename .. "\t" .. path
             count = count + 1
             entries[count] = {
-                tag   = filename,
-                path  = path,
-                lower = filename:lower(),
+                tag = filename,
+                path = path,
+                line = tag_line,
+                folded_line = tag_line:upper(),
             }
         end
     end
     f:close()
 
-    -- In-memory foldcase sort matching GNU sort -f
-    table.sort(entries, function(a, b)
-        if a.lower == b.lower then
-            return a.path < b.path
-        end
-        return a.lower < b.lower
-    end)
+    table.sort(entries, compare_foldcase_entries)
 
     local out, err = io.open(output_file, "w")
     if not out then return false, err end
@@ -2304,11 +2312,15 @@ local function test_filenametags_sort(tester, sandbox)
 
     local test_cscope = "_test_cscope.files"
     local test_tags = "_test_filenametags"
-    sandbox_write_file(sandbox, test_cscope, "src/B.c\nsrc/a.c\nsrc/c.C\n")
+    sandbox_write_file(
+        sandbox,
+        test_cscope,
+        "src/B.c\nsrc/__init__.py\nsrc/a.c\nsrc/_private.py\nsrc/Zeta.py\nsrc/c.C\n"
+    )
 
     local ok_fn, count_fn = generate_filenametags(test_cscope, test_tags)
     assert_eq(ok_fn, true, "generate_filenametags status")
-    assert_eq(count_fn, 3, "generate_filenametags item count")
+    assert_eq(count_fn, 6, "generate_filenametags item count")
 
     local lines = {}
     for line in io.lines(test_tags) do
@@ -2318,6 +2330,9 @@ local function test_filenametags_sort(tester, sandbox)
     assert_eq(lines[2], "a.c\tsrc/a.c\t1", "Foldcase sort order item 1 (a.c)")
     assert_eq(lines[3], "B.c\tsrc/B.c\t1", "Foldcase sort order item 2 (B.c)")
     assert_eq(lines[4], "c.C\tsrc/c.C\t1", "Foldcase sort order item 3 (c.C)")
+    assert_eq(lines[5], "Zeta.py\tsrc/Zeta.py\t1", "Letters sort before '_' (Zeta.py)")
+    assert_eq(lines[6], "_private.py\tsrc/_private.py\t1", "'_' sorts after 'Z' (_private.py)")
+    assert_eq(lines[7], "__init__.py\tsrc/__init__.py\t1", "Uppercase-fold order (__init__.py)")
 end
 
 -- Test 3: the native crawler finds sources and honors exclusions,
