@@ -414,6 +414,48 @@ local function path_exists(path)
     return ffi.C.access(path, POSIX_ACCESS_EXISTS) == 0
 end
 
+-- Returns a temp file path that is unique per call, e.g. for capturing stderr.
+local function make_unique_temp_path(prefix, extension)
+    local microseconds = math.floor((get_time_sec() % 1) * 1e6)
+    return string.format(
+        "%s/%s-%d-%06d-%d%s",
+        get_temp_root(),
+        prefix,
+        os.time(),
+        microseconds,
+        math.random(1, 999999),
+        extension
+    )
+end
+
+-- Reads up to `max_lines` non-empty lines from a captured stderr file, then
+-- deletes the file. Returns the lines and how many further lines were left out.
+local function read_and_remove_error_lines(path, max_lines)
+    local lines = {}
+    local omitted_count = 0
+    if not path then
+        return lines, omitted_count
+    end
+
+    local file = io.open(path, "r")
+    if file then
+        for line in file:lines() do
+            local trimmed = line:gsub("%s+$", "")
+            if trimmed ~= "" then
+                if #lines < max_lines then
+                    table.insert(lines, trimmed)
+                else
+                    omitted_count = omitted_count + 1
+                end
+            end
+        end
+        file:close()
+    end
+
+    os.remove(path)
+    return lines, omitted_count
+end
+
 -- Changes the process working directory.
 -- Returns true, or false plus the OS error text.
 local function change_directory(path)
@@ -820,34 +862,61 @@ local function is_dir_excluded(dir_name, excluded_set)
     return excluded_set[dir_name:lower()] == true
 end
 
+-- Hidden entries start with "." on every platform this tool targets.
+local function is_hidden_name(name)
+    return name:sub(1, 1) == "."
+end
+
+-- Returns true when the native crawler should recurse into directory `name`.
+-- `rules` holds excluded_set, ext_set and skip_hidden_dirs.
+local function should_descend_into(name, rules)
+    if is_dir_excluded(name, rules.excluded_set) then
+        return false
+    end
+    if rules.skip_hidden_dirs and is_hidden_name(name) then
+        return false
+    end
+    return true
+end
+
+-- Adds `rel_path` to `files_out` when its extension is wanted. Paths with
+-- spaces are skipped with a warning because ctags -L cannot quote them.
+local function add_candidate_file(rel_path, file_name, rules, files_out, warnings_out)
+    local ext = file_name:match("(%.[^.]+)$")
+    if not ext or not rules.ext_set[ext:lower()] then
+        return
+    end
+
+    if rel_path:find(" ") then
+        if warnings_out then
+            table.insert(warnings_out, rel_path .. " has spaces (skipped)")
+        end
+        return
+    end
+    table.insert(files_out, rel_path)
+end
+
 -- Win32 High-Speed Crawler via FindFirstFileW
-local function crawl_win32(dir_path, excluded_set, ext_set, files_out, warnings_out)
+local function crawl_win32(dir_path, rules, files_out, warnings_out)
     local pattern = dir_path .. "\\*"
     local wpattern = to_wide(pattern)
     local find_data = ffi.new("WIN32_FIND_DATAW")
     local hFind = ffi.C.FindFirstFileW(wpattern, find_data)
-    if hFind == ffi.cast("HANDLE", -1) or hFind == nil then return end
+    if hFind == ffi.cast("HANDLE", -1) or hFind == nil then
+        return
+    end
 
     repeat
         local name = from_wide(find_data.cFileName)
         if name ~= "." and name ~= ".." then
             local is_dir = bit.band(find_data.dwFileAttributes, 0x10) ~= 0
             if is_dir then
-                if not is_dir_excluded(name, excluded_set) then
-                    crawl_win32(dir_path .. "\\" .. name, excluded_set, ext_set, files_out, warnings_out)
+                if should_descend_into(name, rules) then
+                    crawl_win32(dir_path .. "\\" .. name, rules, files_out, warnings_out)
                 end
             else
-                local ext = name:match("(%.[^.]+)$")
-                if ext and ext_set[ext:lower()] then
-                    local rel_path = clean_path(dir_path .. "/" .. name):gsub("^%./", "")
-                    if rel_path:find(" ") then
-                        if warnings_out then
-                            table.insert(warnings_out, rel_path .. " has spaces (skipped)")
-                        end
-                    else
-                        table.insert(files_out, rel_path)
-                    end
-                end
+                local rel_path = clean_path(dir_path .. "/" .. name):gsub("^%./", "")
+                add_candidate_file(rel_path, name, rules, files_out, warnings_out)
             end
         end
     until ffi.C.FindNextFileW(hFind, find_data) == 0
@@ -856,13 +925,18 @@ local function crawl_win32(dir_path, excluded_set, ext_set, files_out, warnings_
 end
 
 -- POSIX High-Speed Crawler via opendir/readdir
-local function crawl_posix(dir_path, excluded_set, ext_set, files_out, warnings_out)
+local function crawl_posix(dir_path, rules, files_out, warnings_out)
     local dir = ffi.C.opendir(dir_path)
-    if dir == nil then return end
+    if dir == nil then
+        return
+    end
 
     while true do
         local entry = ffi.C.readdir(dir)
-        if entry == nil then break end
+        if entry == nil then
+            break
+        end
+
         local name = ffi.string(entry.d_name)
         if name ~= "." and name ~= ".." then
             local full_path = dir_path .. "/" .. name
@@ -875,21 +949,12 @@ local function crawl_posix(dir_path, excluded_set, ext_set, files_out, warnings_
             end
 
             if is_dir then
-                if not is_dir_excluded(name, excluded_set) then
-                    crawl_posix(full_path, excluded_set, ext_set, files_out, warnings_out)
+                if should_descend_into(name, rules) then
+                    crawl_posix(full_path, rules, files_out, warnings_out)
                 end
             else
-                local ext = name:match("(%.[^.]+)$")
-                if ext and ext_set[ext:lower()] then
-                    local rel_path = clean_path(full_path):gsub("^%./", "")
-                    if rel_path:find(" ") then
-                        if warnings_out then
-                            table.insert(warnings_out, rel_path .. " has spaces (skipped)")
-                        end
-                    else
-                        table.insert(files_out, rel_path)
-                    end
-                end
+                local rel_path = clean_path(full_path):gsub("^%./", "")
+                add_candidate_file(rel_path, name, rules, files_out, warnings_out)
             end
         end
     end
@@ -897,46 +962,142 @@ local function crawl_posix(dir_path, excluded_set, ext_set, files_out, warnings_
     ffi.C.closedir(dir)
 end
 
--- Crawler Facade
-local function crawl_directory(method, root_dir, excl_list, ext_list, no_ignore, warnings_out)
+-- Returns true when the working directory is inside a git work tree
+-- (false as well when git itself is not installed).
+local function is_inside_git_work_tree()
+    local null_device = IS_WINDOWS and "nul" or "/dev/null"
+    local result = os.execute(
+        "git rev-parse --is-inside-work-tree >" .. null_device .. " 2>" .. null_device
+    )
+    return result == 0 or result == true
+end
+
+-- Returns true when any directory component of `rel_path` is excluded.
+local function path_has_excluded_dir(rel_path, excluded_set)
+    for directory_name in rel_path:gmatch("([^/]+)/") do
+        if is_dir_excluded(directory_name, excluded_set) then
+            return true
+        end
+    end
+    return false
+end
+
+-- Lists source files with git, so .gitignore, .git/info/exclude and the
+-- global excludes file apply exactly as git applies them. Untracked files
+-- that are not ignored are included; tracked files deleted from disk are not.
+-- Returns the file list, or nil plus an error message.
+local function list_git_files(rules, warnings_out)
+    local stderr_path = make_unique_temp_path("dotag-git", ".err")
+    local command = string.format(
+        'git ls-files --cached --others --exclude-standard -z 2>"%s"',
+        stderr_path
+    )
+
+    local pipe = io.popen(command)
+    if not pipe then
+        os.remove(stderr_path)
+        return nil, "cannot start git ls-files"
+    end
+    local output = pipe:read("*a") or ""
+    pipe:close()
+
+    -- LuaJIT's pipe:close() has no exit status, so failure shows up on stderr.
+    local error_lines = read_and_remove_error_lines(stderr_path, 1)
+    if #error_lines > 0 then
+        return nil, "git ls-files failed: " .. error_lines[1]
+    end
+
+    -- -z separates paths with NUL and disables git's path quoting.
     local files_out = {}
-    local ext_set = build_ext_set(ext_list)
-    local excluded_set = build_excluded_set(excl_list)
+    for rel_path in output:gmatch("([^%z]+)") do
+        local file_name = rel_path:match("([^/]+)$") or rel_path
+        local wanted = not path_has_excluded_dir(rel_path, rules.excluded_set)
+        if wanted and path_exists(rel_path) then
+            add_candidate_file(rel_path, file_name, rules, files_out, warnings_out)
+        end
+    end
+    return files_out
+end
+
+-- Lists source files with fd. Returns the file list, or nil plus an error.
+local function list_fd_files(ext_list, excl_list, no_ignore, warnings_out)
+    local cmd = "fd --type f --ignore-case"
+    if no_ignore then
+        cmd = cmd .. " --no-ignore --hidden"
+    end
+    for _, ext in ipairs(ext_list) do
+        cmd = cmd .. " -e " .. ext:gsub("^%.", "")
+    end
+    for _, pat in ipairs(excl_list) do
+        cmd = cmd .. " --exclude " .. pat
+    end
+
+    local pipe = io.popen(cmd)
+    if not pipe then
+        return nil, "cannot start fd"
+    end
+
+    local files_out = {}
+    for line in pipe:lines() do
+        local cleaned = clean_path(line):gsub("^%./", "")
+        if cleaned:find(" ") then
+            if warnings_out then
+                table.insert(warnings_out, cleaned .. " has spaces (skipped)")
+            end
+        else
+            table.insert(files_out, cleaned)
+        end
+    end
+    pipe:close()
+    return files_out
+end
+
+-- Crawler Facade. Picks the file source and returns the file list plus a short
+-- description of that source (shown in the TUI and batch output), or nil plus
+-- an error message.
+--   fd                    -> fd (honors .gitignore unless no_ignore)
+--   ffi in a git repo     -> git ls-files (exact .gitignore semantics)
+--   ffi outside git       -> native crawler, hidden directories skipped
+--   ffi with no_ignore    -> native crawler, no ignore rules, hidden included
+local function crawl_directory(method, root_dir, excl_list, ext_list, no_ignore, warnings_out)
+    local rules = {
+        ext_set = build_ext_set(ext_list),
+        excluded_set = build_excluded_set(excl_list),
+        skip_hidden_dirs = not no_ignore,
+    }
 
     if method == "fd" then
-        local cmd = "fd --type f --ignore-case"
-        if no_ignore then cmd = cmd .. " --no-ignore --hidden" end
-        for _, ext in ipairs(ext_list) do
-            cmd = cmd .. " -e " .. ext:gsub("^%.", "")
+        local fd_files, fd_error = list_fd_files(ext_list, excl_list, no_ignore, warnings_out)
+        if not fd_files then
+            return nil, fd_error
         end
-        for _, pat in ipairs(excl_list) do
-            cmd = cmd .. " --exclude " .. pat
+        if no_ignore then
+            return fd_files, "fd --no-ignore --hidden"
         end
-        local p = io.popen(cmd)
-        if p then
-            for line in p:lines() do
-                local cleaned = clean_path(line):gsub("^%./", "")
-                if cleaned:find(" ") then
-                    if warnings_out then
-                        table.insert(warnings_out, cleaned .. " has spaces (skipped)")
-                    end
-                else
-                    table.insert(files_out, cleaned)
-                end
-            end
-            p:close()
-            return files_out
-        end
+        return fd_files, "fd (respects .gitignore)"
     end
 
-    -- Default: Native FFI crawler
+    if not no_ignore and is_inside_git_work_tree() then
+        local git_files, git_error = list_git_files(rules, warnings_out)
+        if not git_files then
+            return nil, git_error .. " (use -I or press 'i' to crawl without git)"
+        end
+        return git_files, "git ls-files (respects .gitignore)"
+    end
+
+    -- Native FFI crawler
+    local files_out = {}
     if IS_WINDOWS then
-        crawl_win32(root_dir, excluded_set, ext_set, files_out, warnings_out)
+        crawl_win32(root_dir, rules, files_out, warnings_out)
     else
-        crawl_posix(root_dir, excluded_set, ext_set, files_out, warnings_out)
+        crawl_posix(root_dir, rules, files_out, warnings_out)
     end
 
-    return files_out
+    if no_ignore then
+        return files_out, "FFI crawler: ignore rules off, hidden directories included"
+    end
+    return files_out, "FFI crawler: not a git repo, so .gitignore is not applied;"
+        .. " hidden directories skipped"
 end
 
 --------------------------------------------------------------------------------
@@ -1103,34 +1264,6 @@ local function make_stderr_capture_path(tool_name)
         os.time(),
         microseconds
     )
-end
-
--- Reads up to `max_lines` non-empty lines from a captured stderr file, then
--- deletes the file. Returns the lines and how many further lines were left out.
-local function read_and_remove_error_lines(path, max_lines)
-    local lines = {}
-    local omitted_count = 0
-    if not path then
-        return lines, omitted_count
-    end
-
-    local file = io.open(path, "r")
-    if file then
-        for line in file:lines() do
-            local trimmed = line:gsub("%s+$", "")
-            if trimmed ~= "" then
-                if #lines < max_lines then
-                    table.insert(lines, trimmed)
-                else
-                    omitted_count = omitted_count + 1
-                end
-            end
-        end
-        file:close()
-    end
-
-    os.remove(path)
-    return lines, omitted_count
 end
 
 -- Runs in the forked child only: discards stdout and sends stderr to
@@ -1470,7 +1603,7 @@ function TUI.start_pipeline()
     TUI.steps.crawl.status = "RUNNING"
     TUI.log(string.format("[1/4] Crawling directory tree using [%s]...", TUI.method))
     local warnings = {}
-    local files = crawl_directory(
+    local files, file_source = crawl_directory(
         TUI.method,
         ".",
         TUI.get_active_excludes(),
@@ -1480,6 +1613,16 @@ function TUI.start_pipeline()
     )
     local t_crawl_elapsed = get_time_sec() - t_crawl_0
     TUI.steps.crawl.elapsed = t_crawl_elapsed
+
+    -- On failure `file_source` is the error message (e.g. git ls-files failed).
+    if not files then
+        TUI.log("[ERROR] File discovery failed: " .. file_source)
+        TUI.fail_crawl_step(file_source)
+        return
+    end
+
+    TUI.steps.crawl.msg = file_source
+    TUI.log("[INFO] File source: " .. file_source)
     TUI.steps.crawl.status = "DONE"
     TUI.total_files = #files
     TUI.discovery_time = t_crawl_elapsed
@@ -2547,7 +2690,7 @@ local function run_cli_batch(options)
     local t_start = get_time_sec()
     print("finding files...")
     local warnings = {}
-    local files = crawl_directory(
+    local files, file_source = crawl_directory(
         method,
         ".",
         DEFAULT_EXCLUDED_DIRS,
@@ -2556,6 +2699,14 @@ local function run_cli_batch(options)
         warnings
     )
     local t_found = get_time_sec() - t_start
+
+    -- On failure `file_source` is the error message (e.g. git ls-files failed).
+    if not files then
+        io.stdout:flush()
+        io.stderr:write("dotag: error: file discovery failed: " .. file_source .. "\n")
+        return EXIT_RUNTIME_ERROR
+    end
+    print("file source: " .. file_source)
     print(string.format("find files: number of files %d elapsed %.3f seconds", #files, t_found))
 
     for _, w in ipairs(warnings) do
@@ -2700,6 +2851,7 @@ local function create_test_sandbox()
         path = sandbox_path,
         directories = {}, -- relative paths, in creation order
         files = {},       -- relative paths of fixture files
+        foreign_trees = {}, -- relative dirs created by external tools (e.g. .git)
     }
 end
 
@@ -2748,6 +2900,22 @@ end
 -- Removes fixture files, generated outputs, sub-directories (deepest first),
 -- and finally the sandbox itself. Returns true, or false plus an error message.
 local function destroy_test_sandbox(sandbox)
+    -- Trees made by external tools (git init) have unknown contents, so they
+    -- are removed recursively, but only when the path is inside this sandbox.
+    for _, relative_dir in ipairs(sandbox.foreign_trees) do
+        local tree_path = sandbox.path .. "/" .. relative_dir
+        local inside_sandbox = tree_path:find(sandbox.path .. "/", 1, true) == 1
+            and sandbox.path:find("dotag-test-", 1, true) ~= nil
+            and not relative_dir:find("..", 1, true)
+        if inside_sandbox then
+            if IS_WINDOWS then
+                os.execute('rmdir /s /q "' .. tree_path:gsub("/", "\\") .. '"')
+            else
+                os.execute("rm -rf '" .. tree_path .. "'")
+            end
+        end
+    end
+
     for _, relative_path in ipairs(sandbox.files) do
         os.remove(sandbox.path .. "/" .. relative_path)
     end
@@ -2971,8 +3139,16 @@ local function test_native_crawler(tester, sandbox)
     sandbox_write_file(sandbox, "layout/view.lua", "return 2\n")
     sandbox_write_file(sandbox, "node_modules/dep.lua", "return 3\n")
     sandbox_write_file(sandbox, "out/generated.lua", "return 4\n")
+    sandbox_write_file(sandbox, ".hidden/secret.lua", "return 5\n")
 
-    local found_files = crawl_directory(
+    -- The sandbox should not be inside a git work tree; if TMPDIR is, git
+    -- would be used instead and these native-crawler checks do not apply.
+    if is_inside_git_work_tree() then
+        print("  [SKIP] TMPDIR is inside a git work tree; native crawler not used")
+        return
+    end
+
+    local found_files, file_source = crawl_directory(
         "ffi",
         ".",
         { "node_modules", "out" },
@@ -2989,6 +3165,23 @@ local function test_native_crawler(tester, sandbox)
     assert_eq(found_set["layout/view.lua"], true, "Crawler found layout/view.lua")
     assert_eq(found_set["node_modules/dep.lua"], nil, "Crawler skipped node_modules/dep.lua")
     assert_eq(found_set["out/generated.lua"], nil, "Crawler skipped out/generated.lua")
+    assert_eq(found_set[".hidden/secret.lua"], nil, "Hidden directory skipped by default")
+    assert_eq(file_source:find("not a git repo", 1, true) ~= nil, true, "Source says no git")
+
+    local all_files, all_source = crawl_directory(
+        "ffi",
+        ".",
+        { "node_modules", "out" },
+        { ".lua" },
+        true,
+        {}
+    )
+    local all_set = {}
+    for _, path in ipairs(all_files) do
+        all_set[path] = true
+    end
+    assert_eq(all_set[".hidden/secret.lua"], true, "-I includes hidden directories")
+    assert_eq(all_source:find("ignore rules off", 1, true) ~= nil, true, "Source says -I")
 end
 
 -- Test 4: clean_all_databases removes every database file and nothing else.
@@ -3039,12 +3232,82 @@ local function test_error_line_capture(tester, sandbox)
     assert_eq(#lines, 0, "No capture path gives no lines")
 end
 
+-- Runs a git command inside `repo_dir`, quietly. Returns true on success.
+local function run_git_quietly(repo_dir, git_arguments)
+    local null_device = IS_WINDOWS and "nul" or "/dev/null"
+    local command = string.format(
+        'git -C "%s" %s >%s 2>%s',
+        repo_dir,
+        git_arguments,
+        null_device,
+        null_device
+    )
+    local result = os.execute(command)
+    return result == 0 or result == true
+end
+
+-- Test 14: inside a git repo, discovery follows .gitignore exactly.
+local function test_git_discovery(tester, sandbox)
+    local assert_eq = tester.assert_eq
+    print("\n[Test 14] git ls-files Discovery (sandbox repo)...")
+    if not command_exists("git") then
+        print("  [SKIP] git is not installed")
+        return
+    end
+
+    local repo = "gitrepo"
+    sandbox_write_file(sandbox, repo .. "/.gitignore", "ignored/\n*.gen.lua\n")
+    sandbox_write_file(sandbox, repo .. "/src/tracked.lua", "return 1\n")
+    sandbox_write_file(sandbox, repo .. "/src/deleted.lua", "return 2\n")
+    sandbox_write_file(sandbox, repo .. "/src/new_untracked.lua", "return 3\n")
+    sandbox_write_file(sandbox, repo .. "/src/build.gen.lua", "return 4\n")
+    sandbox_write_file(sandbox, repo .. "/ignored/skip.lua", "return 5\n")
+    sandbox_write_file(sandbox, repo .. "/node_modules/dep.lua", "return 6\n")
+    sandbox_write_file(sandbox, repo .. "/.github/ci.lua", "return 7\n")
+
+    local repo_path = sandbox.path .. "/" .. repo
+    table.insert(sandbox.foreign_trees, repo .. "/.git")
+    local repo_ready = run_git_quietly(repo_path, "init -q")
+        and run_git_quietly(repo_path, "add src/tracked.lua src/deleted.lua .github/ci.lua")
+        and run_git_quietly(repo_path, "-c user.email=t@example.com -c user.name=t commit -qm init")
+    if not repo_ready then
+        tester.fail("Could not create the sandbox git repository")
+        return
+    end
+    os.remove(repo_path .. "/src/deleted.lua")
+
+    change_directory(repo_path)
+    local found_files, file_source = crawl_directory(
+        "ffi",
+        ".",
+        { "node_modules" },
+        { ".lua" },
+        false,
+        {}
+    )
+    change_directory(sandbox.path)
+
+    local found_set = {}
+    for _, path in ipairs(found_files or {}) do
+        found_set[path] = true
+    end
+    assert_eq(file_source, "git ls-files (respects .gitignore)", "git is the file source")
+    assert_eq(found_set["src/tracked.lua"], true, "Tracked file listed")
+    assert_eq(found_set["src/new_untracked.lua"], true, "Untracked, not ignored file listed")
+    assert_eq(found_set["src/build.gen.lua"], nil, "*.gen.lua ignored by .gitignore")
+    assert_eq(found_set["ignored/skip.lua"], nil, "ignored/ excluded by .gitignore")
+    assert_eq(found_set["src/deleted.lua"], nil, "Tracked file deleted from disk skipped")
+    assert_eq(found_set["node_modules/dep.lua"], nil, "Excluded-dir rule still applies")
+    assert_eq(found_set[".github/ci.lua"], true, "Tracked file in hidden dir listed")
+end
+
 -- Tests that read or write files. Must run with the sandbox as working directory.
 local function run_filesystem_tests(tester, sandbox)
     test_filenametags_sort(tester, sandbox)
     test_native_crawler(tester, sandbox)
     test_database_cleanup(tester, sandbox)
     test_error_line_capture(tester, sandbox)
+    test_git_discovery(tester, sandbox)
 end
 
 -- Runs filesystem tests inside the sandbox, always restoring the original
