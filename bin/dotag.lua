@@ -15,9 +15,12 @@
     - Automated Test Suite (--test) for continuous regression testing.
 
   Usage:
-    luajit bin/dotag.lua [OPTIONS]
+    luajit bin/dotag.lua [OPTIONS] [DIRECTORY]
     luajit bin/dotag.lua --test
-    luajit bin/dotag.lua --batch [OPTIONS]
+    luajit bin/dotag.lua --batch [OPTIONS] [DIRECTORY]
+
+  DIRECTORY is the project to index (default: current directory). If it
+  cannot be entered, dotag exits with an error instead of indexing elsewhere.
 
   Options:
     -f, --find <METHOD>     Discovery method: ffi (default), fd, or find
@@ -1839,32 +1842,26 @@ function TUI.run()
 end
 
 --------------------------------------------------------------------------------
--- Non-Interactive Batch / CLI Mode
+-- Command-Line Parsing
 --------------------------------------------------------------------------------
-local function run_cli_batch(args)
-    local method = "ffi"
-    local clean = false
-    local no_ignore = false
-    local in_memory_sort = true
+local VALID_FIND_METHODS = {
+    ffi = true,
+    fd = true,
+    find = true,
+}
 
-    local i = 1
-    while i <= #args do
-        local a = args[i]
-        if a == "-f" or a == "--find" then
-            i = i + 1
-            method = args[i] or "ffi"
-        elseif a == "-c" or a == "--clean" then
-            clean = true
-        elseif a == "-I" or a == "--no-ignore" then
-            no_ignore = true
-        elseif a == "-S" or a == "--in-memory-sort" then
-            in_memory_sort = true
-        elseif a == "-h" or a == "--help" then
-            print([[
+-- Exit codes: 1 for runtime failures, 2 for invalid command-line usage.
+local EXIT_RUNTIME_ERROR = 1
+local EXIT_USAGE_ERROR = 2
+
+local function print_usage()
+    print([[
 dotag.lua - generate cscope/tags data (LuaJIT + FFI)
 
 Usage:
-  luajit dotag.lua [options]
+  luajit dotag.lua [options] [DIRECTORY]
+
+  DIRECTORY               project directory to index (default: current directory)
 
 Options:
   -f, --find METHOD       find files method: ffi (default), fd, find
@@ -1875,10 +1872,96 @@ Options:
   --test                  run automated test suite
   -h, --help              show this help message
 ]])
-            return 0
-        end
-        i = i + 1
+end
+
+-- Expands a leading "~" or "~/" to the user's home directory.
+local function expand_home_directory(path)
+    if path ~= "~" and path:sub(1, 2) ~= "~/" then
+        return path
     end
+
+    local home = os.getenv("HOME") or os.getenv("USERPROFILE") or ""
+    return home .. path:sub(2)
+end
+
+-- Parses the command line into an options table.
+-- Returns options, or nil plus a message describing the invalid usage.
+local function parse_command_line(args)
+    local options = {
+        method = "ffi",
+        clean = false,
+        no_ignore = false,
+        batch = false,
+        help = false,
+        test = false,
+        target_dir = nil,
+    }
+
+    local index = 1
+    while index <= #args do
+        local argument = args[index]
+
+        -- Options that take a value
+        if argument == "-f" or argument == "--find" then
+            local method = args[index + 1]
+            if not method then
+                return nil, string.format(
+                    "option '%s' requires a value: ffi, fd, or find",
+                    argument
+                )
+            end
+            if not VALID_FIND_METHODS[method:lower()] then
+                return nil, string.format(
+                    "invalid find method '%s' for '%s' (expected ffi, fd, or find)",
+                    method,
+                    argument
+                )
+            end
+            options.method = method:lower()
+            index = index + 1
+
+        -- Flags
+        elseif argument == "-c" or argument == "--clean" then
+            options.clean = true
+        elseif argument == "-I" or argument == "--no-ignore" then
+            options.no_ignore = true
+        elseif argument == "-S" or argument == "--in-memory-sort" then
+            -- Accepted for compatibility; in-memory sort is always used.
+        elseif argument == "-b" or argument == "--batch" then
+            options.batch = true
+        elseif argument == "-h" or argument == "--help" then
+            options.help = true
+        elseif argument == "--test" then
+            options.test = true
+
+        -- Anything else starting with "-" is a typo or unsupported option
+        elseif argument:sub(1, 1) == "-" then
+            return nil, string.format("unknown option '%s'", argument)
+
+        -- Positional argument: the directory to index (only one allowed)
+        elseif options.target_dir then
+            return nil, string.format(
+                "unexpected argument '%s' (directory already given as '%s')",
+                argument,
+                options.target_dir
+            )
+        else
+            options.target_dir = argument
+        end
+
+        index = index + 1
+    end
+
+    return options
+end
+
+--------------------------------------------------------------------------------
+-- Non-Interactive Batch / CLI Mode
+--------------------------------------------------------------------------------
+local function run_cli_batch(options)
+    local method = options.method
+    local clean = options.clean
+    local no_ignore = options.no_ignore
 
     print("find method: " .. method)
     if clean then
@@ -2169,6 +2252,49 @@ local function run_pure_tests(tester)
     for _, frame in ipairs(SPINNER_FRAMES) do
         assert_eq(utf8_col_width(frame), 1, string.format("Spinner frame '%s' width is 1", frame))
     end
+
+    -- Test 10: Command-line parsing
+    print("\n[Test 10] Command-Line Parsing...")
+    local options = parse_command_line({ "-f", "fd", "-c", "src" })
+    assert_eq(options.method, "fd", "-f consumes its value as the method")
+    assert_eq(options.target_dir, "src", "Directory is the positional argument, not -f's value")
+    assert_eq(options.clean, true, "-c sets clean")
+
+    options = parse_command_line({ "--find", "FD" })
+    assert_eq(options.method, "fd", "Method name is case-insensitive")
+    assert_eq(options.target_dir, nil, "No directory when only options are given")
+
+    local parsed, usage_error = parse_command_line({ "-f" })
+    assert_eq(parsed, nil, "Missing -f value is rejected")
+    assert_eq(usage_error:find("requires a value", 1, true) ~= nil, true, "Missing value message")
+
+    parsed, usage_error = parse_command_line({ "-f", "rg" })
+    assert_eq(parsed, nil, "Unknown method is rejected")
+    assert_eq(
+        usage_error:find("invalid find method 'rg'", 1, true) ~= nil,
+        true,
+        "Bad method message"
+    )
+
+    parsed, usage_error = parse_command_line({ "--claen" })
+    assert_eq(parsed, nil, "Unknown option is rejected")
+    assert_eq(
+        usage_error:find("unknown option '--claen'", 1, true) ~= nil,
+        true,
+        "Unknown option message"
+    )
+
+    parsed, usage_error = parse_command_line({ "dir1", "dir2" })
+    assert_eq(parsed, nil, "Second directory is rejected")
+    assert_eq(
+        usage_error:find("unexpected argument 'dir2'", 1, true) ~= nil,
+        true,
+        "Extra arg message"
+    )
+
+    assert_eq(expand_home_directory("plain/path"), "plain/path", "Non-tilde path unchanged")
+    local home = os.getenv("HOME") or os.getenv("USERPROFILE") or ""
+    assert_eq(expand_home_directory("~/proj"), home .. "/proj", "~/ expands to home directory")
 end
 
 -- Test 1: filenametags generation and foldcase ordering.
@@ -2319,56 +2445,61 @@ end
 --------------------------------------------------------------------------------
 -- Main Entry Point
 --------------------------------------------------------------------------------
+-- Changes into the requested project directory before anything is cleaned or
+-- written. Exits with an error instead of silently indexing the wrong directory.
+local function enter_target_directory(target_dir)
+    local resolved_dir = expand_home_directory(target_dir)
+    local entered, enter_error = change_directory(resolved_dir)
+    if entered then
+        return
+    end
+
+    io.stderr:write(string.format(
+        "dotag: error: cannot change to directory '%s': %s\n"
+            .. "Check the path, or run dotag from inside the project directory.\n",
+        resolved_dir,
+        enter_error
+    ))
+    os.exit(EXIT_RUNTIME_ERROR)
+end
+
 local function main(args)
     args = args or {}
 
-    -- Check for test mode
-    for _, a in ipairs(args) do
-        if a == "--test" then
-            os.exit(run_test_suite())
-        end
+    -- Parse and validate all arguments before touching the filesystem
+    local options, usage_error = parse_command_line(args)
+    if not options then
+        io.stderr:write(string.format(
+            "dotag: error: %s\nRun 'dotag --help' for usage.\n",
+            usage_error
+        ))
+        os.exit(EXIT_USAGE_ERROR)
     end
 
-    -- Check for target directory argument
-    local target_dir = nil
-    for _, a in ipairs(args) do
-        if not a:find("^-") then
-            target_dir = a
-            break
-        end
-    end
-    if target_dir then
-        if target_dir:sub(1, 2) == "~/" or target_dir == "~" then
-            local home = os.getenv("HOME") or os.getenv("USERPROFILE") or ""
-            target_dir = home .. target_dir:sub(2)
-        end
-        if IS_WINDOWS then
-            ffi.C.SetCurrentDirectoryA(target_dir)
-        else
-            ffi.C.chdir(target_dir)
-        end
+    if options.help then
+        print_usage()
+        os.exit(0)
     end
 
-    -- Check for batch mode or non-TTY execution
-    local is_batch = false
-    for _, a in ipairs(args) do
-        if a == "-b" or a == "--batch" or a == "-h" or a == "--help" then
+    -- Test mode runs in its own sandbox and ignores the target directory
+    if options.test then
+        os.exit(run_test_suite())
+    end
+
+    if options.target_dir then
+        enter_target_directory(options.target_dir)
+    end
+
+    -- Batch when requested, or when stdout is redirected (POSIX only for now)
+    local is_batch = options.batch
+    if not is_batch and not IS_WINDOWS then
+        if ffi.C.isatty(1) == 0 then
             is_batch = true
-            break
-        end
-    end
-
-    -- Auto-detect if stdout is redirected (non-TTY)
-    if not is_batch then
-        if not IS_WINDOWS then
-            if ffi.C.isatty(1) == 0 then
-                is_batch = true
-            end
         end
     end
 
     if is_batch then
-        os.exit(run_cli_batch(args))
+        os.exit(run_cli_batch(options))
     else
         TUI.run()
     end
