@@ -1250,8 +1250,6 @@ local function cmd_list(opts)
     print(string.format("%s=== Git Branches for %s (Current: %s) ===%s\n",
         C.b_cyan, Engine.get_repo_name(), head_branch or "detached", C.reset))
 
-    printf = function(fmt, ...) print(string.format(fmt, ...)) end
-
     print(string.format("%s %-4s %-8s %-10s %-30s %s%s",
         C.bold, "HEAD", "TYPE", "STATUS", "BRANCH NAME", "TRACKING / SUBJECT", C.reset))
     print(string.rep("─", 80))
