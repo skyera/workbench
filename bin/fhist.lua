@@ -310,34 +310,50 @@ local CSI_SEQUENCE_KEYS = {
 
 local TILDE_CHAR_CODE = 126
 
--- Windows only. Returns the character of the next queued key-down record
--- without blocking, or nil if no key-down record is queued. Key-up records
--- queued before it are always consumed, because VT input queues one after
--- every character. A key-down record is consumed only when `consume` is true.
--- Any other event type (such as a resize) stops the scan and stays queued.
-function Term.next_queued_key_char(consume)
+-- Windows only. Returns the next queued console input record without removing
+-- it, as { is_key = bool, key_down = bool, char_code = number }, or nil when
+-- the queue is empty. The self-test replaces this with a simulated queue.
+function Term.peek_input_record()
     local record = ffi.new("INPUT_RECORD[1]")
     local count = ffi.new("DWORD[1]")
+    if ffi.C.PeekConsoleInputW(Term.hIn, record, 1, count) == 0 or count[0] == 0 then
+        return nil
+    end
 
+    local key_event = record[0].Event.KeyEvent
+    return {
+        is_key = record[0].EventType == 1, -- KEY_EVENT
+        key_down = key_event.bKeyDown ~= 0,
+        char_code = key_event.uChar.UnicodeChar,
+    }
+end
+
+-- Windows only. Removes the record that peek_input_record() just returned.
+function Term.discard_input_record()
+    local record = ffi.new("INPUT_RECORD[1]")
+    local count = ffi.new("DWORD[1]")
+    ffi.C.ReadConsoleInputW(Term.hIn, record, 1, count)
+end
+
+-- Returns the character of the next queued key-down record without blocking,
+-- or nil if no key-down record is queued. Key-up records queued before it are
+-- always consumed, because VT input queues one after every character. A
+-- key-down record is consumed only when `consume` is true. Any other event
+-- type (such as a resize) stops the scan and stays queued.
+function Term.next_queued_key_char(consume)
     while true do
-        if ffi.C.PeekConsoleInputW(Term.hIn, record, 1, count) == 0 or count[0] == 0 then
+        local record = Term.peek_input_record()
+        if record == nil or not record.is_key then
             return nil
         end
-        if record[0].EventType ~= 1 then
-            return nil
+
+        if record.key_down and not consume then
+            return record.char_code
         end
 
-        local key_event = record[0].Event.KeyEvent
-        local is_key_down = key_event.bKeyDown ~= 0
-        local char_code = key_event.uChar.UnicodeChar
-
-        if is_key_down and not consume then
-            return char_code
-        end
-
-        ffi.C.ReadConsoleInputW(Term.hIn, record, 1, count)
-        if is_key_down then
-            return char_code
+        Term.discard_input_record()
+        if record.key_down then
+            return record.char_code
         end
     end
 end
@@ -1426,6 +1442,76 @@ local function run_tests()
     assert_eq("CSI '3~' decodes to DELETE and consumes '~'",
         CSI_SEQUENCE_KEYS[51].key .. tostring(CSI_SEQUENCE_KEYS[51].with_tilde), "DELETEtrue")
     assert_eq("CSI arrow keys have no trailing '~'", CSI_SEQUENCE_KEYS[66].with_tilde, nil)
+
+    -- Test 4: Windows escape-sequence reader against a simulated input queue.
+    -- With VT input, Windows queues a key-down and a key-up per character;
+    -- each queue below holds the records left after the ESC key-down.
+    local simulated_queue = {}
+    local original_peek = Term.peek_input_record
+    local original_discard = Term.discard_input_record
+
+    Term.peek_input_record = function()
+        return simulated_queue[1]
+    end
+    Term.discard_input_record = function()
+        table.remove(simulated_queue, 1)
+    end
+
+    local function key_record(char_code, key_down)
+        return { is_key = true, key_down = key_down, char_code = char_code }
+    end
+
+    local function queue_typed(records, text)
+        for index = 1, #text do
+            local char_code = text:byte(index)
+            records[#records + 1] = key_record(char_code, true)
+            records[#records + 1] = key_record(char_code, false)
+        end
+        return records
+    end
+
+    local function escape_then(text, extra_record)
+        local records = { key_record(27, false) } -- the ESC key-up
+        queue_typed(records, text)
+        if extra_record then
+            records[#records + 1] = extra_record
+        end
+        return records
+    end
+
+    -- Key-up records are ignored by read_key(), so only queued key-downs or
+    -- other events would leak into the next read.
+    local function pending_input_count()
+        local pending = 0
+        for _, record in ipairs(simulated_queue) do
+            if not record.is_key or record.key_down then
+                pending = pending + 1
+            end
+        end
+        return pending
+    end
+
+    local escape_scenarios = {
+        { "lone Esc press", escape_then(""), "ESC", 0 },
+        { "ESC [ A decodes to UP", escape_then("[A"), "UP", 0 },
+        { "ESC [ 5 ~ decodes to PGUP and consumes '~'", escape_then("[5~"), "PGUP", 0 },
+        { "ESC [ 3 ~ decodes to DELETE and consumes '~'", escape_then("[3~"), "DELETE", 0 },
+        { "Esc then 'x' leaves 'x' queued", escape_then("x"), "ESC", 1 },
+        { "Esc then resize leaves the resize queued",
+            escape_then("", { is_key = false }), "ESC", 1 },
+        { "unknown sequence ESC [ Q decodes to ESC", escape_then("[Q"), "ESC", 0 },
+    }
+
+    for _, scenario in ipairs(escape_scenarios) do
+        simulated_queue = scenario[2]
+        local key_name = Term.read_windows_escape_sequence()
+        assert_eq(scenario[1],
+            key_name .. " pending=" .. pending_input_count(),
+            scenario[3] .. " pending=" .. scenario[4])
+    end
+
+    Term.peek_input_record = original_peek
+    Term.discard_input_record = original_discard
 
     print(string.format("\nSelf-test summary: %d passed, %d failed.", passed, failed))
     if failed > 0 then os.exit(1) end
