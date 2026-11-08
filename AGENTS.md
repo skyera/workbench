@@ -37,9 +37,39 @@ well-organized code over compact code.
 ### Language Conventions
 
 *   **Lua / LuaJIT**:
-    *   Use four spaces for indentation in new files. Expand `if`, `for`, `while`, and function bodies across lines rather than writing inline blocks.
+    *   Use four spaces for indentation in new files.
+    *   **No single-line blocks**: Never put an `if ... then ... end`, `for ... do ... end`, `while ... do ... end`, `repeat ... until`, or `function ... end` body on the same line as its header. This includes early returns and guards: `if not f then return nil end` must be expanded. `elseif` and `else` each start their own line.
+    *   **One statement per line**: Do not join statements with `;` or spaces (e.g., `step = 1; width = 1`).
+    *   **Small, focused functions**: Each function does one job and should usually fit on one screen (aim for under ~30–40 lines). Extract loop bodies, complex conditions, string building, and repeated logic into named `local` helpers. Prefer early returns (each in its own expanded block) over deep nesting.
+    *   **Comments where they help**: Add a short comment above each non-trivial function stating its purpose, inputs, and return values. Explain *why* for non-obvious logic, platform quirks, magic numbers, FFI struct layouts, and buffer or handle ownership. Do not comment what the code already says plainly.
     *   Prefer `local` variables and named functions for substantial logic. Use multiline tables for complex records and state objects.
-    *   Keep FFI declarations grouped by API or platform. Name constants instead of scattering unexplained flags and numeric values. Document buffer lifetimes and handle ownership where they matter.
+    *   Keep FFI declarations grouped by API or platform. Name constants instead of scattering unexplained flags and numeric values (e.g., `local O_RDWR = 2`, `local WNOHANG = 1`).
+
+    ```lua
+    -- Bad
+    local function file_exists(path)
+        local f = io.open(path, "r")
+        if f then f:close() return true end
+        return false
+    end
+    for _, item in ipairs(list) do item.enabled = true end
+
+    -- Good
+    -- Returns true when `path` exists and can be opened for reading.
+    local function file_exists(path)
+        local file = io.open(path, "r")
+        if not file then
+            return false
+        end
+
+        file:close()
+        return true
+    end
+
+    for _, item in ipairs(list) do
+        item.enabled = true
+    end
+    ```
 *   **Python**:
     *   Use four spaces for indentation and standard Python naming and import organization. Put module and class responsibilities in concise docstrings when helpful.
     *   Use context managers for resources where appropriate. Specify encodings for text files and subprocess text when the encoding is known, including UTF-8 source files and protocol data.
@@ -94,6 +124,15 @@ For every change, consider how to prove correctness before concluding:
 
 ## Request & Issue Workflow
 
+### 0. Default Response for Questions, Features & New Functions
+When the user asks a question, requests a feature, or asks for a new function or command, the agent MUST respond in this order and then stop:
+
+1.  **Think**: Analyze the request and the relevant code first. State the problem or requirement in a few sentences.
+2.  **Design**: Show the proposed design: what changes, where (files/functions), and how it works, including error handling.
+3.  **Recommendation**: Give one clear recommendation with rationale. Mention alternatives only briefly, with their tradeoffs.
+4.  **Mockup UI / Sample Output**: For any TUI, GUI, or command output, show a realistic mockup, including error states.
+5.  **Ask for Approval**: End by explicitly asking the user to approve (e.g., *"Approve? Reply 'doit' to implement or 'ship' to implement, verify, commit, and push."*). Do NOT modify files until the user approves.
+
 ### 1. User Questions, Checks & Diagnostic Inquiries
 When the user asks a question, requests a health check, asks for current behavior, or inquires about best practices (e.g., *"check ... server"*, *"is X good?"*, *"what is the current behavior?"*, *"what is the best practice?"*, *"should I change X to Y?"*), the agent MUST:
 *   **Non-Destructive Ground-Truth Inspection**: Inspect the live environment, services, sockets, and configurations using read-only commands before answering. Never guess or hallucinate state.
@@ -112,7 +151,9 @@ When the user asks to implement, modify, fix, or update something (e.g., *"fix .
 5.  **Give Recommendation**: Provide your professional recommendation and options.
 6.  **Show Code Comparison / Draft**: Present a before/after diff or draft so the user can see exactly what changes before writing to disk.
 7.  **Approval Mode**:
-    *   If the user has indicated **"approve always"**, **"do it"**, **"auto approve"**, or explicitly asks to fix/implement directly: proceed immediately with implementation and verification without asking for confirmation.
+    *   **"doit"** / **"do it"**: Treat as approval. Proceed immediately with implementation and verification without asking for confirmation. Do not commit or push unless also asked.
+    *   **"ship"**: Treat as approval for the whole flow: implement, verify, commit, and push, without stopping to ask (see Commit Workflow).
+    *   If the user has indicated **"approve always"**, **"auto approve"**, or explicitly asks to fix/implement directly: proceed immediately with implementation and verification without asking for confirmation.
     *   If the user requests to see a draft or review first (e.g., *"show me the draft"*, *"let me review before commit/modify"*): **display the draft and WAIT for user approval before writing or modifying any files.**
     *   Otherwise: **WAIT for user approval before applying changes or starting implementation.**
 
@@ -121,4 +162,4 @@ When the user asks to implement, modify, fix, or update something (e.g., *"fix .
 *   **One commit per issue**: Each fix should be its own atomic commit with a descriptive message.
 *   **"commit"**: When the user says "commit", create the commit(s) locally. Do NOT push.
 *   **"push"**: When the user says "push", push all local commits to the remote repository.
-*   **"ship"**: When the user says "ship", apply/stage the change(s), create atomic commit(s) locally, and push to the remote repository.
+*   **"ship"**: When the user says "ship", it means approve + implement + verify + commit + push. Implement the proposed change(s) if not yet applied, run the verification plan, and only if verification passes, create atomic commit(s) locally and push to the remote repository. If verification fails, stop, report the failure output, and do not commit or push.
