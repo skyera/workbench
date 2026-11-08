@@ -292,6 +292,77 @@ function Term.is_stdout_tty()
     end
 end
 
+-- Final character of an "ESC [" / "ESC O" sequence -> key name. Keys marked
+-- with_tilde are sent as "ESC [ <digit> ~", so the trailing '~' must be read
+-- too, or it leaks into the next read as a typed character.
+local CSI_SEQUENCE_KEYS = {
+    [65] = { key = "UP" },               -- 'A'
+    [66] = { key = "DOWN" },             -- 'B'
+    [67] = { key = "RIGHT" },            -- 'C'
+    [68] = { key = "LEFT" },             -- 'D'
+    [72] = { key = "HOME" },             -- 'H'
+    [70] = { key = "END" },              -- 'F'
+    [90] = { key = "BACKTAB" },          -- 'Z'
+    [53] = { key = "PGUP", with_tilde = true },   -- '5~'
+    [54] = { key = "PGDN", with_tilde = true },   -- '6~'
+    [51] = { key = "DELETE", with_tilde = true }, -- '3~'
+}
+
+local TILDE_CHAR_CODE = 126
+
+-- Windows only. Returns the character of the next queued key-down record
+-- without blocking, or nil if no key-down record is queued. Key-up records
+-- queued before it are always consumed, because VT input queues one after
+-- every character. A key-down record is consumed only when `consume` is true.
+-- Any other event type (such as a resize) stops the scan and stays queued.
+function Term.next_queued_key_char(consume)
+    local record = ffi.new("INPUT_RECORD[1]")
+    local count = ffi.new("DWORD[1]")
+
+    while true do
+        if ffi.C.PeekConsoleInputW(Term.hIn, record, 1, count) == 0 or count[0] == 0 then
+            return nil
+        end
+        if record[0].EventType ~= 1 then
+            return nil
+        end
+
+        local key_event = record[0].Event.KeyEvent
+        local is_key_down = key_event.bKeyDown ~= 0
+        local char_code = key_event.uChar.UnicodeChar
+
+        if is_key_down and not consume then
+            return char_code
+        end
+
+        ffi.C.ReadConsoleInputW(Term.hIn, record, 1, count)
+        if is_key_down then
+            return char_code
+        end
+    end
+end
+
+-- Windows only. Called after an ESC key-down; decodes a queued VT sequence
+-- such as "ESC [ A". Returns "ESC" for a lone Escape press.
+function Term.read_windows_escape_sequence()
+    local introducer = Term.next_queued_key_char(false)
+    if introducer ~= 91 and introducer ~= 79 then -- '[' or 'O'
+        return "ESC"
+    end
+    Term.next_queued_key_char(true)
+
+    local final_char = Term.next_queued_key_char(true)
+    local sequence = final_char and CSI_SEQUENCE_KEYS[final_char]
+    if sequence == nil then
+        return "ESC"
+    end
+
+    if sequence.with_tilde and Term.next_queued_key_char(false) == TILDE_CHAR_CODE then
+        Term.next_queued_key_char(true)
+    end
+    return sequence.key
+end
+
 function Term.read_key()
     if IS_WINDOWS then
         local ir = ffi.new("INPUT_RECORD[1]")
@@ -321,31 +392,7 @@ function Term.read_key()
                 elseif vk == 0x2E then return "DELETE"
                 elseif vk == 0x74 then return "F5"
                 elseif vk == 0x1B or ch == 27 then
-                    local peek_ir = ffi.new("INPUT_RECORD[1]")
-                    local peek_cnt = ffi.new("DWORD[1]")
-                    if ffi.C.PeekConsoleInputW(Term.hIn, peek_ir, 1, peek_cnt) ~= 0 and peek_cnt[0] > 0 then
-                        if peek_ir[0].EventType == 1 and peek_ir[0].Event.KeyEvent.bKeyDown ~= 0 then
-                            local ch2 = peek_ir[0].Event.KeyEvent.uChar.UnicodeChar
-                            if ch2 == 91 or ch2 == 79 then -- '[' or 'O'
-                                ffi.C.ReadConsoleInputW(Term.hIn, peek_ir, 1, peek_cnt)
-                                if ffi.C.ReadConsoleInputW(Term.hIn, peek_ir, 1, peek_cnt) ~= 0 and peek_cnt[0] > 0 then
-                                    local ch3 = peek_ir[0].Event.KeyEvent.uChar.UnicodeChar
-                                    if ch3 == 65 then return "UP"
-                                    elseif ch3 == 66 then return "DOWN"
-                                    elseif ch3 == 67 then return "RIGHT"
-                                    elseif ch3 == 68 then return "LEFT"
-                                    elseif ch3 == 72 then return "HOME"
-                                    elseif ch3 == 70 then return "END"
-                                    elseif ch3 == 90 then return "BACKTAB"
-                                    elseif ch3 == 53 then return "PGUP"
-                                    elseif ch3 == 54 then return "PGDN"
-                                    elseif ch3 == 51 then return "DELETE"
-                                    end
-                                end
-                            end
-                        end
-                    end
-                    return "ESC"
+                    return Term.read_windows_escape_sequence()
                 end
 
                 if ctrl then
@@ -1368,6 +1415,17 @@ local function run_tests()
 
     -- Test 10: Safe execution handling of empty commands
     assert_eq("Engine.run_command handles empty command safely", Engine.run_command(""), 0)
+
+    -- Test 3: VT escape-sequence decoding table (Windows VT input path)
+    assert_eq("CSI 'A' decodes to UP", CSI_SEQUENCE_KEYS[65].key, "UP")
+    assert_eq("CSI 'Z' decodes to BACKTAB", CSI_SEQUENCE_KEYS[90].key, "BACKTAB")
+    assert_eq("CSI '5~' decodes to PGUP and consumes '~'",
+        CSI_SEQUENCE_KEYS[53].key .. tostring(CSI_SEQUENCE_KEYS[53].with_tilde), "PGUPtrue")
+    assert_eq("CSI '6~' decodes to PGDN and consumes '~'",
+        CSI_SEQUENCE_KEYS[54].key .. tostring(CSI_SEQUENCE_KEYS[54].with_tilde), "PGDNtrue")
+    assert_eq("CSI '3~' decodes to DELETE and consumes '~'",
+        CSI_SEQUENCE_KEYS[51].key .. tostring(CSI_SEQUENCE_KEYS[51].with_tilde), "DELETEtrue")
+    assert_eq("CSI arrow keys have no trailing '~'", CSI_SEQUENCE_KEYS[66].with_tilde, nil)
 
     print(string.format("\nSelf-test summary: %d passed, %d failed.", passed, failed))
     if failed > 0 then os.exit(1) end
