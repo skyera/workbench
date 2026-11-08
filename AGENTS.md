@@ -151,6 +151,7 @@ When the user asks to implement, modify, fix, or update something (e.g., *"fix .
 5.  **Give Recommendation**: Provide your professional recommendation and options.
 6.  **Show Code Comparison / Draft**: Present a before/after diff or draft so the user can see exactly what changes before writing to disk.
 7.  **Approval Mode**:
+    *   **"next"**: Move to the next open issue and present it for review only. Show, in order: (1) **Problem**: what the user sees, with a reproduction or evidence; (2) **Root Cause**: why it happens, with `file:line` references; (3) **Solution**: the proposed fix, error handling, and verification plan; (4) **Code Change**: a before/after diff of the exact code to change. Then ask for approval (*"Approve? Reply 'doit' or 'ship'."*). "next" is NOT approval: do not modify files.
     *   **"doit"** / **"do it"**: Treat as approval. Proceed immediately with implementation and verification without asking for confirmation. Do not commit or push unless also asked.
     *   **"ship"**: Treat as approval for the whole flow: implement, verify, commit, and push, without stopping to ask (see Commit Workflow).
     *   If the user has indicated **"approve always"**, **"auto approve"**, or explicitly asks to fix/implement directly: proceed immediately with implementation and verification without asking for confirmation.
