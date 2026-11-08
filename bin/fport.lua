@@ -1611,11 +1611,11 @@ local function run_tui(initial_query, start_all)
                         local sel = state.filtered[state.cursor]
                         if sel and sel.pid ~= 0 and Backend.is_foreign_process(sel.pid) then
                             -- Never fire immediately at another user's process.
-                            state.kill_signal = 15
+                            state.kill_signal = 9
                             state.mode = "confirm_kill"
                             render()
                         elseif sel then
-                            local killed, kerr = Backend.kill_process(sel.pid)
+                            local killed, kerr = Backend.kill_process(sel.pid, 9)
                             if killed then
                                 Term.sleep_ms(80)
                                 refresh_data(string.format("Terminated %s (PID %d)", sel.process, sel.pid), false)
@@ -1718,14 +1718,16 @@ local function cmd_kill_port(target)
         end
     end
     local count = 0
+    local failure_count = 0
     for pid, pname in pairs(pids) do
         count = count + 1
         local ok, err = Backend.kill_process(pid)
         if ok then
             print(string.format("[OK] Terminated %s (PID %d) on port %d", pname, pid, port_num))
         else
+            -- Keep going so one protected process doesn't spare the rest.
+            failure_count = failure_count + 1
             io.stderr:write(string.format("[ERROR] Failed to kill %s (PID %d): %s\n", pname, pid, tostring(err)))
-            os.exit(1)
         end
     end
     if count == 0 then
@@ -1736,6 +1738,9 @@ local function cmd_kill_port(target)
         else
             io.stderr:write(string.format("No user process found bound to port %d.\n", port_num))
         end
+        os.exit(1)
+    end
+    if failure_count > 0 then
         os.exit(1)
     end
 end
