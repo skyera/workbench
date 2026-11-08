@@ -455,6 +455,36 @@ local function shell_quote(s)
     end
 end
 
+-- cmd.exe expands %VAR% even inside double quotes, and it has no escape for a
+-- quote inside a quoted argument, so a typed pattern like `%OS%` or `a" & x`
+-- would be rewritten or partly run as a command. On Windows the pattern goes
+-- to rg through a pattern file instead and never appears on the command line.
+-- rg reads pattern files as UTF-8, which also keeps non-ASCII patterns intact.
+-- Returns the file path, or nil and an error message.
+local function write_pattern_file(pattern)
+    if pattern:find("[\r\n]") then
+        return nil, "the search pattern contains a line break; frg searches for one line at a time"
+    end
+
+    local temp_dir = os.getenv("TEMP") or os.getenv("TMP") or "."
+    local unique_suffix = string.format("%d_%s", os.time(), tostring({}):match("0x(%x+)") or "0")
+    local pattern_path = string.format("%s\\frg_pattern_%s.txt", temp_dir, unique_suffix)
+
+    local pattern_file, open_err = io.open(pattern_path, "wb")
+    if not pattern_file then
+        return nil, string.format(
+            "cannot write the search pattern to a temporary file (%s); "
+                .. "check that TEMP points to a writable folder",
+            tostring(open_err))
+    end
+    pattern_file:write(pattern)
+    pattern_file:close()
+    return pattern_path
+end
+
+-- Run ripgrep and parse its --vimgrep output.
+-- Returns the list of matches, plus an error message when the search could
+-- not run.
 function Engine.run_rg(pattern, search_path, opts)
     if not pattern or #pattern == 0 then
         return {}
@@ -475,21 +505,42 @@ function Engine.run_rg(pattern, search_path, opts)
         table.insert(flags, "--glob=!.git")
     end
 
+    -- The pattern file is owned by this call and removed once rg has exited.
+    local pattern_path = nil
+    if IS_WINDOWS then
+        local write_err
+        pattern_path, write_err = write_pattern_file(pattern)
+        if not pattern_path then
+            return {}, write_err
+        end
+        table.insert(flags, "-f")
+        table.insert(flags, shell_quote(pattern_path))
+        table.insert(flags, "--")
+    else
+        table.insert(flags, "--")
+        table.insert(flags, shell_quote(pattern))
+    end
+
     local target = (search_path and #search_path > 0) and (" " .. shell_quote(search_path)) or ""
     local err_redir = IS_WINDOWS and " 2>nul" or " 2>/dev/null"
-    local cmd = "rg " .. table.concat(flags, " ") .. " -- " .. shell_quote(pattern) .. target .. err_redir
+    local cmd = "rg " .. table.concat(flags, " ") .. target .. err_redir
 
     local results = {}
     local p = io.popen(cmd, "r")
-    if not p then return results end
-    for line in p:lines() do
-        local parsed = parse_vimgrep_line(line)
-        if parsed then
-            table.insert(results, parsed)
-            if #results >= 1000 then break end
+    if p then
+        for line in p:lines() do
+            local parsed = parse_vimgrep_line(line)
+            if parsed then
+                table.insert(results, parsed)
+                if #results >= 1000 then break end
+            end
         end
+        p:close()
     end
-    p:close()
+
+    if pattern_path then
+        os.remove(pattern_path)
+    end
     return results
 end
 
@@ -563,6 +614,7 @@ local function run_tui(initial_pattern, search_path, init_opts)
         filtered = {},
         selected = {}, -- map of match table -> true
         status_msg = "",
+        search_error = nil, -- why the last search could not run, if it failed
          pending_g = false,
     }
 
@@ -593,9 +645,11 @@ local function run_tui(initial_pattern, search_path, init_opts)
 
     local function execute_search()
         if #state.pattern > 0 then
-            state.all_matches = Engine.run_rg(state.pattern, state.search_path, current_opts())
+            state.all_matches, state.search_error =
+                Engine.run_rg(state.pattern, state.search_path, current_opts())
         else
             state.all_matches = {}
+            state.search_error = nil
         end
         state.selected = {}
         state.cursor = 1
@@ -704,6 +758,21 @@ local function run_tui(initial_pattern, search_path, init_opts)
         else
             if #state.pattern == 0 then
                 table.insert(r_lines, C.gray .. " Type a search pattern and press Enter." .. C.reset)
+            elseif state.search_error then
+                -- Word-wrap so the reason is not cut off by the pane width.
+                local wrap_width = math.max(10, right_w - 2)
+                local current_line = ""
+                for word in ("Search failed: " .. state.search_error):gmatch("%S+") do
+                    if #current_line > 0 and #current_line + 1 + #word > wrap_width then
+                        table.insert(r_lines, C.b_red .. " " .. current_line .. C.reset)
+                        current_line = word
+                    elseif #current_line > 0 then
+                        current_line = current_line .. " " .. word
+                    else
+                        current_line = word
+                    end
+                end
+                table.insert(r_lines, C.b_red .. " " .. current_line .. C.reset)
             else
                 table.insert(r_lines, C.gray .. " No matches found." .. C.reset)
             end
@@ -959,7 +1028,11 @@ end
 -- CLI Modes & Self-Tests
 --------------------------------------------------------------------------------
 local function cmd_list(pattern, search_path, opts)
-    local results = Engine.run_rg(pattern, search_path, opts)
+    local results, search_err = Engine.run_rg(pattern, search_path, opts)
+    if search_err then
+        io.stderr:write("frg: search failed: " .. search_err .. "\n")
+        os.exit(2)
+    end
     for _, r in ipairs(results) do
         print(string.format("%s:%d:%d: %s", r.file, r.line, r.col, r.text))
     end
@@ -1019,6 +1092,50 @@ local function run_tests()
     if #rg_res >= 1 then
         assert_eq("Engine.run_rg line number == 2", rg_res[1].line, 2)
     end
+
+    -- Patterns must reach rg byte for byte. On Windows they used to pass
+    -- through cmd.exe, which expanded %VAR% and let `"` + `&` run commands.
+    local temp_dir = os.getenv("TEMP") or os.getenv("TMPDIR") or "/tmp"
+    local fixture_path = temp_dir .. (IS_WINDOWS and "\\" or "/") .. "frg_pattern_selftest.txt"
+    local canary_path = "frg_canary"
+    local fixture_lines = {
+        "%OS%",
+        "Windows_NT",
+        'a" & echo FRG_PWNED >frg_canary & "b',
+        "caret^x pipe|x <angle> it's",
+        "d\195\175r \195\188nicode",
+    }
+    local fixture_file = assert(io.open(fixture_path, "wb"))
+    fixture_file:write(table.concat(fixture_lines, "\n"), "\n")
+    fixture_file:close()
+
+    for line_number, fixture_line in ipairs(fixture_lines) do
+        local label = string.format("run_rg literal %q", fixture_line)
+        local matches, search_err = Engine.run_rg(fixture_line, fixture_path,
+            { case_mode = "sensitive", fixed = true })
+        assert_eq(label .. " has no error", search_err, nil)
+        assert_eq(label .. " matches one line", #matches, 1)
+        assert_eq(label .. " matches line " .. line_number,
+            matches[1] and matches[1].line, line_number)
+    end
+
+    local regex_matches = Engine.run_rg('a" & echo [A-Z_]+ >', fixture_path, { case_mode = "sensitive" })
+    assert_eq("run_rg regex with quote and & matches line 3",
+        regex_matches[1] and regex_matches[1].line, 3)
+
+    local canary_file = io.open(canary_path, "r")
+    if canary_file then
+        canary_file:close()
+        os.remove(canary_path)
+    end
+    assert_eq("run_rg patterns ran no shell command", canary_file == nil, true)
+
+    if IS_WINDOWS then
+        local multiline_matches, multiline_err = Engine.run_rg("a\nb", fixture_path, {})
+        assert_eq("run_rg rejects a pattern with a line break",
+            #multiline_matches == 0 and tostring(multiline_err):find("line break") ~= nil, true)
+    end
+    os.remove(fixture_path)
 
     print(string.format("\nSelf-test summary: %d passed, %d failed.", passed, failed))
     if failed > 0 then os.exit(1) end
