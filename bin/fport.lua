@@ -23,6 +23,7 @@
     -l, --list           Print formatted socket table to stdout and exit
     -a, --all            Show all socket states (including ESTABLISHED, TIME_WAIT)
     -k, --kill <PORT>    Terminate process(es) bound to <PORT> and exit
+    -S, --sudo           Relaunch under sudo to see/kill other users' sockets (Linux)
     --preview <PORT|PID> Print rich ANSI details card for a port or PID and exit
     --test               Run built-in automated self-test suite and exit
     -h, --help           Show this help message
@@ -166,6 +167,19 @@ else
         struct dirent *readdir(DIR *dirp);
         int closedir(DIR *dirp);
         int kill(int pid, int sig);
+        int getpid(void);
+        unsigned int geteuid(void);
+        int execvp(const char *file, char *const argv[]);
+        struct passwd {
+            char *pw_name;
+            char *pw_passwd;
+            unsigned int pw_uid;
+            unsigned int pw_gid;
+            char *pw_gecos;
+            char *pw_dir;
+            char *pw_shell;
+        };
+        struct passwd *getpwuid(unsigned int uid);
         int readlink(const char *pathname, char *buf, size_t bufsiz);
         char *strerror(int errnum);
 
@@ -790,6 +804,18 @@ if IS_WINDOWS then
         return sockets, proc_map
     end
 
+    function Backend.is_root()
+        return false
+    end
+
+    function Backend.is_foreign_process(_)
+        return false
+    end
+
+    function Backend.relaunch_with_sudo()
+        return false, "sudo mode is Linux-only; on Windows run this terminal as Administrator"
+    end
+
     function Backend.kill_process(pid)
         if not pid or pid <= 4 then
             return false, "Cannot terminate system process (PID " .. tostring(pid) .. ")"
@@ -905,12 +931,95 @@ else
         return sockets, proc_map
     end
 
+    local function lookup_user_name(uid)
+        local entry = ffi.C.getpwuid(uid)
+        if entry == nil or entry.pw_name == nil then
+            return tostring(uid)
+        end
+        return ffi.string(entry.pw_name)
+    end
+
+    local function read_link(path)
+        local buf = ffi.new("char[4096]")
+        local len = ffi.C.readlink(path, buf, 4095)
+        if len <= 0 then
+            return nil
+        end
+        return ffi.string(buf, len)
+    end
+
+    function Backend.is_root()
+        return ffi.C.geteuid() == 0
+    end
+
+    -- The user who launched fport. Under sudo this is SUDO_UID, not root.
+    local function invoking_uid()
+        return tonumber(os.getenv("SUDO_UID")) or ffi.C.geteuid()
+    end
+
+    function Backend.is_foreign_process(pid)
+        local info = Backend.get_process_details(pid)
+        return info.uid ~= nil and info.uid ~= invoking_uid()
+    end
+
+    -- Replace this process with `sudo <interpreter> <script> <args> --elevated`.
+    -- Returns (false, reason) only when the relaunch could not happen.
+    function Backend.relaunch_with_sudo(original_args, already_relaunched)
+        if Backend.is_root() then
+            return false, "Already running as root"
+        end
+        if already_relaunched then
+            return false, "Relaunched via sudo but still not root; refusing to loop"
+        end
+
+        local interpreter = read_link("/proc/self/exe")
+        if not interpreter then
+            return false, "Cannot resolve the luajit path from /proc/self/exe"
+        end
+
+        local script = arg and arg[0]
+        if not script then
+            return false, "Cannot determine the fport.lua script path"
+        end
+        if script:sub(1, 1) ~= "/" then
+            local cwd = read_link("/proc/self/cwd")
+            if not cwd then
+                return false, "Cannot resolve the current directory for " .. script
+            end
+            script = cwd .. "/" .. script
+        end
+
+        local argv_list = { "sudo", interpreter, script }
+        for _, value in ipairs(original_args) do
+            table.insert(argv_list, value)
+        end
+        table.insert(argv_list, "--elevated")
+
+        -- The buffers must stay referenced until execvp() replaces the process.
+        local keep_alive = {}
+        local argv = ffi.new("char *[?]", #argv_list + 1)
+        for index, value in ipairs(argv_list) do
+            local buffer = ffi.new("char[?]", #value + 1)
+            ffi.copy(buffer, value)
+            keep_alive[index] = buffer
+            argv[index - 1] = buffer
+        end
+        argv[#argv_list] = nil
+
+        io.stdout:flush()
+        ffi.C.execvp("sudo", argv)
+
+        -- execvp only returns on failure.
+        return false, "Cannot execute sudo: " .. ffi.string(ffi.C.strerror(ffi.errno()))
+    end
+
     function Backend.get_process_details(pid, proc_map)
         if not pid or pid <= 0 then
             return { pid = 0, name = "Kernel / Unknown", ppid = 0, threads = 0, exe = "N/A", rss_mb = 0 }
         end
         local name = (proc_map and proc_map[pid] and proc_map[pid].name) or tostring(pid)
         local ppid, threads, rss_kb = 0, 1, 0
+        local uid = nil
         local sf = io.open(string.format("/proc/%d/status", pid), "r")
         if sf then
             for line in sf:lines() do
@@ -919,6 +1028,7 @@ else
                 elseif k == "PPid" then ppid = tonumber(v) or 0
                 elseif k == "Threads" then threads = tonumber(v) or 1
                 elseif k == "VmRSS" then rss_kb = tonumber(v:match("(%d+)")) or 0
+                elseif k == "Uid" then uid = tonumber(v:match("^(%d+)"))
                 end
             end
             sf:close()
@@ -933,20 +1043,42 @@ else
             threads = threads,
             exe = exe,
             rss_mb = rss_kb / 1024.0,
+            uid = uid,
+            user = uid and lookup_user_name(uid) or nil,
         }
     end
 
     function Backend.kill_process(pid, sig)
-        if not pid or pid <= 1 then
-            return false, "Cannot terminate PID " .. tostring(pid)
+        if not pid or pid == 0 then
+            return false, "Socket owner is not visible (it belongs to another user). "
+                .. "Restart with sudo: press S in the TUI or run 'fport --sudo'"
         end
+        if pid == 1 then
+            return false, "Refusing to terminate PID 1 (init)"
+        end
+        if pid == ffi.C.getpid() then
+            return false, "Refusing to terminate fport itself (PID " .. pid .. ")"
+        end
+
+        -- Kernel threads have no executable; signalling them is pointless.
+        if Backend.is_root() and not read_link(string.format("/proc/%d/exe", pid)) then
+            return false, string.format(
+                "PID %d has no executable (kernel thread or already exited)", pid)
+        end
+
         sig = sig or 15
         local res = ffi.C.kill(pid, sig)
         if res == 0 then
             return true
-        else
-            return false, ffi.string(ffi.C.strerror(ffi.errno()))
         end
+
+        local errno_value = ffi.errno()
+        local message = ffi.string(ffi.C.strerror(errno_value))
+        if errno_value == 1 and not Backend.is_root() then
+            message = message .. " (process is owned by another user; "
+                .. "restart with sudo: press S in the TUI or run 'fport --sudo')"
+        end
+        return false, message
     end
 end
 
@@ -1063,6 +1195,7 @@ local function run_tui(initial_query, start_all)
         status_msg = "",
         status_is_err = false,
         pending_g = false,
+        kill_signal = 15,
         filtered = {},
         counts = count_by_tab(sockets),
     }
@@ -1137,7 +1270,8 @@ local function run_tui(initial_query, start_all)
                 tab_str = tab_str .. C.gray .. label .. C.reset .. " "
             end
         end
-        local title = C.b_cyan .. " fport " .. C.reset .. C.dim .. "Port & Socket Inspector  " .. C.reset .. tab_str
+        local root_badge = Backend.is_root() and (C.bg_red .. C.b_white .. " ROOT " .. C.reset .. " ") or ""
+        local title = C.b_cyan .. " fport " .. C.reset .. root_badge .. C.dim .. "Port & Socket Inspector  " .. C.reset .. tab_str
         table.insert(frame_lines, BOX.tl .. string.rep(BOX.h, cols - 2) .. BOX.tr)
         table.insert(frame_lines, BOX.v .. pad_string(title, cols - 2) .. BOX.v)
 
@@ -1166,6 +1300,7 @@ local function run_tui(initial_query, start_all)
             table.insert(r_lines, " " .. C.b_cyan .. "r                 " .. C.reset .. "Refresh socket table (FFI)")
             table.insert(r_lines, " " .. C.b_cyan .. "x / Enter / Del   " .. C.reset .. "Kill process (with [y/N] prompt)")
             table.insert(r_lines, " " .. C.b_cyan .. "K                 " .. C.reset .. "Force kill process immediately")
+            table.insert(r_lines, " " .. C.b_cyan .. "S                 " .. C.reset .. "Restart with sudo (other users' ports)")
             table.insert(r_lines, " " .. C.b_cyan .. "Esc               " .. C.reset .. "Clear filter or quit")
             table.insert(r_lines, " " .. C.b_cyan .. "q / Ctrl+C        " .. C.reset .. "Quit fport")
         elseif sel then
@@ -1186,7 +1321,18 @@ local function run_tui(initial_query, start_all)
             local pinfo = get_proc_info(sel.pid)
             table.insert(r_lines, C.b_cyan .. " Owning Process" .. C.reset)
             table.insert(r_lines, C.gray .. " " .. string.rep(BOX.h, math.max(10, right_w - 2)) .. C.reset)
+            if sel.pid == 0 then
+                table.insert(r_lines, C.yellow .. " Owner hidden (another user's process)." .. C.reset)
+                if Backend.is_root() then
+                    table.insert(r_lines, C.gray .. " Kernel-owned or exited socket." .. C.reset)
+                else
+                    table.insert(r_lines, C.b_cyan .. " Press S to restart with sudo." .. C.reset)
+                end
+            end
             table.insert(r_lines, string.format(" %sProcess    :%s %s%s%s", C.gray, C.reset, C.b_white, pinfo.name, C.reset))
+            if pinfo.user then
+                table.insert(r_lines, string.format(" %sUser       :%s %s (uid %d)", C.gray, C.reset, pinfo.user, pinfo.uid))
+            end
             table.insert(r_lines, string.format(" %sPID        :%s %d  (PPID: %d)", C.gray, C.reset, pinfo.pid, pinfo.ppid))
             table.insert(r_lines, string.format(" %sThreads    :%s %d", C.gray, C.reset, pinfo.threads))
             if pinfo.rss_mb and pinfo.rss_mb > 0 then
@@ -1263,14 +1409,18 @@ local function run_tui(initial_query, start_all)
         table.insert(frame_lines, BOX.vl .. string.rep(BOX.h, left_w) .. BOX.tb .. string.rep(BOX.h, right_w) .. BOX.vr)
         local footer
         if state.mode == "confirm_kill" and sel then
+            local owner_note = ""
+            if Backend.is_foreign_process(sel.pid) then
+                owner_note = string.format(", owner: %s, NOT YOUR USER", get_proc_info(sel.pid).user)
+            end
             footer = C.bg_red .. C.b_white ..
-                string.format(" Kill process '%s' (PID %d) on port %d? Press [y] to confirm, [n/Esc] to cancel ",
-                    sel.process, sel.pid, sel.port) .. C.reset
+                string.format(" Kill '%s' (PID %d%s) on port %d? [y] confirm, [n/Esc] cancel ",
+                    sel.process, sel.pid, owner_note, sel.port) .. C.reset
         elseif #state.status_msg > 0 then
             local col = state.status_is_err and C.b_red or C.b_green
             footer = " " .. col .. state.status_msg .. C.reset .. "  " .. filter_line
         else
-            local hints = C.gray .. " [j/k] Move  [Tab/1-4] Tab  [/] Filter  [s] Sort  [r] Refresh  [x/Enter] Kill  [?] Help  [q] Quit" .. C.reset
+            local hints = C.gray .. " [j/k] Move  [Tab/1-4] Tab  [/] Filter  [s] Sort  [r] Refresh  [x/Enter] Kill  [S] Sudo  [?] Help  [q] Quit" .. C.reset
             footer = (#state.query > 0 or state.mode == "search") and filter_line or hints
         end
         table.insert(frame_lines, BOX.v .. pad_string(truncate_string(footer, cols - 2), cols - 2) .. BOX.v)
@@ -1308,7 +1458,7 @@ local function run_tui(initial_query, start_all)
                         local sel = state.filtered[state.cursor]
                         state.mode = "normal"
                         if sel then
-                            local killed, kerr = Backend.kill_process(sel.pid)
+                            local killed, kerr = Backend.kill_process(sel.pid, state.kill_signal)
                             if killed then
                                 Term.sleep_ms(80)
                                 refresh_data(string.format("Terminated %s (PID %d)", sel.process, sel.pid), false)
@@ -1426,14 +1576,45 @@ local function run_tui(initial_query, start_all)
                         render()
                     elseif key == "x" or key == "enter" or key == "delete" then
                         state.pending_g = false
-                        if state.filtered[state.cursor] then
+                        local sel = state.filtered[state.cursor]
+                        if sel and sel.pid == 0 then
+                            -- No owner to confirm; surface the "use sudo" explanation.
+                            local _, kerr = Backend.kill_process(0)
+                            state.status_msg = kerr
+                            state.status_is_err = true
+                            render()
+                        elseif sel then
+                            state.kill_signal = 15
                             state.mode = "confirm_kill"
                             render()
                         end
+                    elseif key == "S" then
+                        state.pending_g = false
+                        -- Leave the alternate screen so sudo can prompt for a password.
+                        Term.restore()
+                        local relaunch_args = {}
+                        if start_all then
+                            table.insert(relaunch_args, "--all")
+                        end
+                        if #state.query > 0 then
+                            table.insert(relaunch_args, state.query)
+                        end
+                        local _, relaunch_err = Backend.relaunch_with_sudo(relaunch_args, false)
+                        -- Only reached when the relaunch failed: re-enter the TUI.
+                        Term.enable_raw()
+                        prev_cols = 0
+                        state.status_msg = relaunch_err
+                        state.status_is_err = true
+                        render()
                     elseif key == "K" then
                         state.pending_g = false
                         local sel = state.filtered[state.cursor]
-                        if sel then
+                        if sel and sel.pid ~= 0 and Backend.is_foreign_process(sel.pid) then
+                            -- Never fire immediately at another user's process.
+                            state.kill_signal = 15
+                            state.mode = "confirm_kill"
+                            render()
+                        elseif sel then
                             local killed, kerr = Backend.kill_process(sel.pid)
                             if killed then
                                 Term.sleep_ms(80)
@@ -1528,9 +1709,12 @@ local function cmd_kill_port(target)
     end
     local sockets = Backend.get_sockets()
     local pids = {}
+    local hidden_owner_count = 0
     for _, s in ipairs(sockets) do
         if s.port == port_num and s.pid > 4 then
             pids[s.pid] = s.process
+        elseif s.port == port_num and s.pid == 0 and IS_POSIX then
+            hidden_owner_count = hidden_owner_count + 1
         end
     end
     local count = 0
@@ -1545,7 +1729,13 @@ local function cmd_kill_port(target)
         end
     end
     if count == 0 then
-        io.stderr:write(string.format("No user process found bound to port %d.\n", port_num))
+        if hidden_owner_count > 0 and not Backend.is_root() then
+            io.stderr:write(string.format(
+                "Port %d is in use but its owner is not visible (another user's process).\n"
+                .. "Retry with: fport --sudo -k %d\n", port_num, port_num))
+        else
+            io.stderr:write(string.format("No user process found bound to port %d.\n", port_num))
+        end
         os.exit(1)
     end
 end
@@ -1627,6 +1817,8 @@ Options:
   -l, --list           Print formatted port table to stdout and exit
   -a, --all            Include all TCP states (ESTABLISHED, TIME_WAIT) and UDP sockets
   -k, --kill <PORT>    Terminate process(es) listening/bound on <PORT>
+  -S, --sudo           Relaunch under sudo so other users' sockets are visible
+                       and killable (Linux; on Windows use an Administrator terminal)
   --preview <PORT|PID> Print detailed ANSI socket & process card for a port or PID
   --test               Run automated self-test suite
   -h, --help           Show this help message
@@ -1644,6 +1836,8 @@ TUI Keybindings:
   r                    Refresh socket table immediately
   x / Enter / Del      Terminate owning process (with [y/N] confirmation)
   K                    Force terminate owning process immediately
+                       (asks first when the process belongs to another user)
+  S                    Restart fport under sudo
   q / Esc              Quit]])
 end
 
@@ -1654,6 +1848,9 @@ local args = { ... }
 local mode = "tui"
 local show_all = false
 local target_arg = nil
+local want_sudo = false
+local already_relaunched = false
+local passthrough_args = {}
 
 local i = 1
 while i <= #args do
@@ -1666,20 +1863,40 @@ while i <= #args do
         os.exit(0)
     elseif a == "-l" or a == "--list" then
         mode = "list"
+        table.insert(passthrough_args, a)
     elseif a == "-a" or a == "--all" then
         show_all = true
+        table.insert(passthrough_args, a)
+    elseif a == "-S" or a == "--sudo" then
+        want_sudo = true
+    elseif a == "--elevated" then
+        -- Internal marker added by the sudo relaunch; guards against loops.
+        already_relaunched = true
     elseif a == "-k" or a == "--kill" then
         mode = "kill"
+        table.insert(passthrough_args, a)
         i = i + 1
         target_arg = args[i]
+        table.insert(passthrough_args, args[i])
     elseif a == "--preview" then
         mode = "preview"
+        table.insert(passthrough_args, a)
         i = i + 1
         target_arg = args[i]
+        table.insert(passthrough_args, args[i])
     else
         target_arg = a
+        table.insert(passthrough_args, a)
     end
     i = i + 1
+end
+
+if want_sudo then
+    local relaunched, relaunch_err = Backend.relaunch_with_sudo(passthrough_args, already_relaunched)
+    if not relaunched and relaunch_err ~= "Already running as root" then
+        io.stderr:write("[ERROR] " .. relaunch_err .. "\n")
+        os.exit(1)
+    end
 end
 
 if mode == "list" then
