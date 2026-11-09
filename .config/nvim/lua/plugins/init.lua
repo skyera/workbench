@@ -432,6 +432,146 @@ return {
       local capabilities = vim.lsp.protocol.make_client_capabilities()
       capabilities = require("cmp_nvim_lsp").default_capabilities(capabilities)
 
+      ------------------------------------------------------------------------
+      -- Hover / navigation helpers
+      -- These use buf_request_all so a buffer with several attached servers
+      -- gets ONE callback (and one result) instead of one per server.
+      ------------------------------------------------------------------------
+
+      -- Hover window shared by every K press, so repeated presses reuse it.
+      local hover_window = nil
+
+      -- Returns the position params for `client`, using its offset encoding.
+      local function position_params_for(client, bufnr)
+        return vim.lsp.util.make_position_params(0, client.offset_encoding)
+      end
+
+      -- Returns the non-blank markdown lines for an LSP hover result, or {}.
+      local function hover_result_lines(result)
+        if not result or not result.contents then
+          return {}
+        end
+
+        local lines = vim.lsp.util.convert_input_to_markdown_lines(result.contents)
+        if type(lines) ~= "table" then
+          return {}
+        end
+
+        return vim.tbl_filter(function(line)
+          return line and line:match("%S")
+        end, lines)
+      end
+
+      -- Picks the first server that returned hover text.
+      -- Returns lines (possibly empty) and a human-readable reason when empty.
+      local function first_hover(results)
+        local reason = "no hover result"
+
+        for _, response in pairs(results or {}) do
+          if response.err then
+            reason = "error: " .. tostring(response.err.message or response.err)
+          else
+            local lines = hover_result_lines(response.result)
+            if not vim.tbl_isempty(lines) then
+              return lines, nil
+            end
+          end
+        end
+
+        return {}, reason
+      end
+
+      -- Looks up `word` in the man pages (section 3 first, then any section).
+      -- Returns lines on success, or nil plus the reason it failed.
+      local function man_page_lines(word)
+        if vim.fn.executable("man") == 0 then
+          return nil, "man not installed"
+        end
+
+        local attempts = { { "man", "3", word }, { "man", word } }
+        for _, command in ipairs(attempts) do
+          local result = vim.system(command, { text = true }):wait(3000)
+          if result.code == 0 and result.stdout and result.stdout ~= "" then
+            return vim.split(result.stdout, "\n", { plain = true }), nil
+          end
+        end
+
+        return nil, "no man entry"
+      end
+
+      -- Shows `lines` in the top hover window, reusing it when still open.
+      local function show_in_hover_window(lines, filetype)
+        local reusable = hover_window and vim.api.nvim_win_is_valid(hover_window)
+        if reusable then
+          vim.api.nvim_set_current_win(hover_window)
+        else
+          vim.cmd("topleft 14split")
+          hover_window = vim.api.nvim_get_current_win()
+        end
+
+        local scratch_buf = vim.api.nvim_create_buf(false, true)
+        vim.api.nvim_win_set_buf(hover_window, scratch_buf)
+        vim.api.nvim_buf_set_lines(scratch_buf, 0, -1, false, lines)
+        vim.bo[scratch_buf].filetype = filetype
+        vim.bo[scratch_buf].bufhidden = "wipe"
+        vim.bo[scratch_buf].buftype = "nofile"
+        vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = scratch_buf, silent = true })
+      end
+
+      -- K: hover docs from the first server that has some, else a man page,
+      -- else an explanatory message.
+      local function hover_or_man(bufnr)
+        local word = vim.fn.expand("<cword>")
+        if word == "" then
+          vim.notify("No identifier under cursor", vim.log.levels.INFO)
+          return
+        end
+
+        vim.lsp.buf_request_all(bufnr, "textDocument/hover", position_params_for, function(results)
+          local lines, lsp_reason = first_hover(results)
+          local filetype = "markdown"
+          local man_reason = nil
+
+          if vim.tbl_isempty(lines) then
+            lines, man_reason = man_page_lines(word)
+            filetype = "man"
+          end
+
+          if not lines or vim.tbl_isempty(lines) then
+            vim.notify(
+              string.format("No documentation found for '%s' (LSP: %s; man: %s)", word, lsp_reason, man_reason),
+              vim.log.levels.INFO
+            )
+            return
+          end
+
+          vim.schedule(function()
+            show_in_hover_window(lines, filetype)
+          end)
+        end)
+      end
+
+      -- Collects LSP locations from the first server that returned any.
+      -- Returns the filtered locations and that server's offset encoding.
+      local function first_locations(results)
+        for client_id, response in pairs(results or {}) do
+          local result = response.result
+          if not response.err and result then
+            local locations = vim.islist(result) and result or { result }
+            locations = vim.tbl_filter(function(loc)
+              return type(loc) == "table" and (loc.uri ~= nil or loc.targetUri ~= nil)
+            end, locations)
+
+            if #locations > 0 then
+              local client = vim.lsp.get_client_by_id(client_id)
+              return locations, client and client.offset_encoding or "utf-16"
+            end
+          end
+        end
+
+        return {}, "utf-16"
+      end
+
       -- Configure global LspAttach autocmd for keymaps
       vim.api.nvim_create_autocmd("LspAttach", {
         callback = function(args)
@@ -441,28 +581,20 @@ return {
             vim.keymap.set(mode, lhs, rhs, { buffer = bufnr, silent = true, desc = "LSP: " .. desc })
           end
 
-          -- Helper for LSP navigation with fallback to native Vim gd / gD
+          -- LSP navigation with fallback to native Vim gd / gD when no server answers
           local jump_with_fallback = function(method, fallback_cmd)
-            local offset_enc = _client and _client.offset_encoding or "utf-16"
-            local params = vim.lsp.util.make_position_params(0, offset_enc)
-            vim.lsp.buf_request(bufnr, method, params, function(err, result, _ctx, _config)
-              local locations = {}
-              if not err and result then
-                locations = vim.islist(result) and result or { result }
-                locations = vim.tbl_filter(function(loc)
-                  return type(loc) == "table" and (loc.uri ~= nil or loc.targetUri ~= nil)
-                end, locations)
+            vim.lsp.buf_request_all(bufnr, method, position_params_for, function(results)
+              local locations, offset_enc = first_locations(results)
+
+              local items = {}
+              if #locations > 0 then
+                local ok, converted = pcall(vim.lsp.util.locations_to_items, locations, offset_enc)
+                if ok and converted then
+                  items = converted
+                end
               end
 
-              if #locations == 0 then
-                vim.schedule(function()
-                  pcall(vim.cmd, "normal! " .. fallback_cmd)
-                end)
-                return
-              end
-
-              local ok, items = pcall(vim.lsp.util.locations_to_items, locations, offset_enc)
-              if not ok or not items or vim.tbl_isempty(items) then
+              if vim.tbl_isempty(items) then
                 vim.schedule(function()
                   pcall(vim.cmd, "normal! " .. fallback_cmd)
                 end)
@@ -493,40 +625,9 @@ return {
           map("n", "gr", vim.lsp.buf.references, "Goto References")
           map("n", "gi", vim.lsp.buf.implementation, "Goto Implementation")
           map("n", "gy", vim.lsp.buf.type_definition, "Goto Type Definition")
-          -- K: Open LSP Hover documentation in a top split window (with Man page fallback)
+          -- K: LSP hover in a reusable top split (man page fallback, then a message)
           map("n", "K", function()
-            local cword = vim.fn.expand("<cword>")
-            local params = vim.lsp.util.make_position_params(0, _client and _client.offset_encoding)
-            vim.lsp.buf_request(bufnr, "textDocument/hover", params, function(err, result, _ctx, _config)
-              local lines = {}
-              if not err and result and result.contents then
-                lines = vim.lsp.util.convert_input_to_markdown_lines(result.contents)
-                if type(lines) == "table" then
-                  lines = vim.tbl_filter(function(line) return line and line:match("%S") end, lines)
-                end
-              end
-
-              -- Fallback to man page if LSP hover returned no documentation
-              local is_man = false
-              if vim.tbl_isempty(lines) and cword ~= "" then
-                local man_output = vim.fn.systemlist("man 3 " .. vim.fn.shellescape(cword) .. " 2>/dev/null || man " .. vim.fn.shellescape(cword) .. " 2>/dev/null")
-                if vim.v.shell_error == 0 and not vim.tbl_isempty(man_output) then
-                  lines = man_output
-                  is_man = true
-                end
-              end
-
-              if vim.tbl_isempty(lines) then return end
-
-              vim.cmd("topleft 14split")
-              local scratch_buf = vim.api.nvim_create_buf(false, true)
-              vim.api.nvim_win_set_buf(0, scratch_buf)
-              vim.api.nvim_buf_set_lines(scratch_buf, 0, -1, false, lines)
-              vim.bo[scratch_buf].filetype = is_man and "man" or "markdown"
-              vim.bo[scratch_buf].bufhidden = "wipe"
-              vim.bo[scratch_buf].buftype = "nofile"
-              vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = scratch_buf, silent = true })
-            end)
+            hover_or_man(bufnr)
           end, "Hover Documentation (Top Window)")
 
           -- gK: Open LSP Hover documentation in floating preview window
