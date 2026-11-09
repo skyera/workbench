@@ -77,6 +77,25 @@ EXCLUDED_DIRS = [
 
 CSCOPE_FILE_NAME = "cscope.files"
 FILENAMETAG_FILE_NAME = "filenametags"
+# Longest command line echoed in an error message (find commands are very long).
+MAX_COMMAND_DISPLAY = 120
+
+
+class DotagError(Exception):
+    """A failure that main() reports as a clear message and a non-zero exit."""
+
+
+def run_tool(cmd, **kwargs):
+    """Run an external tool; raise DotagError naming the command and why it failed."""
+    printable = " ".join(shlex.quote(str(arg)) for arg in cmd)
+    if len(printable) > MAX_COMMAND_DISPLAY:
+        printable = printable[:MAX_COMMAND_DISPLAY] + " ..."
+    try:
+        return subprocess.run(cmd, check=True, **kwargs)
+    except FileNotFoundError as e:
+        raise DotagError(f"cannot run '{printable}': {e}") from e
+    except subprocess.CalledProcessError as e:
+        raise DotagError(f"'{printable}' failed with exit status {e.returncode}") from e
 
 
 def parse():
@@ -244,9 +263,7 @@ def gnu_find_files():
     env["CYGWIN"] = "noglob"
     env["MSYS"] = "noglob"
 
-    result = subprocess.run(
-        cmd.args, check=True, stdout=subprocess.PIPE, text=True, env=env
-    )
+    result = run_tool(cmd.args, stdout=subprocess.PIPE, text=True, env=env)
     files = result.stdout.splitlines()
     return write_cscope_files(files)
 
@@ -300,7 +317,7 @@ def run_cscope():
             if os.path.exists(sh_path):
                 env["SHELL"] = sh_path
         
-    subprocess.run(cmd, check=True, env=env)
+    run_tool(cmd, env=env)
     log_cpu("cscope", start)
 
 
@@ -317,11 +334,7 @@ def create_filenametags(use_external_sort=False, sort_executable="sort"):
         print("creating filenametags (in-memory sort)...")
 
     if not os.path.exists(CSCOPE_FILE_NAME):
-        print(
-            f"[ERROR] {CSCOPE_FILE_NAME} not found. Cannot create filenametags.",
-            file=sys.stderr,
-        )
-        return
+        raise DotagError(f"{CSCOPE_FILE_NAME} not found. Cannot create filenametags.")
 
     if use_external_sort:
         # Generate raw tag lines and pipe them to 'sort -f'
@@ -342,20 +355,18 @@ def create_filenametags(use_external_sort=False, sort_executable="sort"):
             sort_env = os.environ.copy()
             sort_env["LC_ALL"] = "C"
 
-            result = subprocess.run(
+            result = run_tool(
                 [sort_executable, "-f"],
                 input=input_data,
                 stdout=subprocess.PIPE,
                 env=sort_env,
-                check=True,
             )
 
             with open(FILENAMETAG_FILE_NAME, "w", encoding="utf-8") as f:
                 f.write("!_TAG_FILE_SORTED\t2\t/2=foldcase/\n")
                 f.write(result.stdout.decode("utf-8"))
-        except subprocess.CalledProcessError as e:
-            print(f"[ERROR] External sort failed: {e}", file=sys.stderr)
-            return
+        except DotagError as e:
+            raise DotagError(f"external sort failed: {e}") from e
     else:
         lines = []
         with open(CSCOPE_FILE_NAME, "r", encoding="utf-8") as f:
@@ -377,7 +388,7 @@ def create_tags():
     start = time.time()
     cmd = ["ctags", "-L", CSCOPE_FILE_NAME]
     print(" ".join(cmd))
-    subprocess.run(cmd, check=True)
+    run_tool(cmd)
     log_cpu("ctags", start)
 
 
@@ -494,6 +505,7 @@ def main():
     # Cleanup old database files to prevent tool-level state conflicts
     if clean:
         print("Cleaning old database files...")
+        undeletable = []
         for f in [
             CSCOPE_FILE_NAME,
             "cscope.out",
@@ -505,8 +517,14 @@ def main():
             if os.path.exists(f):
                 try:
                     os.remove(f)
-                except OSError:
-                    pass
+                except OSError as e:
+                    undeletable.append(f"{f}: {e.strerror}")
+
+        if undeletable:
+            raise DotagError(
+                "cannot remove old database files (close programs using them, "
+                "or fix permissions):\n  " + "\n  ".join(undeletable)
+            )
 
     start = time.time()
 
@@ -522,11 +540,22 @@ def main():
             executor.submit(create_tags),
         ]
         # Wait for all tasks to complete and raise exceptions if any occurred
+        errors = []
         for future in futures:
-            future.result()
+            try:
+                future.result()
+            except DotagError as e:
+                errors.append(str(e))
+
+        if errors:
+            raise DotagError("\n".join(errors))
 
     log_cpu("Total", start)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except DotagError as error:
+        print(f"[ERROR] {error}", file=sys.stderr)
+        sys.exit(1)
