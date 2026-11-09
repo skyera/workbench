@@ -384,10 +384,6 @@ return {
     lazy = false,
   },
   {
-    "Exafunction/windsurf.vim",
-    event = "InsertEnter",
-  },
-  {
     "vim-scripts/a.vim",
     cmd = { "A", "AS", "AV", "AT", "AN", "IH", "IHS", "IHV", "IHT", "IHN" },
   },

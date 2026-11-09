@@ -228,9 +228,6 @@ vim.g.vimwiki_list = {
 vim.g.vimwiki_hl_headers = 1
 vim.g.vimwiki_hl_cb_checked = 1
 
--- Codeium: Start disabled by default for dynamic toggling
-vim.g.codeium_enabled = 0
-
 -- Performance & LSP Settings
 vim.opt.updatetime = 200
 

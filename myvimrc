@@ -49,7 +49,6 @@ Plug 'christoomey/vim-tmux-navigator'
 Plug 'dense-analysis/ale'
 Plug 'godlygeek/tabular'
 Plug 'tmhedberg/SimpylFold'
-Plug 'Exafunction/windsurf.vim'
 Plug 'ryanoasis/vim-devicons'
 if !has('gui_running')
     Plug 'ptzz/lf.vim'
@@ -503,10 +502,7 @@ if !has('gui_running')
     nnoremap <leader>lf :Lf<CR>
 endif
 
-" --- External Tools (Codeium, Webdevicons) ---
-imap <C-;>   <Cmd>call codeium#CycleCompletions(1)<CR>
-imap <C-,>   <Cmd>call codeium#CycleCompletions(-1)<CR>
-imap <C-x>   <Cmd>call codeium#Clear()<CR>
+" --- External Tools (Webdevicons) ---
 
 if exists('g:loaded_webdevicons')
     call webdevicons#refresh() 
