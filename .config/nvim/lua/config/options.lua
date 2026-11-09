@@ -229,7 +229,7 @@ vim.g.vimwiki_hl_headers = 1
 vim.g.vimwiki_hl_cb_checked = 1
 
 -- Performance & LSP Settings
-vim.opt.updatetime = 200
+vim.opt.updatetime = 500
 
 
 
@@ -241,9 +241,20 @@ vim.diagnostic.config({
   severity_sort = true,
 })
 
--- Show diagnostic float automatically when cursor rests on a line
+-- Shows the diagnostic float when the cursor rests on a line, in real file
+-- buffers only. Toggle with <leader>uf; the group prevents duplicates on re-source.
+vim.g.diagnostic_float_enabled = true
 vim.api.nvim_create_autocmd("CursorHold", {
+  group = vim.api.nvim_create_augroup("diagnostic_float", { clear = true }),
   callback = function()
+    if not vim.g.diagnostic_float_enabled then
+      return
+    end
+
+    if vim.bo.buftype ~= "" then
+      return
+    end
+
     vim.diagnostic.open_float(nil, { focus = false })
   end,
 })

@@ -58,6 +58,13 @@ for _, key in ipairs({ "grn", "gra", "gri", "grr", "grt", "grx" }) do
 end
 pcall(vim.keymap.del, "x", "gra")
 
+-- Toggle the automatic diagnostic float (see options.lua).
+vim.keymap.set("n", "<leader>uf", function()
+    vim.g.diagnostic_float_enabled = not vim.g.diagnostic_float_enabled
+    local state = vim.g.diagnostic_float_enabled and "on" or "off"
+    vim.notify("Diagnostic float: " .. state)
+end, { desc = "Toggle diagnostic float" })
+
 -- Tmux Navigator
 vim.keymap.set("n", "<M-h>", ":TmuxNavigateLeft<cr>", { silent = true })
 vim.keymap.set("n", "<M-j>", ":TmuxNavigateDown<cr>", { silent = true })
