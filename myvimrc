@@ -174,8 +174,32 @@ nmap <C-F10> :tp<cr>
 nmap <C-F2> :browse edit<cr>
 nmap <silent> <leader>ll :LUBufs<cr>
 
+" Formats the buffer with xmllint; the buffer is replaced only on success so a
+" missing tool or malformed input reports an error instead of eating the text.
+function! FormatXml()
+  if !executable('xmllint')
+    echohl ErrorMsg
+    echom 'xmllint not found: install it (Debian/Ubuntu: sudo apt install libxml2-utils)'
+    echohl None
+    return
+  endif
+
+  let output_lines = systemlist('xmllint --format -', getline(1, '$'))
+  if v:shell_error != 0
+    echohl ErrorMsg
+    echom 'xmllint failed (exit ' . v:shell_error . '): ' . join(output_lines, ' ')
+    echohl None
+    return
+  endif
+
+  let cursor_position = getpos('.')
+  silent keepjumps %delete _
+  call setline(1, output_lines)
+  call setpos('.', cursor_position)
+endfunction
+
 " --- Editing Helpers ---
-map <F2> <Esc>:1,$!xmllint --format -<CR>
+nnoremap <silent> <F2> :call FormatXml()<CR>
 map <F4> :execute "vimgrep /" . expand("<cword>") . "/j **" <Bar> cw<CR>
 nmap <F11> :silent !start explorer /select,%:p<CR>
 noremap <F12> <Esc>:syntax sync fromstart<CR>

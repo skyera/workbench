@@ -1,6 +1,38 @@
 -- Keymaps (translated from myvimrc)
 vim.g.mapleader = "\\" -- Set backslash as leader
 
+-- Formats the current buffer with xmllint.
+-- The buffer is replaced only when xmllint succeeds, so a missing tool or
+-- malformed input reports an error instead of overwriting the text.
+local function format_xml()
+    if vim.fn.executable("xmllint") == 0 then
+        vim.notify(
+            "xmllint not found: install it (Debian/Ubuntu: sudo apt install libxml2-utils)",
+            vim.log.levels.ERROR
+        )
+        return
+    end
+
+    local buffer_lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+    local input = table.concat(buffer_lines, "\n") .. "\n"
+    local result = vim.system({ "xmllint", "--format", "-" }, { stdin = input, text = true }):wait()
+
+    if result.code ~= 0 then
+        local detail = vim.trim(result.stderr or "")
+        if detail == "" then
+            detail = "no error output"
+        end
+        vim.notify(
+            string.format("xmllint failed (exit %d): %s", result.code, detail),
+            vim.log.levels.ERROR
+        )
+        return
+    end
+
+    local output_lines = vim.split(vim.trim(result.stdout), "\n", { plain = true })
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, output_lines)
+end
+
 -- General mappings
 vim.keymap.set("n", "<leader>ll", ":LUBufs<cr>", { silent = true })
 vim.keymap.set("n", "<F6>", ":cn<cr>")
@@ -12,7 +44,7 @@ vim.keymap.set("n", "<C-F10>", ":tp<cr>")
 vim.keymap.set("n", "<F4>", ':execute "vimgrep /" . expand("<cword>") . "/j **" <Bar> cw<CR>')
 vim.keymap.set("n", "<F11>", ":silent !start explorer /select,%:p<CR>")
 vim.keymap.set("n", "<C-F2>", ":browse edit<cr>")
-vim.keymap.set("n", "<F2>", "<Esc>:1,$!xmllint --format -<CR>")
+vim.keymap.set("n", "<F2>", format_xml, { desc = "Format XML with xmllint" })
 vim.keymap.set("n", "<F12>", "<Esc>:syntax sync fromstart<CR>")
 vim.keymap.set("n", "<space>", "za")
 vim.keymap.set("v", "<space>", "zf")
