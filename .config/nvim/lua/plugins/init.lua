@@ -492,6 +492,7 @@ return {
           map("n", "gD", function() jump_with_fallback("textDocument/declaration", "gD") end, "Goto Declaration (with Vim fallback)")
           map("n", "gr", vim.lsp.buf.references, "Goto References")
           map("n", "gi", vim.lsp.buf.implementation, "Goto Implementation")
+          map("n", "gy", vim.lsp.buf.type_definition, "Goto Type Definition")
           -- K: Open LSP Hover documentation in a top split window (with Man page fallback)
           map("n", "K", function()
             local cword = vim.fn.expand("<cword>")
