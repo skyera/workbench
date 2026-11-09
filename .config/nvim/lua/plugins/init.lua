@@ -258,7 +258,15 @@ return {
   {
     "junegunn/fzf.vim",
     dependencies = { "junegunn/fzf" },
-    cmd = { "Files", "GFiles", "Buffers", "Colors", "Ag", "Rg", "RG", "Frg", "FzfRG", "FRG", "Lines", "BLines", "Tags", "BTags", "Marks", "Windows", "Locate", "History", "Snippets", "Commits", "BCommits", "Commands", "Maps", "Helptags", "Filetypes" },
+    -- Names carry the "Fzf" prefix because vim.g.fzf_command_prefix = "Fzf"
+    -- (options.lua); unprefixed names would never match a typed command.
+    cmd = {
+      "FzfFiles", "FzfGFiles", "FzfBuffers", "FzfColors", "FzfAg", "FzfRg",
+      "FzfLines", "FzfBLines", "FzfTags", "FzfBTags", "FzfMarks", "FzfWindows",
+      "FzfLocate", "FzfHistory", "FzfSnippets", "FzfCommits", "FzfBCommits",
+      "FzfCommands", "FzfMaps", "FzfHelptags", "FzfFiletypes",
+      "FzfRG", "FRG", "Frg",
+    },
   },
   {
     "jremmen/vim-ripgrep",
