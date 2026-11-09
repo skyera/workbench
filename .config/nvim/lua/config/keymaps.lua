@@ -68,7 +68,9 @@ end, { desc = "Toggle Codeium AI" })
 -- AI Plugin Inline Mappings
 vim.keymap.set("i", "<C-;>", "<Cmd>call codeium#CycleCompletions(1)<CR>")
 vim.keymap.set("i", "<C-,>", "<Cmd>call codeium#CycleCompletions(-1)<CR>")
-vim.keymap.set("i", "<C-x>", "<Cmd>call codeium#Clear()<CR>")
+-- <C-]> (Codeium's default) instead of <C-x>, which would shadow the
+-- built-in i_CTRL-X completion prefix (^X^F, ^X^O, ^X^L, ...).
+vim.keymap.set("i", "<C-]>", "<Cmd>call codeium#Clear()<CR>", { desc = "Codeium: clear suggestion" })
 
 -- Terminal Tool Mappings (Only if not GUI)
 if vim.fn.has("gui_running") == 0 then
