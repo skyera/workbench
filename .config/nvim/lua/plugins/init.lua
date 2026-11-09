@@ -353,7 +353,7 @@ return {
         map("v", "<leader>hr", function() gs.reset_hunk({ vim.fn.line("."), vim.fn.line("v") }) end, "Reset Hunk (Visual)")
         map("n", "<leader>hp", gs.preview_hunk, "Preview Hunk Diff")
         map("n", "<leader>hb", function() gs.blame_line({ full = true }) end, "Blame Line (Popup)")
-        map("n", "<leader>tb", gs.toggle_current_line_blame, "Toggle Line Blame")
+        map("n", "<leader>hB", gs.toggle_current_line_blame, "Toggle Line Blame")
         map("n", "<leader>hd", gs.diffthis, "Diff This Buffer")
       end,
     },
