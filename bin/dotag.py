@@ -143,7 +143,7 @@ class FindCmd:
             for i, d in enumerate(self.excluded_dirs):
                 if i > 0:
                     self.args.append("-or")
-                self.args.extend(["-iname", f"*{d}*"])
+                self.args.extend(["-iname", d])
             self.args.extend([")", "-prune", "-or"])
 
         self.args.extend(["-type", "f", "("])
@@ -189,14 +189,13 @@ class FdCmd:
 
 
 def get_files():
+    excluded_names = {excl.lower() for excl in EXCLUDED_DIRS}
+
     for root, dirs, file_names in os.walk("."):
-        # Prune excluded directories in-place to prevent os.walk from descending
-        # Use substring matching for consistency with the 'find' method
-        dirs[:] = [
-            d
-            for d in dirs
-            if not any(excl.lower() in d.lower() for excl in EXCLUDED_DIRS)
-        ]
+        # Prune excluded directories in-place to prevent os.walk from descending.
+        # Names must match exactly (case-insensitive), as with the 'find' and 'fd'
+        # methods; substring matching would also drop dirs like "layout" or "output".
+        dirs[:] = [d for d in dirs if d.lower() not in excluded_names]
 
         for file_name in file_names:
             path = os.path.join(root, file_name)
