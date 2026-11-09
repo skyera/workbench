@@ -138,6 +138,12 @@ vim.api.nvim_create_autocmd("FileType", {
                 return
             end
 
+            -- Only real file buffers: help pages, hover floats and plugin
+            -- windows keep nvim's default highlighting.
+            if vim.bo[event.buf].buftype ~= "" then
+                return
+            end
+
             vim.treesitter.stop(event.buf)
             vim.bo[event.buf].syntax = vim.bo[event.buf].filetype
         end)
