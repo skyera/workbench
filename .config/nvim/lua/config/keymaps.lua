@@ -1,13 +1,26 @@
 -- Keymaps (translated from myvimrc)
 vim.g.mapleader = "\\" -- Set backslash as leader
 
+-- Returns an install hint for xmllint that matches the current OS.
+local function xmllint_install_hint()
+    if vim.fn.has("win32") == 1 then
+        return "install libxml2 (e.g. MSYS2: pacman -S libxml2) and add it to PATH"
+    end
+
+    if vim.fn.has("mac") == 1 then
+        return "install it with: brew install libxml2"
+    end
+
+    return "Debian/Ubuntu: sudo apt install libxml2-utils; Fedora: sudo dnf install libxml2"
+end
+
 -- Formats the current buffer with xmllint.
 -- The buffer is replaced only when xmllint succeeds, so a missing tool or
 -- malformed input reports an error instead of overwriting the text.
 local function format_xml()
     if vim.fn.executable("xmllint") == 0 then
         vim.notify(
-            "xmllint not found: install it (Debian/Ubuntu: sudo apt install libxml2-utils)",
+            "xmllint not found: " .. xmllint_install_hint(),
             vim.log.levels.ERROR
         )
         return

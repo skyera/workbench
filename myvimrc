@@ -177,10 +177,23 @@ nmap <silent> <leader>ll :LUBufs<cr>
 
 " Formats the buffer with xmllint; the buffer is replaced only on success so a
 " missing tool or malformed input reports an error instead of eating the text.
+" Returns an install hint for xmllint that matches the current OS.
+function! s:XmllintInstallHint()
+  if has('win32')
+    return 'install libxml2 (e.g. MSYS2: pacman -S libxml2) and add it to PATH'
+  endif
+
+  if has('mac')
+    return 'install it with: brew install libxml2'
+  endif
+
+  return 'Debian/Ubuntu: sudo apt install libxml2-utils; Fedora: sudo dnf install libxml2'
+endfunction
+
 function! FormatXml()
   if !executable('xmllint')
     echohl ErrorMsg
-    echom 'xmllint not found: install it (Debian/Ubuntu: sudo apt install libxml2-utils)'
+    echom 'xmllint not found: ' . s:XmllintInstallHint()
     echohl None
     return
   endif
