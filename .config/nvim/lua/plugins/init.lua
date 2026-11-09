@@ -97,7 +97,7 @@ return {
       { "<leader>sm", function() Snacks.picker.marks() end, desc = "Marks (Snacks)" },
       { "<leader>sj", function() Snacks.picker.jumps() end, desc = "Jumps (Snacks)" },
       -- Snacks Utilities & Git
-      { "<leader>h",  function() Snacks.dashboard() end, desc = "Open Dashboard" },
+      { "<leader>hh", function() Snacks.dashboard() end, desc = "Open Dashboard" },
       { "<leader>z",  function() Snacks.zen() end, desc = "Toggle Zen Mode" },
       { "<leader>Z",  function() Snacks.zen.zoom() end, desc = "Toggle Zoom" },
       { "<leader>.",  function() Snacks.scratch() end, desc = "Toggle Scratch Buffer" },

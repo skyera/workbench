@@ -268,8 +268,8 @@ nnoremap <silent> <leader>Vg :FzfRG<CR>
 nnoremap <silent> <leader>Vb :FzfBuffers<CR>
 nnoremap <silent> <leader>Vt :FzfTags<CR>
 nnoremap <silent> <leader>Vl :FzfLines<CR>
-nnoremap <silent> <leader>Vlb :FzfBLines<CR>
-nnoremap <silent> <leader>Vtb :FzfBTags<CR>
+nnoremap <silent> <leader>VL :FzfBLines<CR>
+nnoremap <silent> <leader>VT :FzfBTags<CR>
 
 " Lowercase <leader>v* aliases (faster typing, avoids Shift delay and accidental Visual mode trigger)
 nnoremap <silent> <leader>vf :FzfFiles<CR>
@@ -277,8 +277,8 @@ nnoremap <silent> <leader>vg :FzfRG<CR>
 nnoremap <silent> <leader>vb :FzfBuffers<CR>
 nnoremap <silent> <leader>vt :FzfTags<CR>
 nnoremap <silent> <leader>vl :FzfLines<CR>
-nnoremap <silent> <leader>vlb :FzfBLines<CR>
-nnoremap <silent> <leader>vtb :FzfBTags<CR>
+nnoremap <silent> <leader>vL :FzfBLines<CR>
+nnoremap <silent> <leader>vT :FzfBTags<CR>
 
 " --- ALE (Linting/Fixing) ---
 let g:ale_fixers = {
@@ -503,7 +503,7 @@ endif
 " --- Ranger / LF / Floaterm ---
 if !has('win32') && !has('gui_running')
     let g:ranger_map_keys = 0
-    nnoremap <leader>r :Ranger<CR>
+    nnoremap <leader>R :Ranger<CR>
 endif
 
 if !has('gui_running')

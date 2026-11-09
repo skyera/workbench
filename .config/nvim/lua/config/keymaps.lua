@@ -50,6 +50,14 @@ vim.keymap.set("n", "<space>", "za")
 vim.keymap.set("v", "<space>", "zf")
 vim.keymap.set("n", "<leader>cp", ':let @* = expand("%:p")<cr>', { desc = "Copy Full File Path" })
 
+-- Remove nvim's default gr* LSP maps (grn, gra, gri, grr, grt, grx). They make
+-- our "gr" (references, set on LspAttach) wait for 'timeoutlen' before firing.
+-- Rename, code action and implementation stay on <leader>rn, <leader>ca and gi.
+for _, key in ipairs({ "grn", "gra", "gri", "grr", "grt", "grx" }) do
+    pcall(vim.keymap.del, "n", key)
+end
+pcall(vim.keymap.del, "x", "gra")
+
 -- Tmux Navigator
 vim.keymap.set("n", "<M-h>", ":TmuxNavigateLeft<cr>", { silent = true })
 vim.keymap.set("n", "<M-j>", ":TmuxNavigateDown<cr>", { silent = true })
@@ -63,8 +71,8 @@ vim.keymap.set("n", "<leader>Vg", ":FzfRG<CR>", { silent = true, desc = "FZF Rip
 vim.keymap.set("n", "<leader>Vb", ":FzfBuffers<CR>", { silent = true, desc = "FZF Buffers (Vim)" })
 vim.keymap.set("n", "<leader>Vt", ":FzfTags<CR>", { silent = true, desc = "FZF Tags (Vim)" })
 vim.keymap.set("n", "<leader>Vl", ":FzfLines<CR>", { silent = true, desc = "FZF Lines (Vim)" })
-vim.keymap.set("n", "<leader>Vlb", ":FzfBLines<CR>", { silent = true, desc = "FZF Buffer Lines (Vim)" })
-vim.keymap.set("n", "<leader>Vtb", ":FzfBTags<CR>", { silent = true, desc = "FZF Buffer Tags (Vim)" })
+vim.keymap.set("n", "<leader>VL", ":FzfBLines<CR>", { silent = true, desc = "FZF Buffer Lines (Vim)" })
+vim.keymap.set("n", "<leader>VT", ":FzfBTags<CR>", { silent = true, desc = "FZF Buffer Tags (Vim)" })
 
 -- Lowercase <leader>v* aliases (faster typing, avoids Shift delay and accidental Visual mode trigger on timeout)
 vim.keymap.set("n", "<leader>vf", ":FzfFiles<CR>", { silent = true, desc = "FZF Files (Vim)" })
@@ -72,8 +80,8 @@ vim.keymap.set("n", "<leader>vg", ":FzfRG<CR>", { silent = true, desc = "FZF Rip
 vim.keymap.set("n", "<leader>vb", ":FzfBuffers<CR>", { silent = true, desc = "FZF Buffers (Vim)" })
 vim.keymap.set("n", "<leader>vt", ":FzfTags<CR>", { silent = true, desc = "FZF Tags (Vim)" })
 vim.keymap.set("n", "<leader>vl", ":FzfLines<CR>", { silent = true, desc = "FZF Lines (Vim)" })
-vim.keymap.set("n", "<leader>vlb", ":FzfBLines<CR>", { silent = true, desc = "FZF Buffer Lines (Vim)" })
-vim.keymap.set("n", "<leader>vtb", ":FzfBTags<CR>", { silent = true, desc = "FZF Buffer Tags (Vim)" })
+vim.keymap.set("n", "<leader>vL", ":FzfBLines<CR>", { silent = true, desc = "FZF Buffer Lines (Vim)" })
+vim.keymap.set("n", "<leader>vT", ":FzfBTags<CR>", { silent = true, desc = "FZF Buffer Tags (Vim)" })
 
 -- Note: Snacks.picker (<leader>s*) and Snacks utilities (<leader>h, <leader>z, <leader>lg, <c-/>) keymaps
 -- are defined in lua/plugins/init.lua under the snacks.nvim plugin spec to leverage lazy.nvim lazy-loading.
@@ -86,7 +94,7 @@ vim.keymap.set("n", "<leader>nf", ":NERDTreeFind<cr>")
 
 -- Terminal Tool Mappings (Only if not GUI)
 if vim.fn.has("gui_running") == 0 then
-  vim.keymap.set("n", "<leader>r", ":Ranger<CR>", { silent = true })
+  vim.keymap.set("n", "<leader>R", ":Ranger<CR>", { silent = true })
   vim.keymap.set("n", "<leader>lf", ":Lf<CR>", { silent = true })
 end
 
