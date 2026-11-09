@@ -79,6 +79,8 @@ CSCOPE_FILE_NAME = "cscope.files"
 FILENAMETAG_FILE_NAME = "filenametags"
 # Longest command line echoed in an error message (find commands are very long).
 MAX_COMMAND_DISPLAY = 120
+# Debian and Ubuntu install fd-find as "fdfind" because "fd" clashes with another package.
+FD_EXECUTABLE_NAMES = ("fd", "fdfind")
 
 
 class DotagError(Exception):
@@ -182,11 +184,19 @@ def case_insensitive_glob(name):
     return "".join(f"[{c.lower()}{c.upper()}]" if c.isalpha() else c for c in name)
 
 
+def find_fd_executable():
+    """Return the fd executable name on PATH (Debian/Ubuntu: fdfind), or None."""
+    for name in FD_EXECUTABLE_NAMES:
+        if shutil.which(name):
+            return name
+    return None
+
+
 class FdCmd:
     def __init__(self, excluded_dirs, file_exts, no_ignore=False):
         self.excluded_dirs = excluded_dirs
         self.file_exts = file_exts
-        self.fd_cmd = ["fd", "--type", "f", "--ignore-case"]
+        self.fd_cmd = [find_fd_executable() or "fd", "--type", "f", "--ignore-case"]
         if no_ignore:
             self.fd_cmd.extend(["--no-ignore", "--hidden"])
 
@@ -408,12 +418,13 @@ def log_find_method(find_method):
 def check_dependencies(find_method):
     """Verify that required tools are installed."""
     tools = ["cscope", "ctags"]
-    if find_method == "fd":
-        tools.append("fd")
-    elif find_method == "find":
+    if find_method == "find":
         tools.append("find")
 
     missing = []
+    if find_method == "fd" and find_fd_executable() is None:
+        missing.append("fd (or fdfind)")
+
     for tool in tools:
         if shutil.which(tool) is None:
             # Special check for find on Windows to avoid the built-in Windows find.exe
