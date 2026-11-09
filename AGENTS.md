@@ -23,7 +23,7 @@ well-organized code over compact code.
 
 ### General Rules
 
-*   **One Statement per Line**: Do not pack assignments, calls, branches, or loops onto one line using semicolons or other separators. Expand control flow, including early returns, into clearly indented blocks.
+*   **One Statement per Line**: Do not pack assignments, calls, branches, or loops onto one line using semicolons or other separators. Expand control flow, including early returns, into clearly indented blocks (Lua has two narrow exceptions, listed under Language Conventions).
 *   **Consistent Formatting & Vertical Paragraphing**: Use consistent indentation, spacing around operators, and blank lines between logical steps. Expanding compact code must not create unbroken vertical walls of code. Break functions longer than 15–20 lines into readable logical paragraphs (e.g., argument validation, data transformation, loops, state updates, resource acquisition/release). Group long branching ladders (such as key event handlers or CLI parsers) into logical clusters separated by blank lines and concise category comments.
 *   **Section Dividers**: For substantial single-file tools or modules (>300 lines), use clear 80-column section divider banners (e.g., `--------------------------------------------------------------------------------`) to delineate major layers: constants & FFI, utility helpers, domain/state logic, UI/rendering, host/CLI management, and entry points.
 *   **Descriptive Names**: Choose names that explain purpose and units, such as `refresh_interval_seconds` or `process_start_ticks`. Avoid cryptic abbreviations and single-letter names except for small loop indices or conventional local values.
@@ -38,7 +38,7 @@ well-organized code over compact code.
 
 *   **Lua / LuaJIT**:
     *   Use four spaces for indentation in new files. The Neovim config (`.config/nvim`) is the exception: it uses two spaces, the Neovim convention. `.editorconfig` files set both widths.
-    *   **No single-line blocks**: Never put an `if ... then ... end`, `for ... do ... end`, `while ... do ... end`, `repeat ... until`, or `function ... end` body on the same line as its header. This includes early returns and guards: `if not f then return nil end` must be expanded. `elseif` and `else` each start their own line.
+    *   **No single-line blocks**, with two exceptions: (1) a callback whose whole body is one call or one `return` expression (e.g. `function() Snacks.zen() end`); (2) a short guard (`if cond then return end`, `break`, `goto continue`) with no `else`, under 100 columns. Everything else is expanded: never put the body of an `if`, `for`, `while`, `repeat` or multi-statement `function` on the same line as its header, and `elseif` and `else` each start their own line.
     *   **One statement per line**: Do not join statements with `;` or spaces (e.g., `step = 1; width = 1`).
     *   **Small, focused functions**: Each function does one job and should usually fit on one screen (aim for under ~30–40 lines). Extract loop bodies, complex conditions, string building, and repeated logic into named `local` helpers. Prefer early returns (each in its own expanded block) over deep nesting.
     *   **Comments where they help**: Add a short comment above each non-trivial function stating its purpose, inputs, and return values. Explain *why* for non-obvious logic, platform quirks, magic numbers, FFI struct layouts, and buffer or handle ownership. Do not comment what the code already says plainly.
