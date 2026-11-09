@@ -42,8 +42,15 @@ vim.keymap.set("n", "<F9>", ":bp<cr>")
 vim.keymap.set("n", "<F10>", ":tn<cr>")
 vim.keymap.set("n", "<C-F10>", ":tp<cr>")
 vim.keymap.set("n", "<F4>", ':execute "vimgrep /" . expand("<cword>") . "/j **" <Bar> cw<CR>')
-vim.keymap.set("n", "<F11>", ":silent !start explorer /select,%:p<CR>")
-vim.keymap.set("n", "<C-F2>", ":browse edit<cr>")
+-- Windows Explorer reveal; the "start explorer" command only exists on Windows.
+if vim.fn.has("win32") == 1 then
+    vim.keymap.set("n", "<F11>", ":silent !start explorer /select,%:p<CR>")
+end
+
+-- File-open dialog; :browse only works in a GUI.
+if vim.fn.has("gui_running") == 1 then
+    vim.keymap.set("n", "<C-F2>", ":browse edit<cr>")
+end
 vim.keymap.set("n", "<F2>", format_xml, { desc = "Format XML with xmllint" })
 vim.keymap.set("n", "<F12>", "<Esc>:syntax sync fromstart<CR>")
 vim.keymap.set("n", "<space>", "za")

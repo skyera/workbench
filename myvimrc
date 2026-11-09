@@ -96,7 +96,6 @@ set shiftwidth=4
 set expandtab
 set ai
 set shiftround
-set cindent
 set cinoptions=g-1
 set listchars=tab:▸\ ,trail:·,extends:❯,precedes:❮,nbsp:␣
 
@@ -171,7 +170,9 @@ nmap <F8> :bn<cr>
 nmap <F9> :bp<cr>
 nmap <F10> :tn<cr>
 nmap <C-F10> :tp<cr>
-nmap <C-F2> :browse edit<cr>
+if has('gui_running')
+  nmap <C-F2> :browse edit<cr>
+endif
 nmap <silent> <leader>ll :LUBufs<cr>
 
 " Formats the buffer with xmllint; the buffer is replaced only on success so a
@@ -201,7 +202,9 @@ endfunction
 " --- Editing Helpers ---
 nnoremap <silent> <F2> :call FormatXml()<CR>
 map <F4> :execute "vimgrep /" . expand("<cword>") . "/j **" <Bar> cw<CR>
-nmap <F11> :silent !start explorer /select,%:p<CR>
+if has('win32')
+  nmap <F11> :silent !start explorer /select,%:p<CR>
+endif
 noremap <F12> <Esc>:syntax sync fromstart<CR>
 nnoremap <space> za
 vnoremap <space> zf
@@ -324,9 +327,7 @@ let g:LookupFile_ignorecase = 1
 let g:LookupFile_EnableRemapCmd = 0
 let g:LookupFile_TagExpr = '"filenametags"'
 
-" --- Classic Vim UI (WinManager/Startify) ---
-let g:winManagerWindowLayout='FileExplorer|TagList'
-let Tlist_Show_One_File=1
+" --- Classic Vim UI (Startify) ---
 let g:startify_change_to_dir = 0
 let g:startify_disable_at_vimenter = 1
 let g:startify_vcs_number_of_files = 0

@@ -34,15 +34,12 @@ vim.opt.ignorecase = true
 vim.opt.smartcase = true
 vim.opt.cursorline = true
 vim.opt.shiftround = true
-vim.opt.encoding = "utf-8"
 vim.opt.colorcolumn = "80"
 vim.opt.termguicolors = true
 vim.opt.laststatus = 2
 vim.opt.wrapscan = true
-vim.opt.cindent = true
 vim.opt.cinoptions = "g-1"
 vim.opt.listchars = { tab = "▸ ", trail = "·", extends = "❯", precedes = "❮", nbsp = "␣" }
-vim.opt.directory:prepend(vim.fn.expand("$HOME") .. "/.vim/tmp//")
 
 -- Clipboard logic
 if vim.fn.has("clipboard") == 1 then
@@ -65,8 +62,6 @@ end
 -- Plugin Globals
 vim.g.lf_map_keys = 0
 vim.g.ranger_map_keys = 0
-vim.g.winManagerWindowLayout = 'FileExplorer|TagList'
-vim.g.Tlist_Show_One_File = 1
 vim.g.LookupFile_MinPatLength = 3
 vim.g.LookupFile_PreserveLastPattern = 0
 vim.g.LookupFile_PreservePatternHistory = 1
