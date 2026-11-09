@@ -97,7 +97,7 @@ if [ "$NVIM_CHOICE" == "lua" ]; then
         echo "Deploying Neovim Lua configuration..."
         mkdir -p "$HOME/.config/nvim"
         [ -f "$HOME/.config/nvim/init.vim" ] && rm "$HOME/.config/nvim/init.vim"
-        cp -r "$REPO_DIR/.config/nvim/"* "$HOME/.config/nvim/"
+        cp -r "$REPO_DIR/.config/nvim/." "$HOME/.config/nvim/"
         echo "Deployed Neovim configuration to $HOME/.config/nvim"
     fi
 else

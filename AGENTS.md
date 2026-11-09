@@ -37,7 +37,7 @@ well-organized code over compact code.
 ### Language Conventions
 
 *   **Lua / LuaJIT**:
-    *   Use four spaces for indentation in new files.
+    *   Use four spaces for indentation in new files. The Neovim config (`.config/nvim`) is the exception: it uses two spaces, the Neovim convention. `.editorconfig` files set both widths.
     *   **No single-line blocks**: Never put an `if ... then ... end`, `for ... do ... end`, `while ... do ... end`, `repeat ... until`, or `function ... end` body on the same line as its header. This includes early returns and guards: `if not f then return nil end` must be expanded. `elseif` and `else` each start their own line.
     *   **One statement per line**: Do not join statements with `;` or spaces (e.g., `step = 1; width = 1`).
     *   **Small, focused functions**: Each function does one job and should usually fit on one screen (aim for under ~30–40 lines). Extract loop bodies, complex conditions, string building, and repeated logic into named `local` helpers. Prefer early returns (each in its own expanded block) over deep nesting.
