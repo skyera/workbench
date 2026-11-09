@@ -253,9 +253,10 @@ return {
   },
   {
     "junegunn/fzf",
-    -- --bin only downloads the binary; --all would also edit ~/.bashrc/.zshrc
-    -- and create ~/.fzf.*, duplicating the integration in mybashrc.
-    build = "./install --bin",
+    -- fzf#install() picks install.ps1 on native Windows and `install --bin`
+    -- elsewhere. Both only download the binary (unlike `install --all`,
+    -- which edits ~/.bashrc/.zshrc). A raw "./install" breaks under cmd.exe.
+    build = ":call fzf#install()",
   },
   {
     "junegunn/fzf.vim",
