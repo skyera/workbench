@@ -253,7 +253,9 @@ return {
   },
   {
     "junegunn/fzf",
-    build = "./install --all",
+    -- --bin only downloads the binary; --all would also edit ~/.bashrc/.zshrc
+    -- and create ~/.fzf.*, duplicating the integration in mybashrc.
+    build = "./install --bin",
   },
   {
     "junegunn/fzf.vim",
