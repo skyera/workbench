@@ -173,6 +173,15 @@ class FindCmd:
         self.args.extend([")", "-print"])
 
 
+def case_insensitive_glob(name):
+    """Return a glob matching `name` in any letter case: 'Out' -> '[oO][uU][tT]'.
+
+    fd's --exclude is always case-sensitive (--ignore-case only affects the
+    search pattern), unlike the 'find' and 'py' methods.
+    """
+    return "".join(f"[{c.lower()}{c.upper()}]" if c.isalpha() else c for c in name)
+
+
 class FdCmd:
     def __init__(self, excluded_dirs, file_exts, no_ignore=False):
         self.excluded_dirs = excluded_dirs
@@ -186,7 +195,7 @@ class FdCmd:
             self.fd_cmd.extend(["-e", ext.lstrip(".")])
 
         for pat in self.excluded_dirs:
-            self.fd_cmd.extend(["--exclude", pat])
+            self.fd_cmd.extend(["--exclude", case_insensitive_glob(pat)])
 
     def run_fd(self):
         print("Running fd")
