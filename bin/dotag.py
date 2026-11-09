@@ -304,6 +304,11 @@ def run_cscope():
     log_cpu("cscope", start)
 
 
+def foldcase_sort_key(line):
+    """Sort key equal to GNU `LC_ALL=C sort -f`: ASCII-only fold to upper case, by bytes."""
+    return line.encode("utf-8").upper()
+
+
 def create_filenametags(use_external_sort=False, sort_executable="sort"):
     start = time.time()
     if use_external_sort:
@@ -332,10 +337,16 @@ def create_filenametags(use_external_sort=False, sort_executable="sort"):
             input_data = "".join(tag_entries).encode("utf-8")
 
             # Run sort -f and capture output
+            # Force the C locale: locale collation ignores punctuation and would
+            # disagree with the in-memory sort and the foldcase header below.
+            sort_env = os.environ.copy()
+            sort_env["LC_ALL"] = "C"
+
             result = subprocess.run(
                 [sort_executable, "-f"],
                 input=input_data,
                 stdout=subprocess.PIPE,
+                env=sort_env,
                 check=True,
             )
 
@@ -353,7 +364,7 @@ def create_filenametags(use_external_sort=False, sort_executable="sort"):
                 name = Path(path).name
                 lines.append(f"{name}\t{path}\t1\n")
 
-        lines.sort(key=str.lower)
+        lines.sort(key=foldcase_sort_key)
 
         with open(FILENAMETAG_FILE_NAME, "w", encoding="utf-8") as f:
             f.write("!_TAG_FILE_SORTED\t2\t/2=foldcase/\n")
