@@ -20,7 +20,7 @@ return {
             { icon = " ", key = "n", desc = "New File", action = ":ene | startinsert" },
             { icon = " ", key = "g", desc = "Find Text", action = ":lua Snacks.picker.grep()" },
             { icon = " ", key = "r", desc = "Recent Files", action = ":lua Snacks.picker.recent()" },
-            { icon = " ", key = "c", desc = "Neovim Config", action = ":lua Snacks.picker.files({ cwd = vim.fn.stdpath('config') })" },
+            { icon = " ", key = "c", desc = "Neovim Config", action = ":lua Snacks.picker.files({ cwd = vim.fn.stdpath('config'), ignored = true })" },
             { icon = "󰒲 ", key = "l", desc = "Lazy Plugins", action = ":Lazy" },
             { icon = " ", key = "q", desc = "Quit", action = ":qa" },
           },
