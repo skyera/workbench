@@ -134,11 +134,40 @@ def parse():
     return args.find, args.clean, args.no_ignore, not args.in_memory_sort
 
 
+def decode_file_names(raw_output):
+    """Split a find tool's raw stdout into file names.
+
+    Bytes that are not valid UTF-8 become surrogate escapes instead of raising,
+    so write_cscope_files() can report and skip just the affected names.
+    """
+    return [line.decode("utf-8", "surrogateescape") for line in raw_output.splitlines()]
+
+
+def is_utf8_name(file_name):
+    """Return True when `file_name` can be written to the UTF-8 database files."""
+    try:
+        file_name.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+
+    return True
+
+
+def printable_name(file_name):
+    """Return `file_name` with undecodable bytes shown as \\xNN, safe to print anywhere."""
+    return file_name.encode("utf-8", "surrogateescape").decode("utf-8", "backslashreplace")
+
+
 def write_cscope_files(files):
-    """Write files to cscope.files, skipping those with spaces and printing a warning."""
+    """Write files to cscope.files, skipping (with a warning) names that have
+    spaces or are not valid UTF-8."""
     count = 0
     with open(CSCOPE_FILE_NAME, "w", encoding="utf-8") as cscope_f:
         for f in files:
+            if not is_utf8_name(f):
+                print(f"{printable_name(f)} is not valid UTF-8 (skipped)", file=sys.stderr)
+                continue
+
             if " " in f:
                 print(f"{f} has spaces", file=sys.stderr)
                 continue
@@ -215,14 +244,13 @@ class FdCmd:
             self.fd_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
             check=False,
         )
         if result.returncode != 0:
-            print(result.stderr, file=sys.stderr)
+            print(result.stderr.decode("utf-8", "replace"), file=sys.stderr)
             sys.exit(1)
 
-        files = result.stdout.splitlines()
+        files = decode_file_names(result.stdout)
         return write_cscope_files(files)
 
 
@@ -282,8 +310,8 @@ def gnu_find_files():
     env["CYGWIN"] = "noglob"
     env["MSYS"] = "noglob"
 
-    result = run_tool(cmd.args, stdout=subprocess.PIPE, text=True, env=env)
-    files = result.stdout.splitlines()
+    result = run_tool(cmd.args, stdout=subprocess.PIPE, env=env)
+    files = decode_file_names(result.stdout)
     return write_cscope_files(files)
 
 
