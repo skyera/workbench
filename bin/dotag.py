@@ -411,14 +411,14 @@ def run_cscope():
     start = time.time()
     cmd = ["cscope", "-b", "-q", "-k", "-i", CSCOPE_FILE_NAME]
     print(" ".join(cmd))
-    
+
     # Resolve cscope location to ensure it calls sibling binaries (like Cygwin sort)
     cscope_path = shutil.which("cscope")
     env = os.environ.copy()
     if cscope_path:
         cscope_dir = os.path.dirname(cscope_path)
         env["PATH"] = cscope_dir + os.pathsep + env.get("PATH", "")
-        
+
         # Override SHELL to use sibling sh.exe if on Windows to prevent
         # cross-environment path translation errors (e.g. MSYS2 bash not understanding
         # Cygwin temp paths like /cygdrive/c/...).
@@ -426,7 +426,7 @@ def run_cscope():
             sh_path = os.path.join(cscope_dir, "sh.exe")
             if os.path.exists(sh_path):
                 env["SHELL"] = sh_path
-        
+
     run_tool(cmd, env=env)
     log_cpu("cscope", start)
 
