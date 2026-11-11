@@ -85,6 +85,45 @@ class DotagPy(unittest.TestCase):
                 if method != "fd":
                     self.assertIn("caf\\xe9.c is not valid UTF-8 (skipped)", result.stderr)
 
+    @unittest.skipIf(os.name == "nt", "needs POSIX directory permissions")
+    def test_unreadable_directory_is_skipped_with_warning(self):
+        if os.geteuid() == 0:
+            self.skipTest("root can read every directory")
+
+        self.write_source("src/a.c")
+        self.write_source("locked/b.c")
+        locked = self.tree / "locked"
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o755)
+
+        for method in available_find_methods():
+            with self.subTest(method=method):
+                result = self.run_dotag("-c", "-f", method)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual([Path(name).name for name in self.listed_files()], ["a.c"])
+                self.assertTrue((self.tree / "cscope.out").exists())
+                self.assertIn("[WARN]", result.stderr)
+                self.assertIn("locked", result.stderr)
+                self.assertIn("ermission denied", result.stderr)
+
+    @unittest.skipIf(os.name == "nt", "needs POSIX directory permissions")
+    @unittest.skipUnless(HAS_FIND, "requires find")
+    def test_find_that_lists_nothing_and_fails_is_an_error(self):
+        if os.geteuid() == 0:
+            self.skipTest("root can read every directory")
+
+        self.write_source("locked/b.c")
+        locked = self.tree / "locked"
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o755)
+
+        result = self.run_dotag("-c", "-f", "find")
+
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("[ERROR] find failed with exit status 1 and listed no files", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

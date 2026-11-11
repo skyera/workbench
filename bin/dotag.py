@@ -87,13 +87,16 @@ class DotagError(Exception):
     """A failure that main() reports as a clear message and a non-zero exit."""
 
 
-def run_tool(cmd, **kwargs):
-    """Run an external tool; raise DotagError naming the command and why it failed."""
+def run_tool(cmd, check=True, **kwargs):
+    """Run an external tool; raise DotagError naming the command and why it failed.
+
+    With check=False a non-zero exit status is returned to the caller instead.
+    """
     printable = " ".join(shlex.quote(str(arg)) for arg in cmd)
     if len(printable) > MAX_COMMAND_DISPLAY:
         printable = printable[:MAX_COMMAND_DISPLAY] + " ..."
     try:
-        return subprocess.run(cmd, check=True, **kwargs)
+        return subprocess.run(cmd, check=check, **kwargs)
     except FileNotFoundError as e:
         raise DotagError(f"cannot run '{printable}': {e}") from e
     except subprocess.CalledProcessError as e:
@@ -225,7 +228,14 @@ class FdCmd:
     def __init__(self, excluded_dirs, file_exts, no_ignore=False):
         self.excluded_dirs = excluded_dirs
         self.file_exts = file_exts
-        self.fd_cmd = [find_fd_executable() or "fd", "--type", "f", "--ignore-case"]
+        # --show-errors: fd otherwise skips unreadable directories silently.
+        self.fd_cmd = [
+            find_fd_executable() or "fd",
+            "--type",
+            "f",
+            "--ignore-case",
+            "--show-errors",
+        ]
         if no_ignore:
             self.fd_cmd.extend(["--no-ignore", "--hidden"])
 
@@ -250,14 +260,28 @@ class FdCmd:
             print(result.stderr.decode("utf-8", "replace"), file=sys.stderr)
             sys.exit(1)
 
+        # fd exits 0 even when it had to skip paths; pass its reports on.
+        skipped_path_errors = result.stderr.decode("utf-8", "replace").strip()
+        if skipped_path_errors:
+            print(skipped_path_errors, file=sys.stderr)
+            print("[WARN] fd could not read the paths above (skipped)", file=sys.stderr)
+
         files = decode_file_names(result.stdout)
         return write_cscope_files(files)
+
+
+def warn_unreadable_directory(error):
+    """os.walk error callback: report a directory that could not be listed."""
+    print(
+        f"[WARN] cannot read directory {error.filename}: {error.strerror} (skipped)",
+        file=sys.stderr,
+    )
 
 
 def get_files():
     excluded_names = {excl.lower() for excl in EXCLUDED_DIRS}
 
-    for root, dirs, file_names in os.walk("."):
+    for root, dirs, file_names in os.walk(".", onerror=warn_unreadable_directory):
         # Prune excluded directories in-place to prevent os.walk from descending.
         # Names must match exactly (case-insensitive), as with the 'find' and 'fd'
         # methods; substring matching would also drop dirs like "layout" or "output".
@@ -269,6 +293,29 @@ def get_files():
                 _, ext = os.path.splitext(file_name)
                 if ext.lower() in FILE_EXTS:
                     yield path
+
+
+def check_find_exit_status(exit_status, file_count):
+    """Decide whether a non-zero find exit status is fatal.
+
+    find exits non-zero when it cannot read some directory, yet still lists
+    everything else. Keep that partial list; fail only when nothing was listed.
+    find's own messages (which name the paths) have already gone to stderr.
+    """
+    if exit_status == 0:
+        return
+
+    if file_count == 0:
+        raise DotagError(
+            f"find failed with exit status {exit_status} and listed no files "
+            "(see its messages above)"
+        )
+
+    print(
+        f"[WARN] find exited with status {exit_status}: it could not read the paths above; "
+        f"continuing with the {file_count} files it listed",
+        file=sys.stderr,
+    )
 
 
 def gnu_find_files():
@@ -310,8 +357,9 @@ def gnu_find_files():
     env["CYGWIN"] = "noglob"
     env["MSYS"] = "noglob"
 
-    result = run_tool(cmd.args, stdout=subprocess.PIPE, env=env)
+    result = run_tool(cmd.args, check=False, stdout=subprocess.PIPE, env=env)
     files = decode_file_names(result.stdout)
+    check_find_exit_status(result.returncode, len(files))
     return write_cscope_files(files)
 
 
