@@ -124,6 +124,24 @@ class DotagPy(unittest.TestCase):
         self.assertNotIn("Traceback", result.stderr)
         self.assertIn("[ERROR] find failed with exit status 1 and listed no files", result.stderr)
 
+    def test_tree_without_source_files_is_a_clear_error(self):
+        (self.tree / "notes.txt").write_text("not a source file\n", encoding="utf-8")
+
+        for method in available_find_methods():
+            with self.subTest(method=method):
+                result = self.run_dotag("-c", "-f", method)
+
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertIn("[ERROR] no source files found under", result.stderr)
+                self.assertIn(f"(find method: {method})", result.stderr)
+                self.assertEqual("-I to include" in result.stderr, method == "fd")
+
+                # The indexers must not have run on the empty list.
+                self.assertNotIn("cscope: no source files found", result.stderr)
+                self.assertFalse((self.tree / "tags").exists())
+                self.assertFalse((self.tree / "filenametags").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

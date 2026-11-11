@@ -390,6 +390,21 @@ def collect_files(find_method, no_ignore=False):
         num_files = fd_files(no_ignore)
 
     log_cpu(f"find files: number of files {num_files}", start)
+    return num_files
+
+
+def no_source_files_message(find_method, no_ignore):
+    """Explain an empty file list and how to get a non-empty one."""
+    message = (
+        f"no source files found under {os.getcwd()} (find method: {find_method}); "
+        "nothing to index. Run dotag.py from the root of the source tree."
+    )
+    if find_method == "fd" and not no_ignore:
+        message += (
+            "\nfd skips hidden and ignored (.gitignore) files; use -I to include them."
+        )
+
+    return message
 
 
 def run_cscope():
@@ -625,7 +640,9 @@ def main():
     start = time.time()
 
     # 1. Collect files (Sequential, as it creates the base file)
-    collect_files(find_method, no_ignore)
+    file_count = collect_files(find_method, no_ignore)
+    if file_count == 0:
+        raise DotagError(no_source_files_message(find_method, no_ignore))
 
     # 2. Run post-processing tasks in parallel
     print("Starting post-processing (parallel)...")
