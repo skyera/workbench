@@ -436,7 +436,8 @@ def foldcase_sort_key(line):
     return line.encode("utf-8").upper()
 
 
-def create_filenametags(use_external_sort=False, sort_executable="sort"):
+def write_filenametags(use_external_sort=False, sort_executable="sort"):
+    """Build the filenametags file from cscope.files (may raise OSError)."""
     start = time.time()
     if use_external_sort:
         print(f"creating filenametags (external {sort_executable} -f)...")
@@ -492,6 +493,17 @@ def create_filenametags(use_external_sort=False, sort_executable="sort"):
             f.writelines(lines)
 
     log_cpu("filenametags", start)
+
+
+def create_filenametags(use_external_sort=False, sort_executable="sort"):
+    """Create filenametags; report file I/O failures as a DotagError."""
+    try:
+        write_filenametags(use_external_sort, sort_executable)
+    except OSError as e:
+        raise DotagError(
+            f"cannot write {FILENAMETAG_FILE_NAME}: {e} "
+            "(remove or rename it, or run dotag.py with -c)"
+        ) from e
 
 
 def create_tags():

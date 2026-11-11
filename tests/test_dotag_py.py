@@ -142,6 +142,23 @@ class DotagPy(unittest.TestCase):
                 self.assertFalse((self.tree / "tags").exists())
                 self.assertFalse((self.tree / "filenametags").exists())
 
+    def test_unwritable_filenametags_is_a_clear_error(self):
+        self.write_source("a.c")
+
+        for method in available_find_methods():
+            with self.subTest(method=method):
+                # A directory in the way makes opening filenametags for writing fail.
+                blocker = self.tree / "filenametags"
+                blocker.mkdir(exist_ok=True)
+                self.addCleanup(shutil.rmtree, blocker, True)
+
+                result = self.run_dotag("-f", method)
+
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertIn("[ERROR] cannot write filenametags:", result.stderr)
+                self.assertIn("run dotag.py with -c", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
