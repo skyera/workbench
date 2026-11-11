@@ -87,14 +87,20 @@ class DotagError(Exception):
     """A failure that main() reports as a clear message and a non-zero exit."""
 
 
+def printable_command(cmd):
+    """Return `cmd` as a shell-quoted string, truncated for error messages."""
+    printable = " ".join(shlex.quote(str(arg)) for arg in cmd)
+    if len(printable) > MAX_COMMAND_DISPLAY:
+        printable = printable[:MAX_COMMAND_DISPLAY] + " ..."
+    return printable
+
+
 def run_tool(cmd, check=True, **kwargs):
     """Run an external tool; raise DotagError naming the command and why it failed.
 
     With check=False a non-zero exit status is returned to the caller instead.
     """
-    printable = " ".join(shlex.quote(str(arg)) for arg in cmd)
-    if len(printable) > MAX_COMMAND_DISPLAY:
-        printable = printable[:MAX_COMMAND_DISPLAY] + " ..."
+    printable = printable_command(cmd)
     try:
         return subprocess.run(cmd, check=check, **kwargs)
     except FileNotFoundError as e:
@@ -257,8 +263,11 @@ class FdCmd:
             check=False,
         )
         if result.returncode != 0:
-            print(result.stderr.decode("utf-8", "replace"), file=sys.stderr)
-            sys.exit(1)
+            reason = result.stderr.decode("utf-8", "replace").strip() or "no message"
+            raise DotagError(
+                f"'{printable_command(self.fd_cmd)}' failed with exit status "
+                f"{result.returncode}: {reason}"
+            )
 
         # fd exits 0 even when it had to skip paths; pass its reports on.
         skipped_path_errors = result.stderr.decode("utf-8", "replace").strip()
@@ -322,8 +331,11 @@ def gnu_find_files():
     find_executable = shutil.which("find")
     if os.name == "nt":
         if not find_executable:
-            print("Error: 'find' command not found.", file=sys.stderr)
-            sys.exit(1)
+            raise DotagError(
+                "'find' command not found. On Windows, ensure Git Bash or Cygwin "
+                "is in your PATH."
+            )
+
         try:
             result = subprocess.run(
                 [find_executable, "--version"],
@@ -332,15 +344,14 @@ def gnu_find_files():
                 text=True,
                 check=False,
             )
-            if "GNU findutils" not in result.stdout:
-                print(
-                    "Error: 'find' is not GNU find. On Windows, ensure Git Bash or Cygwin is in your PATH.",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-        except Exception as e:
-            print(f"Error checking 'find' version: {e}", file=sys.stderr)
-            sys.exit(1)
+        except OSError as e:
+            raise DotagError(f"cannot run '{find_executable} --version': {e}") from e
+
+        if "GNU findutils" not in result.stdout:
+            raise DotagError(
+                f"'{find_executable}' is not GNU find. On Windows, ensure Git Bash "
+                "or Cygwin is in your PATH."
+            )
 
     cmd = FindCmd(EXCLUDED_DIRS, FILE_EXTS)
     cmd.create(find_executable)
@@ -536,12 +547,10 @@ def check_dependencies(find_method):
             missing.append(tool)
 
     if missing:
-        print(
-            f"[ERROR] Missing required dependencies: {', '.join(missing)}",
-            file=sys.stderr,
+        raise DotagError(
+            f"Missing required dependencies: {', '.join(missing)}\n"
+            "Please install them and ensure they are in your PATH."
         )
-        print("Please install them and ensure they are in your PATH.", file=sys.stderr)
-        sys.exit(1)
 
 
 def check_sort_version():
@@ -573,8 +582,7 @@ def try_apply_setpath():
     setpath_bat = os.path.join(script_dir, "setpath.bat")
 
     if not os.path.exists(setpath_bat):
-        print(f"[ERROR] {setpath_bat} not found.", file=sys.stderr)
-        sys.exit(1)
+        raise DotagError(f"{setpath_bat} not found; cannot locate GNU sort.")
 
     # Run the batch file and capture the environment changes
     try:
@@ -612,11 +620,10 @@ def main():
         try_apply_setpath()
         sort_executable = check_sort_version()
         if not sort_executable:
-            print(
-                "[ERROR] GNU sort not found even after running setpath.bat. Quitting.",
-                file=sys.stderr,
+            raise DotagError(
+                "GNU sort not found even after running setpath.bat; "
+                "install GNU coreutils or fix PATH."
             )
-            sys.exit(1)
         print("[INFO] GNU sort detected after environment update.")
 
     # Default to "sort" if not on NT or if check_sort_version failed but we didn't exit

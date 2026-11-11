@@ -159,6 +159,52 @@ class DotagPy(unittest.TestCase):
                 self.assertIn("[ERROR] cannot write filenametags:", result.stderr)
                 self.assertIn("run dotag.py with -c", result.stderr)
 
+    def test_missing_dependency_is_a_clear_error(self):
+        self.write_source("a.c")
+        empty_bin = self.tree / "empty-bin"
+        empty_bin.mkdir()
+
+        result = subprocess.run(
+            [sys.executable, str(DOTAG), "-f", "py"],
+            cwd=self.tree,
+            env={**os.environ, "PATH": str(empty_bin)},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("[ERROR] Missing required dependencies: cscope, ctags", result.stderr)
+        self.assertIn("ensure they are in your PATH", result.stderr)
+
+    @unittest.skipIf(os.name == "nt", "uses a POSIX shell stub")
+    def test_fd_failure_is_reported_with_command_and_reason(self):
+        self.write_source("a.c")
+        stub_dir = self.tree / "stub-bin"
+        stub_dir.mkdir()
+        stub = stub_dir / "fd"
+        stub.write_text("#!/bin/sh\necho 'bad exclude pattern' >&2\nexit 2\n", encoding="utf-8")
+        stub.chmod(0o755)
+
+        result = subprocess.run(
+            [sys.executable, str(DOTAG), "-f", "fd"],
+            cwd=self.tree,
+            env={**os.environ, "PATH": f"{stub_dir}{os.pathsep}{os.environ['PATH']}"},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("[ERROR] 'fd --type f", result.stderr)
+        self.assertIn("failed with exit status 2: bad exclude pattern", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
