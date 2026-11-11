@@ -115,12 +115,31 @@ When building or modifying CLI utilities, TUIs, scripts, and subprocess wrappers
 
 ## Verification & Validation Guidelines
 
-For every change, consider how to prove correctness before concluding:
+For every change, define how it will be proven correct *before* writing code,
+and choose the method that fits what changed:
+
+| Change type            | Minimum verification                                         |
+|------------------------|--------------------------------------------------------------|
+| Bug fix                | Reproduce the failure first; show it passes after the fix    |
+| New behavior / feature | Add a test; run the real command and inspect its output      |
+| Error handling         | Trigger the failure; confirm the exact message shown         |
+| TUI / rendering        | Run it in a terminal; check resize, shrink, and cleanup      |
+| Refactor / formatting  | Existing tests unchanged; `git diff --check`; no behavior diff |
+| Docs / config only     | Syntax or lint check; confirm the file is still parsed       |
+
 *   **Pre-Implementation Strategy**: Identify test commands, scripts, or reproduction steps *before* writing code.
-*   **Automated Tests**: Run test suites (`--test`, unit tests, integration tests). Add new test cases covering the change and edge cases.
+*   **Automated Tests**: Run the narrowest relevant test first, then the full suite (`--test`, unit tests, integration tests). Add new test cases covering the change and edge cases.
 *   **Live Verification**: Execute the actual command or utility in the environment to confirm the fix works in practice.
 *   **Edge Cases & Regressions**: Test boundary inputs, invalid parameters, error handling, and ensure existing behavior is preserved.
 *   **Verification is Mandatory**: Never assume a fix works without running verification commands and inspecting output.
+*   **Report Evidence**: End each task with a `Verified:` block listing the real commands run and their results, taken from actual output (never assumed).
+*   **If Something Cannot Be Verified** (e.g. Windows-only code on Linux), state exactly what was not verified and why. Never describe it as passing.
+
+    ```
+    Verified:     python3 dotag.py --test   -> 42 passed, 0 failed
+    Verified:     dotag.py /nonexistent     -> "error: path not found: /nonexistent"
+    Not verified: Windows console path (no Windows host available)
+    ```
 
 ## Request & Issue Workflow
 
@@ -138,6 +157,7 @@ When the user asks a question, requests a health check, asks for current behavio
 *   **Non-Destructive Ground-Truth Inspection**: Inspect the live environment, services, sockets, and configurations using read-only commands before answering. Never guess or hallucinate state.
 *   **Direct & Transparent Answers**: Answer the user's specific question directly at the start. State clearly whether the system is healthy, failing, or partially degraded.
 *   **Root Cause & Objective Analysis**: Clearly explain *why* things behave the way they do, backed by log output or concrete technical facts.
+*   **Show the Investigation Trail**: List the decisive commands used to reach the conclusion, each with a one-line result, so the user can rerun them and troubleshoot on their own (see Request & Issue Workflow, section 2).
 *   **Professional Recommendation & Options**: Present industry best practices with realistic tradeoffs (pros, cons, side effects) and actionable recommendations.
 *   **No Unrequested Modifications**: Present potential solutions or improvements as options/proposals. Do NOT modify files or system state during pure diagnostic/question inquiries unless the user explicitly asks to fix or change them.
 
@@ -145,13 +165,14 @@ When the user asks a question, requests a health check, asks for current behavio
 When the user asks to implement, modify, fix, or update something (e.g., *"fix ..."*, *"make X do Y"*, *"update ..."*), the agent MUST:
 
 1.  **Think & Analyze**: Explain the root cause or understand the requirement clearly.
+    *   **Show the Investigation Trail**: Before stating a root cause, list the decisive commands used to find it (reproduction, grep/search, log or state inspection), each with a one-line result. Keep them copy-pasteable and in order. Skip noise; keep dead ends only when they ruled out a likely suspect. Finish with a short "Troubleshoot it yourself" tip. If the cause is not confirmed, label it **Hypothesis** and give the command that would confirm it.
 2.  **Propose a Solution & Design**: Explain what needs to change, the plan of action, and why. Ensure error handling and user-facing error messages are defined.
 3.  **Define Verification / Validation Plan**: Explicitly state how the change will be tested and validated (commands to run, expected results, edge cases).
 4.  **Show Mockup UI / Command Output**: If the request involves TUI, GUI, or command output, provide a realistic mockup or sample output preview (including error states if applicable).
 5.  **Give Recommendation**: Provide your professional recommendation and options.
 6.  **Show Code Comparison / Draft**: Present a before/after diff or draft so the user can see exactly what changes before writing to disk.
 7.  **Approval Mode**:
-    *   **"next"**: Move to the next open issue and present it for review only. Show, in order: (1) **Problem**: what the user sees, with a reproduction or evidence; (2) **Root Cause**: why it happens, with `file:line` references; (3) **Solution**: the proposed fix, error handling, and verification plan; (4) **Code Change**: a before/after diff of the exact code to change. Then ask for approval (*"Approve? Reply 'doit' or 'ship'."*). "next" is NOT approval: do not modify files.
+    *   **"next"**: Move to the next open issue and present it for review only. Show, in order: (1) **Problem**: what the user sees, with a reproduction or evidence; (2) **Investigation**: the decisive commands run and what each showed; (3) **Root Cause**: why it happens, with `file:line` references; (4) **Solution**: the proposed fix, error handling, and verification plan; (5) **Code Change**: a before/after diff of the exact code to change. Then ask for approval (*"Approve? Reply 'doit' or 'ship'."*). "next" is NOT approval: do not modify files.
     *   **"doit"** / **"do it"**: Treat as approval. Proceed immediately with implementation and verification without asking for confirmation. Do not commit or push unless also asked.
     *   **"ship"**: Treat as approval for the whole flow: implement, verify, commit, and push, without stopping to ask (see Commit Workflow).
     *   **"fix it"** / **"fix #N"**: Same as "ship": implement, verify, commit, and push, without stopping to ask.
