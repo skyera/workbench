@@ -69,7 +69,7 @@ The [bin/](bin) directory includes utilities for:
 - Finding files and changing directories with interactive TUIs (`fe`, `fcd`, `frg`, `fvim`).
 - Connecting to hosts, copying files, inspecting remote processes, and opening tunnels (`fssh`, `fscp`, `fremote`, `fssh_tunnel`).
 - Working with Git and source indexes (`fco`, `flog`, `fbr`, `dotag`).
-- Managing shell history, processes, clipboard access, and remote mounts (`fhist`, `fkill`, `osc52-yank`, `rsshfs`).
+- Managing shell history, processes, clipboard access, and remote mounts (`fhist`, `fkill`, `osc52-yank`, `rmount`).
 - Inspecting interfaces, DNS records, latency, and open ports (`fnet`).
 - Capturing the screen, a window, or a dragged region to PNG, with optional clipboard copy, plus an annotation editor for marking up a capture (`fshot --edit`).
 

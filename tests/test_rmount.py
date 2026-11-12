@@ -1,6 +1,6 @@
-"""Run with: python3 -m unittest discover -s tests -p test_rsshfs.py -v
+"""Run with: python3 -m unittest discover -s tests -p test_rmount.py -v
 
-Exercise bin/rsshfs.sh with stub sshfs, findmnt, stat and fusermount3
+Exercise bin/rmount.sh with stub sshfs, findmnt, stat and fusermount3
 executables placed first on PATH. The stubs keep a fake mount table in a
 temporary directory, so no SSH connections or real mounts are made.
 """
@@ -14,7 +14,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "bin" / "rsshfs.sh"
+SCRIPT = ROOT / "bin" / "rmount.sh"
 BASH = shutil.which("bash")
 
 # Each stub records its argv in $STUB_LOG. The fake mount table is the file
@@ -58,9 +58,9 @@ done
 
 
 @unittest.skipUnless(BASH and os.name != "nt", "requires bash on a POSIX host")
-class RsshfsTests(unittest.TestCase):
+class RmountTests(unittest.TestCase):
     def setUp(self):
-        temp = tempfile.TemporaryDirectory(prefix="rsshfs-test-")
+        temp = tempfile.TemporaryDirectory(prefix="rmount-test-")
         self.addCleanup(temp.cleanup)
         self.cwd = Path(temp.name)
 

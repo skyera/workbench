@@ -1474,7 +1474,7 @@ _apply_overrides() {
     command -v theme.sh >/dev/null 2>&1 && alias theme='theme.sh'
     command -v opacity.sh >/dev/null 2>&1 && alias opacity='opacity.sh'
     command -v fssh.sh >/dev/null 2>&1 && alias fssh='fssh.sh'
-    command -v rsshfs.sh >/dev/null 2>&1 && alias rsshfs='rsshfs.sh'
+    command -v rmount.sh >/dev/null 2>&1 && alias rmount='rmount.sh' && alias rsshfs='rmount.sh'
     command -v fscp.sh >/dev/null 2>&1 && alias fscp='fscp.sh'
     command -v frsync.sh >/dev/null 2>&1 && alias frsync='frsync.sh'
     command -v fpull.sh >/dev/null 2>&1 && alias fpull='fpull.sh'

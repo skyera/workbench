@@ -123,7 +123,7 @@ if not "%REMOTE_DIR%"=="" (
     set "PWD_UNC=\\sshfs\%REMOTE_HOST%"
 )
 
-set "TEMP_LOG=%TEMP%\rsshfs_mount_%RANDOM%.log"
+set "TEMP_LOG=%TEMP%\rmount_%RANDOM%.log"
 
 if "%AUTH_MODE%"=="password" goto :try_password
 

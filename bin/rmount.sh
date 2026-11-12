@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# rsshfs.sh - mount a remote directory over SSHFS, or unmount it again.
+# rmount.sh - mount a remote directory over SSHFS, or unmount it again.
 #
 # Mount detection reads the kernel mount table (findmnt) instead of stat'ing
 # the directory, so a stale mount left behind by a dead sshfs process
