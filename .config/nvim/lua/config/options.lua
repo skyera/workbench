@@ -79,6 +79,11 @@ if vim.fn.executable("rg") == 1 then
   vim.opt.grepformat = "%f:%l:%c:%m"
 end
 
+-- Python folding comes from the SimpylFold plugin (no foldmethod override here).
+-- Open files unfolded; `zi` toggles folding, `zM` folds all, `zR` unfolds all.
+vim.g.SimpylFold_docstring_preview = 1
+vim.opt.foldenable = false
+
 -- Tagbar TypeScript
 vim.g.tagbar_type_typescript = {
   ctagstype = 'typescript',
@@ -199,13 +204,6 @@ vim.api.nvim_create_autocmd("FileType", {
     vim.opt_local.shiftwidth = 2
     vim.opt_local.tabstop = 2
     vim.opt_local.softtabstop = 2
-  end,
-})
-
-vim.api.nvim_create_autocmd("FileType", {
-  pattern = "python",
-  callback = function()
-    vim.opt_local.foldmethod = "indent"
   end,
 })
 
