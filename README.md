@@ -148,6 +148,12 @@ Windows.
     email = you@example.com
 ```
 
+`./deploy.sh` creates this file for you. It prompts for a name and email, or reads
+`GIT_USER_NAME` and `GIT_USER_EMAIL`, and never overwrites an identity that already
+exists. `.gitconfig` sets `user.useConfigOnly`, so a commit made without an identity
+fails with `fatal: no email was given and auto-detection is disabled` instead of using a
+guessed one. Fix it by re-running `./deploy.sh`.
+
 ## Further reading
 
 - [CLI power-user guide](cli_power_user_guide.md)

@@ -206,6 +206,54 @@ if ! command -v sshfs >/dev/null 2>&1; then
     echo "Tip: 'sshfs' is not installed. Install it via package manager (e.g. sudo apt install sshfs) to use rmount.sh."
 fi
 
+# 3b. Ensure ~/.gitconfig.local holds the Git commit identity.
+# Name and email come from GIT_USER_NAME / GIT_USER_EMAIL, or from a prompt
+# when stdin is a terminal. An identity that already exists is never changed.
+ensure_git_identity() {
+    local local_config="$HOME/.gitconfig.local"
+    local user_name="${GIT_USER_NAME:-}"
+    local user_email="${GIT_USER_EMAIL:-}"
+
+    if ! command -v git >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if [ -f "$local_config" ] \
+        && git config --file "$local_config" user.name >/dev/null 2>&1 \
+        && git config --file "$local_config" user.email >/dev/null 2>&1; then
+        echo "Git identity already set in $local_config"
+        return 0
+    fi
+
+    if [ -z "$user_name" ] || [ -z "$user_email" ]; then
+        if [ ! -t 0 ]; then
+            echo "Warning: Git identity not set and no terminal to ask on." >&2
+            echo "  Set GIT_USER_NAME and GIT_USER_EMAIL, then re-run ./deploy.sh," >&2
+            echo "  or run: git config --file ~/.gitconfig.local user.name 'Your Name'" >&2
+            return 0
+        fi
+
+        echo "Git identity not set in $local_config"
+        read -r -p "  Name:  " user_name
+        read -r -p "  Email: " user_email
+    fi
+
+    if [ -z "$user_name" ] || [ -z "$user_email" ]; then
+        echo "Warning: empty name or email; Git identity not saved." >&2
+        return 0
+    fi
+
+    if ! git config --file "$local_config" user.name "$user_name" \
+        || ! git config --file "$local_config" user.email "$user_email"; then
+        echo "Error: could not write Git identity to $local_config" >&2
+        return 1
+    fi
+
+    echo "Saved Git identity to $local_config"
+}
+
+ensure_git_identity
+
 # 4. Handle legacy Git versions (< 2.35.0) for 'zdiff3' compatibility
 if command -v git >/dev/null 2>&1; then
     GIT_VER=$(git --version | awk '{print $3}' | grep -oE '^[0-9]+\.[0-9]+')

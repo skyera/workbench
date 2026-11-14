@@ -119,6 +119,11 @@
 [help]
 	autocorrect = prompt
 
+# Refuse to commit with a guessed user@hostname identity. The identity lives in
+# ~/.gitconfig.local (created by deploy.sh) or in a per-repo config.
+[user]
+	useConfigOnly = true
+
 [include]
 	path = ~/.gitconfig.local
 
