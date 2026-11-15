@@ -2,7 +2,10 @@
 
 import os
 from pathlib import Path
+import pty
+import select
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -101,6 +104,44 @@ class SelfTestRegressions(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("Failed to kill PID %d" % finished.pid, result.stderr)
         self.assertEqual(result.stdout, "")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "drives the TUI through a pty")
+    def test_fkill_restores_terminal_when_terminated(self):
+        child_pid, master_fd = pty.fork()
+        if child_pid == 0:
+            os.execv(LUAJIT, [LUAJIT, str(ROOT / "bin/fkill.lua")])
+
+        def read_for(seconds):
+            data = b""
+            deadline = time.time() + seconds
+            while time.time() < deadline:
+                ready, _, _ = select.select([master_fd], [], [], 0.05)
+                if not ready:
+                    continue
+                try:
+                    data += os.read(master_fd, 65536)
+                except OSError:
+                    break
+            return data
+
+        try:
+            startup = read_for(1.0)
+            self.assertIn(b"\x1b[?1049h", startup, "TUI did not start")
+
+            os.kill(child_pid, signal.SIGTERM)
+            shutdown = read_for(1.5)
+            _, status = os.waitpid(child_pid, 0)
+            child_pid = 0
+        finally:
+            if child_pid:
+                os.kill(child_pid, signal.SIGKILL)
+                os.waitpid(child_pid, 0)
+            os.close(master_fd)
+
+        self.assertIn(b"\x1b[?1049l", shutdown, "alternate screen was not left")
+        self.assertIn(b"received SIGTERM; terminal restored", shutdown)
+        self.assertTrue(os.WIFEXITED(status), "fkill must exit, not die from the signal")
+        self.assertEqual(os.WEXITSTATUS(status), 128 + signal.SIGTERM)
 
     def test_rfe_forced_ffi_availability_and_engine_cycling(self):
         # Test both platform branches without requiring a Windows host or

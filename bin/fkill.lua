@@ -189,6 +189,15 @@ else
             short revents;
         };
         int poll(struct pollfd *fds, unsigned long nfds, int timeout);
+
+        /* Sized for glibc's 1024-bit sigset_t; only libc reads its contents. */
+        typedef struct { unsigned long bits[16]; } fkill_sigset_t;
+        int sigemptyset(fkill_sigset_t *set);
+        int sigaddset(fkill_sigset_t *set, int signum);
+        int sigismember(const fkill_sigset_t *set, int signum);
+        int sigprocmask(int how, const fkill_sigset_t *set, fkill_sigset_t *oldset);
+        int sigpending(fkill_sigset_t *set);
+        int sigwait(const fkill_sigset_t *set, int *sig);
         int readlink(const char *pathname, char *buf, size_t bufsiz);
         char *strerror(int errnum);
 
@@ -235,6 +244,8 @@ local Term = {
     tty_out = nil,
     pending_keys = {}, -- decoded keys not yet returned by Term.read_key
     read_buffer = nil, -- reusable char buffer for POSIX read()
+    saved_signal_mask = nil, -- signal mask to put back when the TUI ends
+    received_signal = nil, -- entry of TERMINATING_SIGNALS that ended the TUI
 }
 
 -- Bytes requested per read(); a paste or key repeat can deliver many keys at once.
@@ -283,6 +294,59 @@ function Term.write_tui(s)
     Term.tty_out:flush()
 end
 
+local SIG_BLOCK = 0
+local SIG_SETMASK = 2
+
+-- Shells report "killed by signal N" as exit status 128 + N.
+local SIGNAL_EXIT_BASE = 128
+
+-- Signals that would otherwise kill fkill mid-TUI and leave the terminal raw.
+local TERMINATING_SIGNALS = {
+    { number = 1, name = "SIGHUP" },
+    { number = 2, name = "SIGINT" },
+    { number = 3, name = "SIGQUIT" },
+    { number = 15, name = "SIGTERM" },
+}
+
+-- Blocks the terminating signals so they stay pending instead of killing the
+-- process. Returns the previous signal mask for restore_signal_mask().
+local function block_terminating_signals()
+    local blocked = ffi.new("fkill_sigset_t")
+    ffi.C.sigemptyset(blocked)
+    for _, signal in ipairs(TERMINATING_SIGNALS) do
+        ffi.C.sigaddset(blocked, signal.number)
+    end
+
+    local previous_mask = ffi.new("fkill_sigset_t")
+    ffi.C.sigprocmask(SIG_BLOCK, blocked, previous_mask)
+    return previous_mask
+end
+
+-- Puts back a mask returned by block_terminating_signals(). Any signal still
+-- pending is delivered at this point with its default action.
+local function restore_signal_mask(previous_mask)
+    if previous_mask then
+        ffi.C.sigprocmask(SIG_SETMASK, previous_mask, nil)
+    end
+end
+
+-- Returns the first blocked terminating signal that is pending, or nil.
+-- Polling sigpending() replaces a signal handler, which LuaJIT cannot run safely.
+local function pending_terminating_signal()
+    local pending = ffi.new("fkill_sigset_t")
+    if ffi.C.sigpending(pending) ~= 0 then
+        return nil
+    end
+
+    for _, signal in ipairs(TERMINATING_SIGNALS) do
+        if ffi.C.sigismember(pending, signal.number) == 1 then
+            return signal
+        end
+    end
+
+    return nil
+end
+
 -- Switches the terminal to raw mode and the alternate screen.
 -- Returns true, or nil plus an error message when there is no terminal to drive.
 function Term.init()
@@ -321,6 +385,8 @@ function Term.init()
                 .. "Use 'fkill --list' or 'fkill <PID>' instead."
         end
 
+        Term.saved_signal_mask = block_terminating_signals()
+
         Term.orig_termios = ffi.new("struct termios")
         ffi.C.tcgetattr(Term.tty_fd, Term.orig_termios)
 
@@ -338,7 +404,10 @@ function Term.init()
     return true
 end
 
-function Term.restore()
+-- Leaves the alternate screen and raw mode. Pass `keep_signals_blocked` when
+-- exiting because of a signal: unblocking would deliver it and kill the process
+-- before it can report why it stopped.
+function Term.restore(keep_signals_blocked)
     if not Term.initialized then return end
     -- Show cursor, restore autowrap (\27[?7h), exit alternate screen
     Term.write_tui("\27[?25h\27[?7h\27[?1049l" .. C.reset)
@@ -358,6 +427,11 @@ function Term.restore()
             pcall(function() Term.tty_out:close() end)
             Term.tty_out = nil
         end
+
+        if not keep_signals_blocked then
+            restore_signal_mask(Term.saved_signal_mask)
+        end
+        Term.saved_signal_mask = nil
     end
     Term.initialized = false
 end
@@ -497,7 +571,8 @@ local function decode_keys(bytes)
 end
 
 -- Blocks until a key is available and returns its name. Returns "EOF" when the
--- terminal is gone and "NONE" when the read should simply be retried.
+-- terminal is gone, "SIGNAL" when a terminating signal arrived (details in
+-- Term.received_signal) and "NONE" when the read should simply be retried.
 function Term.read_key()
     if IS_WINDOWS then
         local ch = ffi.C._getch()
@@ -536,6 +611,11 @@ function Term.read_key()
     else
         if #Term.pending_keys == 0 then
             Term.read_buffer = Term.read_buffer or ffi.new("char[?]", READ_BUFFER_SIZE)
+            Term.received_signal = pending_terminating_signal()
+            if Term.received_signal then
+                return "SIGNAL"
+            end
+
             local input_fd = Term.tty_fd >= 0 and Term.tty_fd or 0
             if not wait_for_input(input_fd, RESIZE_POLL_INTERVAL_MS) then
                 return "NONE"
@@ -1552,6 +1632,13 @@ local function run_tui(init_opts)
             os.exit(0)
         end
 
+        if key == "SIGNAL" then
+            local signal = Term.received_signal
+            Term.restore(true)
+            io.stderr:write(string.format("fkill: received %s; terminal restored.\n", signal.name))
+            os.exit(SIGNAL_EXIT_BASE + signal.number)
+        end
+
         if key == "EOF" then
             Term.restore()
             io.stderr:write("fkill: terminal input closed; exiting.\n")
@@ -2389,6 +2476,27 @@ local function run_tests()
     assert_eq("subheader long typed filter keeps its tail",
         plain_subheader(80, sub_states[5]):find("_tail█", 1, true) ~= nil, true)
     assert_eq("fit_filter_tail exact width", display_width(fit_filter_tail("abcdefghij", 5)), 5)
+
+    -- Test 17: blocked terminating signals are detected instead of killing fkill
+    if not IS_WINDOWS then
+        local previous_mask = block_terminating_signals()
+        assert_eq("no signal pending at start", pending_terminating_signal(), nil)
+
+        for _, signal in ipairs(TERMINATING_SIGNALS) do
+            ffi.C.kill(ffi.C.getpid(), signal.number)
+            local detected = pending_terminating_signal()
+            assert_eq(signal.name .. " detected while blocked", detected and detected.name, signal.name)
+
+            -- Consume the signal so it is not delivered when the mask is restored.
+            local only_this_signal = ffi.new("fkill_sigset_t")
+            ffi.C.sigemptyset(only_this_signal)
+            ffi.C.sigaddset(only_this_signal, signal.number)
+            ffi.C.sigwait(only_this_signal, ffi.new("int[1]"))
+        end
+
+        assert_eq("no signal pending after consuming", pending_terminating_signal(), nil)
+        restore_signal_mask(previous_mask)
+    end
 
     -- Test 11: key decoding keeps every key from one read()
     local function decoded(bytes)
