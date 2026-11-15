@@ -182,6 +182,13 @@ else
         int kill(int pid, int sig);
         int getpid(void);
         int isatty(int fd);
+
+        struct pollfd {
+            int fd;
+            short events;
+            short revents;
+        };
+        int poll(struct pollfd *fds, unsigned long nfds, int timeout);
         int readlink(const char *pathname, char *buf, size_t bufsiz);
         char *strerror(int errnum);
 
@@ -235,6 +242,32 @@ local READ_BUFFER_SIZE = 256
 
 local EINTR = 4
 local EXIT_FAILURE = 1
+
+local POLLIN = 0x0001
+
+-- How long a key wait may block before the TUI re-checks the terminal size.
+-- read() alone would only notice a resize on the next keypress.
+local RESIZE_POLL_INTERVAL_MS = 250
+
+-- Waits up to `timeout_ms` for input on `fd`. Returns true when read() should be
+-- called (data, hang-up, or a poll error that read() will report precisely) and
+-- false when the wait timed out or was interrupted.
+local function wait_for_input(fd, timeout_ms)
+    local poll_request = ffi.new("struct pollfd[1]")
+    poll_request[0].fd = fd
+    poll_request[0].events = POLLIN
+
+    local ready_count = ffi.C.poll(poll_request, 1, timeout_ms)
+    if ready_count == 0 then
+        return false
+    end
+
+    if ready_count < 0 and ffi.errno() == EINTR then
+        return false
+    end
+
+    return true
+end
 
 local O_RDWR = 2
 
@@ -504,6 +537,10 @@ function Term.read_key()
         if #Term.pending_keys == 0 then
             Term.read_buffer = Term.read_buffer or ffi.new("char[?]", READ_BUFFER_SIZE)
             local input_fd = Term.tty_fd >= 0 and Term.tty_fd or 0
+            if not wait_for_input(input_fd, RESIZE_POLL_INTERVAL_MS) then
+                return "NONE"
+            end
+
             local byte_count = ffi.C.read(input_fd, Term.read_buffer, READ_BUFFER_SIZE)
 
             if byte_count == 0 then
@@ -540,34 +577,86 @@ local function delete_word(s)
     return s
 end
 
+-- Returns the number of terminal cells `s` occupies: colour codes take none and
+-- each UTF-8 character takes one (fkill draws no double-width glyphs).
+local function display_width(s)
+    local plain = s:gsub("\27%[[%d;]*m", "")
+    local _, continuation_byte_count = plain:gsub("[\128-\191]", "")
+    return #plain - continuation_byte_count
+end
+
+-- Returns the first `char_count` UTF-8 characters of plain text `s`, never
+-- splitting a multi-byte character.
+local function utf8_prefix(s, char_count)
+    local chars_seen = 0
+
+    for index = 1, #s do
+        local byte = s:byte(index)
+        local starts_character = byte < 0x80 or byte >= 0xC0
+        if starts_character then
+            if chars_seen == char_count then
+                return s:sub(1, index - 1)
+            end
+            chars_seen = chars_seen + 1
+        end
+    end
+
+    return s
+end
+
+-- Pads `s` with spaces to `w` terminal cells. Never truncates: cutting a styled
+-- string by bytes can split a colour code, and autowrap is off so an over-long
+-- line is clipped by the terminal instead.
 local function pad_right(s, w)
-    local len = #s
-    if len >= w then return s:sub(1, w) end
-    return s .. string.rep(" ", w - len)
+    local missing_cells = w - display_width(s)
+    if missing_cells <= 0 then
+        return s
+    end
+
+    return s .. string.rep(" ", missing_cells)
 end
 
-local function pad_left(s, w)
-    local len = #s
-    if len >= w then return s:sub(1, w) end
-    return string.rep(" ", w - len) .. s
-end
-
+-- Shortens plain text `s` to at most `max_w` cells, ending with an ellipsis.
 local function truncate(s, max_w)
     if not s then return "" end
-    if #s <= max_w then return s end
-    if max_w <= 1 then return s:sub(1, max_w) end
-    return s:sub(1, max_w - 1) .. "…"
+    if display_width(s) <= max_w then return s end
+    if max_w <= 1 then return utf8_prefix(s, max_w) end
+    return utf8_prefix(s, max_w - 1) .. "…"
 end
 
+-- Replaces control bytes (including ESC) with "?" so text taken from another
+-- process cannot move the cursor or restyle the screen.
+local function sanitize_for_display(s)
+    return (s:gsub("[%z\1-\31\127]", "?"))
+end
+
+-- Width in cells of every format_mem() result, so the MEM column stays aligned.
+local MEM_COLUMN_WIDTH = 10
+
+-- Largest value that "%5.1f" still prints in five characters.
+local FIVE_DIGIT_LIMIT = 999.95
+
+-- Formats a size in megabytes as a fixed-width pill such as "[372.2 MB]".
 local function format_mem(mb)
-    if not mb or mb <= 0 then return "     -   " end
-    if mb < 1 then
-        return string.format("[%4d KB]", math.floor(mb * 1024))
-    elseif mb < 1024 then
-        return string.format("[%4.1f MB]", mb)
-    else
-        return string.format("[%4.1f GB]", mb / 1024)
+    if not mb or mb <= 0 then
+        return pad_right("     -", MEM_COLUMN_WIDTH)
     end
+
+    if mb < 1 then
+        return string.format("[%5d KB]", math.floor(mb * 1024))
+    end
+
+    -- Values that would print as "1000.0" need the next unit to keep five digits.
+    if mb < FIVE_DIGIT_LIMIT then
+        return string.format("[%5.1f MB]", mb)
+    end
+
+    local gb = mb / 1024
+    if gb < FIVE_DIGIT_LIMIT then
+        return string.format("[%5.1f GB]", gb)
+    end
+
+    return string.format("[%5.0f GB]", gb)
 end
 
 local function fuzzy_score(pattern, str)
@@ -655,6 +744,14 @@ function LinuxBackend.get_process_list()
     return procs
 end
 
+-- kthreadd is the parent of every Linux kernel thread.
+local KTHREADD_PID = 2
+
+-- Returns true for kthreadd and its children, which are not user applications.
+local function is_kernel_thread(pid, ppid)
+    return pid == KTHREADD_PID or ppid == KTHREADD_PID
+end
+
 function LinuxBackend.get_proc_summary(pid)
     local status_file = io.open(string.format("/proc/%d/status", pid), "r")
     if not status_file then return nil end
@@ -669,7 +766,7 @@ function LinuxBackend.get_proc_summary(pid)
     for line in status_file:lines() do
         local k, v = line:match("^(%w+):%s*(.*)$")
         if k == "Name" then
-            name = v
+            name = sanitize_for_display(v)
         elseif k == "State" then
             state = v:match("^(%S+)") or v
         elseif k == "PPid" then
@@ -691,7 +788,7 @@ function LinuxBackend.get_proc_summary(pid)
         local raw = cmd_file:read("*all")
         cmd_file:close()
         if raw and #raw > 0 then
-            cmd = raw:gsub("%z", " "):gsub("%s+$", "")
+            cmd = sanitize_for_display(raw:gsub("%z", " "):gsub("%s+$", ""))
         end
     end
     if cmd == "" then
@@ -709,7 +806,7 @@ function LinuxBackend.get_proc_summary(pid)
         threads = threads,
         rss = rss_mb,
         cmd = cmd,
-        is_system = SYSTEM_PROCS[name:lower()] == true or (name:sub(1,1) == "[" and name:sub(-1) == "]")
+        is_system = SYSTEM_PROCS[name:lower()] == true or is_kernel_thread(pid, ppid),
     }
 end
 
@@ -862,6 +959,57 @@ local SORT_LABELS = {
 }
 
 local FORCE_KILL_LABEL = IS_WINDOWS and "FORCE kill" or "FORCE kill (SIGKILL)"
+
+-- Fixed cells of a process row before the name: pointer, checkbox, PID, memory
+-- pill and thread count with their separators (1+1+3+1+7+1+10+1+4+2).
+local LIST_FIXED_COLUMNS_WIDTH = 31
+
+local HELP_KEY_COLUMN_WIDTH = 18
+
+local HELP_SECTIONS = {
+    {
+        title = "NAVIGATION & MOTIONS",
+        bindings = {
+            { "j / k, ^n / ^p", "Move cursor down / up" },
+            { "gg / G", "Jump to first / last process" },
+            { "Ctrl-d / Ctrl-u", "Scroll half-page down / up" },
+            { "Ctrl-f / Ctrl-b", "Scroll full-page down / up" },
+            { "H / M / L", "Jump to High / Mid / Low screen" },
+            { "zz / zt / zb", "Recenter: Middle / Top / Bottom" },
+            { "Ctrl-e / Ctrl-y", "Scroll inspector card down / up" },
+        },
+    },
+    {
+        title = "SELECTION & PROCESS ACTIONS",
+        bindings = {
+            { "v / Tab / Space", "Toggle selection checkbox [x]" },
+            { "d / Enter", "Terminate process (prompt)" },
+            { "D / K", "Force kill (SIGKILL), asks y / Enter" },
+            { "s / S", "Cycle sort mode (RAM/PID/Name)" },
+            { "h / l, 1 / 2 / 3", "Switch tab: All / User / Heavy" },
+            { "r / Ctrl-r", "Refresh process list & memory" },
+            { "/", "Real-time fuzzy filter (/)" },
+            { "?, q / Esc", "Close help / exit fkill" },
+        },
+    },
+}
+
+-- Returns the styled lines of the keybinding cheatsheet, one per screen row.
+local function build_help_lines()
+    local lines = {}
+
+    for _, section in ipairs(HELP_SECTIONS) do
+        lines[#lines + 1] = ""
+        lines[#lines + 1] = C.b_yellow .. C.bold .. "  " .. section.title .. C.reset
+
+        for _, binding in ipairs(section.bindings) do
+            local keys = pad_right(binding[1], HELP_KEY_COLUMN_WIDTH)
+            lines[#lines + 1] = "   " .. C.b_cyan .. keys .. C.reset .. " " .. binding[2]
+        end
+    end
+
+    return lines
+end
 
 -- Kills each process in `targets` with `kill_process(pid, force)`.
 -- Returns the list of PIDs that were signalled and a list of failures, each
@@ -1053,7 +1201,7 @@ local function run_tui(init_opts)
         end
 
         -- 1. Header
-        local head_str = string.format(" %s%s⚡ fkill%s %s[%s]%s │ Host: %s%s%s │ Sort: %s%s%s",
+        local head_str = string.format(" %s%sfkill%s %s[%s]%s │ Host: %s%s%s │ Sort: %s%s%s",
             C.b_red, C.bold, C.reset,
             C.b_yellow, TAB_LABELS[TABS[state.tab_idx]], C.reset,
             C.b_white, hostname, C.reset,
@@ -1086,7 +1234,7 @@ local function run_tui(init_opts)
 
         local sub_l = " " .. filter_disp
         local sub_r = tabs_str .. " "
-        local sub_space = cols - (#filter_disp:gsub("\27%[[%d;]*m", "") + #tabs_str:gsub("\27%[[%d;]*m", "") + 4)
+        local sub_space = cols - (display_width(filter_disp) + display_width(tabs_str) + 4)
         if sub_space < 1 then sub_space = 1 end
         add_line(sub_l .. string.rep(" ", sub_space) .. sub_r)
 
@@ -1110,15 +1258,23 @@ local function run_tui(init_opts)
         end
 
         -- Header divider
-        local raw_hdr = pad_right(string.format("  %-3s  %-7s  %-10s %-4s  %s", "SEL", "PID", "MEM", "THR", "PROCESS NAME"), left_w)
+        -- Below 90 columns there is no right pane, so help takes over the list.
+        local show_help_in_list = (state.mode == "help" and cols < 90)
+        local list_help_lines = show_help_in_list and build_help_lines() or {}
+
+        local raw_hdr = string.format("  %-3s %7s %-10s %4s  %s", "SEL", "PID", "MEM", "THR", "PROCESS NAME")
+        if show_help_in_list then
+            raw_hdr = "  VIM KEYBINDINGS CHEATSHEET"
+        end
+        raw_hdr = pad_right(raw_hdr, left_w)
         local list_hdr = C.b_blue .. C.bold .. raw_hdr .. C.reset
         local right_title
         if state.mode == "help" then
-            right_title = " 📖 VIM KEYBINDINGS CHEATSHEET"
+            right_title = " VIM KEYBINDINGS CHEATSHEET"
         elseif cur_item then
-            right_title = truncate(" 📋 PROCESS: " .. cur_item.name .. " (" .. cur_item.pid .. ")", math.max(10, right_w - 2))
+            right_title = truncate(" PROCESS: " .. cur_item.name .. " (" .. cur_item.pid .. ")", math.max(10, right_w - 2))
         else
-            right_title = " 📋 PROCESS INSPECTOR"
+            right_title = " PROCESS INSPECTOR"
         end
         local right_hdr = (cols >= 90) and (C.b_white .. C.bold .. right_title .. C.reset) or ""
         local hdr_sep = (cols >= 90) and (C.gray .. "│" .. C.reset) or ""
@@ -1128,25 +1284,7 @@ local function run_tui(init_opts)
         local r_lines = {}
         if cols >= 90 then
             if state.mode == "help" then
-                table.insert(r_lines, "")
-                table.insert(r_lines, C.b_yellow .. C.bold .. "  NAVIGATION & MOTIONS" .. C.reset)
-                table.insert(r_lines, string.format("   %s%-18s%s Move cursor down / up", C.b_cyan, "j / k, ^n / ^p", C.reset))
-                table.insert(r_lines, string.format("   %s%-18s%s Jump to first / last process", C.b_cyan, "gg / G", C.reset))
-                table.insert(r_lines, string.format("   %s%-18s%s Scroll half-page down / up", C.b_cyan, "Ctrl-d / Ctrl-u", C.reset))
-                table.insert(r_lines, string.format("   %s%-18s%s Scroll full-page down / up", C.b_cyan, "Ctrl-f / Ctrl-b", C.reset))
-                table.insert(r_lines, string.format("   %s%-18s%s Jump to High / Mid / Low screen", C.b_cyan, "H / M / L", C.reset))
-                table.insert(r_lines, string.format("   %s%-18s%s Recenter: Middle / Top / Bottom", C.b_cyan, "zz / zt / zb", C.reset))
-                table.insert(r_lines, string.format("   %s%-18s%s Scroll inspector card down / up", C.b_cyan, "Ctrl-e / Ctrl-y", C.reset))
-                table.insert(r_lines, "")
-                table.insert(r_lines, C.b_yellow .. C.bold .. "  SELECTION & PROCESS ACTIONS" .. C.reset)
-                table.insert(r_lines, string.format("   %s%-18s%s Toggle selection checkbox [x]", C.b_cyan, "v / Tab / Space", C.reset))
-                table.insert(r_lines, string.format("   %s%-18s%s Terminate process (prompt)", C.b_cyan, "d / Enter", C.reset))
-                table.insert(r_lines, string.format("   %s%-18s%s Force kill (SIGKILL), asks y / Enter", C.b_cyan, "D / K", C.reset))
-                table.insert(r_lines, string.format("   %s%-18s%s Cycle sort mode (RAM/PID/Name)", C.b_cyan, "s / S", C.reset))
-                table.insert(r_lines, string.format("   %s%-18s%s Switch tab: All / User / Heavy", C.b_cyan, "h / l, 1 / 2 / 3", C.reset))
-                table.insert(r_lines, string.format("   %s%-18s%s Refresh process list & memory", C.b_cyan, "r / Ctrl-r", C.reset))
-                table.insert(r_lines, string.format("   %s%-18s%s Real-time fuzzy filter (/)", C.b_cyan, "/", C.reset))
-                table.insert(r_lines, string.format("   %s%-18s%s Close help / exit fkill", C.b_cyan, "?, q / Esc", C.reset))
+                r_lines = build_help_lines()
             elseif cur_item then
                 if not state.cached_details[cur_item.pid] then
                     state.cached_details[cur_item.pid] = Backend.get_proc_details(cur_item.pid) or cur_item
@@ -1193,7 +1331,9 @@ local function run_tui(init_opts)
             local item = state.filtered[idx]
             local l_str
 
-            if item then
+            if show_help_in_list then
+                l_str = pad_right(list_help_lines[row] or "", left_w)
+            elseif item then
                 local is_cur = (idx == state.cursor)
                 local bg = is_cur and C.bg_select or ""
                 local ptr = is_cur and (C.b_red .. "▸" .. C.reset .. bg) or " "
@@ -1216,12 +1356,8 @@ local function run_tui(init_opts)
                 local thr_disp = C.gray .. thr_str .. C.reset .. bg
 
                 -- Name
-                local name_w = math.max(8, left_w - 32)
-                local raw_name = item.name
-                local name_disp = truncate(raw_name, name_w)
-                if #name_disp < name_w then
-                    name_disp = pad_right(name_disp, name_w)
-                end
+                local name_w = math.max(8, left_w - LIST_FIXED_COLUMNS_WIDTH)
+                local name_disp = pad_right(truncate(item.name, name_w), name_w)
                 local name_col = is_cur and (C.b_white .. C.bold) or (item.is_system and C.gray or C.white)
                 local full_name_disp = name_col .. name_disp .. C.reset
 
@@ -1286,6 +1422,14 @@ local function run_tui(init_opts)
     while true do
         render()
         local key = Term.read_key()
+
+        -- An idle tick: repaint (which picks up a resize) without touching state,
+        -- so status messages and pending vim operators survive it.
+        while key == "NONE" do
+            render()
+            key = Term.read_key()
+        end
+
         if state.mode ~= "confirm_kill" then
             state.status_msg = ""
         end
@@ -2050,6 +2194,37 @@ local function run_tests()
     assert_eq("find by name excludes own PID", #find_processes_by_name(fake_procs, "luajit", 10), 1)
     assert_eq("find by name is exact", find_processes_by_name(fake_procs, "lua", 10)[1].pid, 12)
     assert_eq("suggestions list distinct names", #suggest_similar_names(fake_procs, "lu", 10), 2)
+
+    -- Test 14: display width and fixed-width columns
+    local styled = C.b_red .. C.bold .. "fkill" .. C.reset .. " │ é"
+    assert_eq("display_width ignores colour codes and counts UTF-8 chars", display_width(styled), 9)
+    assert_eq("pad_right pads styled text by cells", display_width(pad_right(styled, 20)), 20)
+    assert_eq("pad_right never truncates", pad_right("abcdef", 3), "abcdef")
+    assert_eq("truncate keeps UTF-8 characters whole", truncate("ééééé", 3), "éé…")
+    assert_eq("truncate result fits the width", display_width(truncate("ééééé", 3)), 3)
+    assert_eq("truncate leaves fitting UTF-8 text alone", truncate("ééé", 3), "ééé")
+
+    for _, megabytes in ipairs({ 0, 0.5, 2.3, 98.4, 372.2, 999.96, 1023.9, 20480, 2000000 }) do
+        assert_eq(string.format("format_mem(%s) is %d cells", megabytes, MEM_COLUMN_WIDTH),
+            #format_mem(megabytes), MEM_COLUMN_WIDTH)
+    end
+
+    local list_header = string.format("  %-3s %7s %-10s %4s  %s", "SEL", "PID", "MEM", "THR", "")
+    assert_eq("list header matches row fixed width", #list_header, LIST_FIXED_COLUMNS_WIDTH)
+
+    for _, help_line in ipairs(build_help_lines()) do
+        if display_width(help_line) > 78 then
+            assert_eq("help line fits an 80-column terminal", help_line, "<= 78 cells")
+        end
+    end
+    assert_eq("help lines cover both sections", #build_help_lines(), 19)
+
+    -- Test 15: process text sanitising and kernel threads
+    assert_eq("sanitize strips ESC sequences", sanitize_for_display("a\27[2Jb\7"), "a?[2Jb?")
+    assert_eq("sanitize keeps UTF-8 text", sanitize_for_display("café --flag"), "café --flag")
+    assert_eq("kthreadd is a kernel thread", is_kernel_thread(2, 0), true)
+    assert_eq("child of kthreadd is a kernel thread", is_kernel_thread(57, 2), true)
+    assert_eq("init child is not a kernel thread", is_kernel_thread(900, 1), false)
 
     -- Test 11: key decoding keeps every key from one read()
     local function decoded(bytes)
