@@ -15,7 +15,7 @@
     - Multi-Selection & Batch Process Termination:
       * Tab / Space: Multi-select processes with checkboxes [x]
       * d / Enter: Terminate selected processes with visual confirmation dialog
-      * D / K: Immediate force kill (SIGKILL on Linux, TerminateProcess on Windows)
+      * D / K: Force kill (SIGKILL on Linux, TerminateProcess on Windows), confirmed with y / Enter
     - Multi-Column Sorting:
       * s: Cycle sorting order (Memory -> PID -> Name -> Threads)
     - Preserved CLI Modes:
@@ -181,6 +181,7 @@ else
         int closedir(DIR *dirp);
         int kill(int pid, int sig);
         int getpid(void);
+        int isatty(int fd);
         int readlink(const char *pathname, char *buf, size_t bufsiz);
         char *strerror(int errnum);
 
@@ -225,7 +226,17 @@ local Term = {
     hOut = nil,
     tty_fd = -1,
     tty_out = nil,
+    pending_keys = {}, -- decoded keys not yet returned by Term.read_key
+    read_buffer = nil, -- reusable char buffer for POSIX read()
 }
+
+-- Bytes requested per read(); a paste or key repeat can deliver many keys at once.
+local READ_BUFFER_SIZE = 256
+
+local EINTR = 4
+local EXIT_FAILURE = 1
+
+local O_RDWR = 2
 
 function Term.write_tui(s)
     if not Term.tty_out then
@@ -239,8 +250,10 @@ function Term.write_tui(s)
     Term.tty_out:flush()
 end
 
+-- Switches the terminal to raw mode and the alternate screen.
+-- Returns true, or nil plus an error message when there is no terminal to drive.
 function Term.init()
-    if Term.initialized then return end
+    if Term.initialized then return true end
     if IS_WINDOWS then
         pcall(function()
             ffi.C.SetConsoleOutputCP(65001)
@@ -265,8 +278,16 @@ function Term.init()
         ffi.C.SetConsoleMode(Term.hOut, raw_out)
         ffi.C.SetConsoleMode(hErr, raw_err)
     else
-        Term.tty_fd = ffi.C.open("/dev/tty", 2)
+        Term.tty_fd = ffi.C.open("/dev/tty", O_RDWR)
         if Term.tty_fd < 0 then Term.tty_fd = 0 end
+
+        -- Without a terminal there are no keys to read and nowhere to draw.
+        if ffi.C.isatty(Term.tty_fd) == 0 then
+            Term.tty_fd = -1
+            return nil, "interactive mode needs a terminal. "
+                .. "Use 'fkill --list' or 'fkill <PID>' instead."
+        end
+
         Term.orig_termios = ffi.new("struct termios")
         ffi.C.tcgetattr(Term.tty_fd, Term.orig_termios)
 
@@ -281,6 +302,7 @@ function Term.init()
     Term.initialized = true
     -- Alternate screen, disable autowrap (\27[?7l), clear screen, hide cursor
     Term.write_tui("\27[?1049h\27[?7l\27[2J\27[H\27[?25l")
+    return true
 end
 
 function Term.restore()
@@ -328,6 +350,121 @@ function Term.get_size()
     return 80, 24
 end
 
+-- Escape sequences sent by special keys, keyed by their exact bytes.
+local ESCAPE_SEQUENCE_KEYS = {
+    ["\27[A"] = "UP",
+    ["\27OA"] = "UP",
+    ["\27[B"] = "DOWN",
+    ["\27OB"] = "DOWN",
+    ["\27[C"] = "RIGHT",
+    ["\27OC"] = "RIGHT",
+    ["\27[D"] = "LEFT",
+    ["\27OD"] = "LEFT",
+    ["\27[H"] = "HOME",
+    ["\27[1~"] = "HOME",
+    ["\27[F"] = "END",
+    ["\27[4~"] = "END",
+    ["\27[5~"] = "PGUP",
+    ["\27[6~"] = "PGDN",
+    ["\27[3~"] = "DELETE",
+    ["\27[Z"] = "BACKTAB",
+}
+local MIN_ESCAPE_SEQUENCE_LENGTH = 3
+local MAX_ESCAPE_SEQUENCE_LENGTH = 4
+
+-- Single bytes that map to a named key instead of a literal character.
+local SINGLE_BYTE_KEYS = {
+    ["\27"] = "ESC",
+    ["\n"] = "ENTER",
+    ["\r"] = "ENTER",
+    ["\t"] = "TAB",
+    ["\127"] = "BACKSPACE",
+    ["\8"] = "BACKSPACE",
+    ["\2"] = "CTRL_B",
+    ["\3"] = "CTRL_C",
+    ["\4"] = "CTRL_D",
+    ["\5"] = "CTRL_E",
+    ["\6"] = "CTRL_F",
+    ["\14"] = "CTRL_N",
+    ["\16"] = "CTRL_P",
+    ["\18"] = "CTRL_R",
+    ["\21"] = "CTRL_U",
+    ["\23"] = "CTRL_W",
+    ["\25"] = "CTRL_Y",
+    [" "] = "SPACE",
+}
+
+local ESCAPE_BYTE = 27
+
+-- Returns the byte length of the UTF-8 character starting with `lead_byte`.
+local function utf8_char_length(lead_byte)
+    if lead_byte >= 0xF0 then return 4 end
+    if lead_byte >= 0xE0 then return 3 end
+    if lead_byte >= 0xC0 then return 2 end
+    return 1
+end
+
+-- Decodes the key at `position` when it starts with ESC.
+-- Returns key name and bytes consumed, or nil when the byte is not ESC.
+local function decode_escape_sequence(bytes, position)
+    if bytes:byte(position) ~= ESCAPE_BYTE then
+        return nil
+    end
+
+    for length = MAX_ESCAPE_SEQUENCE_LENGTH, MIN_ESCAPE_SEQUENCE_LENGTH, -1 do
+        local key = ESCAPE_SEQUENCE_KEYS[bytes:sub(position, position + length - 1)]
+        if key then
+            return key, length
+        end
+    end
+
+    -- Unrecognised CSI / SS3 sequences are swallowed whole so their parameter
+    -- bytes are not mistaken for typed characters.
+    local control_sequence = bytes:match("^\27%[[0-?]*[ -/]*[@-~]", position)
+        or bytes:match("^\27O.", position)
+    if control_sequence then
+        return "UNKNOWN", #control_sequence
+    end
+
+    -- ESC followed directly by another key is an Alt chord, not a request to
+    -- leave the current mode. Only a lone ESC counts as the ESC key.
+    local next_byte = bytes:byte(position + 1)
+    if next_byte and next_byte ~= ESCAPE_BYTE then
+        return "UNKNOWN", 1 + utf8_char_length(next_byte)
+    end
+
+    return "ESC", 1
+end
+
+-- Decodes the non-escape key at `position`. Returns key name and bytes consumed.
+local function decode_plain_key(bytes, position)
+    local length = utf8_char_length(bytes:byte(position))
+    local character = bytes:sub(position, position + length - 1)
+
+    return SINGLE_BYTE_KEYS[character] or character, #character
+end
+
+-- Splits raw terminal input into key names, so several keys delivered by one
+-- read() (key repeat, fast typing, paste) are all kept. Returns a list of keys.
+local function decode_keys(bytes)
+    local keys = {}
+    local position = 1
+
+    while position <= #bytes do
+        local key, consumed = decode_escape_sequence(bytes, position)
+        if not key then
+            key, consumed = decode_plain_key(bytes, position)
+        end
+
+        keys[#keys + 1] = key
+        position = position + consumed
+    end
+
+    return keys
+end
+
+-- Blocks until a key is available and returns its name. Returns "EOF" when the
+-- terminal is gone and "NONE" when the read should simply be retried.
 function Term.read_key()
     if IS_WINDOWS then
         local ch = ffi.C._getch()
@@ -364,41 +501,26 @@ function Term.read_key()
         end
         return string.char(ch)
     else
-        local buf = ffi.new("char[32]")
-        local n = ffi.C.read(Term.tty_fd >= 0 and Term.tty_fd or 0, buf, 32)
-        if n <= 0 then return "NONE" end
-        local seq = ffi.string(buf, n)
+        if #Term.pending_keys == 0 then
+            Term.read_buffer = Term.read_buffer or ffi.new("char[?]", READ_BUFFER_SIZE)
+            local input_fd = Term.tty_fd >= 0 and Term.tty_fd or 0
+            local byte_count = ffi.C.read(input_fd, Term.read_buffer, READ_BUFFER_SIZE)
 
-        if seq == "\27" then return "ESC"
-        elseif seq == "\n" or seq == "\r" then return "ENTER"
-        elseif seq == "\t" then return "TAB"
-        elseif seq == "\127" or seq == "\8" then return "BACKSPACE"
-        elseif seq == "\2" then return "CTRL_B"
-        elseif seq == "\3" then return "CTRL_C"
-        elseif seq == "\4" then return "CTRL_D"
-        elseif seq == "\5" then return "CTRL_E"
-        elseif seq == "\6" then return "CTRL_F"
-        elseif seq == "\14" then return "CTRL_N"
-        elseif seq == "\16" then return "CTRL_P"
-        elseif seq == "\18" then return "CTRL_R"
-        elseif seq == "\21" then return "CTRL_U"
-        elseif seq == "\23" then return "CTRL_W"
-        elseif seq == "\25" then return "CTRL_Y"
-        elseif seq == " " then return "SPACE"
-        elseif seq == "\27[A" or seq == "\27OA" then return "UP"
-        elseif seq == "\27[B" or seq == "\27OB" then return "DOWN"
-        elseif seq == "\27[C" or seq == "\27OC" then return "RIGHT"
-        elseif seq == "\27[D" or seq == "\27OD" then return "LEFT"
-        elseif seq == "\27[H" or seq == "\27[1~" then return "HOME"
-        elseif seq == "\27[F" or seq == "\27[4~" then return "END"
-        elseif seq == "\27[5~" then return "PGUP"
-        elseif seq == "\27[6~" then return "PGDN"
-        elseif seq == "\27[3~" then return "DELETE"
-        elseif seq == "\27[Z" then return "BACKTAB"
+            if byte_count == 0 then
+                return "EOF"
+            end
+
+            if byte_count < 0 then
+                -- An interrupted read is retried; any other error (such as EIO
+                -- after the terminal hangs up) will never recover.
+                if ffi.errno() == EINTR then return "NONE" end
+                return "EOF"
+            end
+
+            Term.pending_keys = decode_keys(ffi.string(Term.read_buffer, byte_count))
         end
 
-        if #seq == 1 then return seq end
-        return "UNKNOWN"
+        return table.remove(Term.pending_keys, 1) or "NONE"
     end
 end
 
@@ -739,9 +861,81 @@ local SORT_LABELS = {
     threads = "Threads (Desc)",
 }
 
+local FORCE_KILL_LABEL = IS_WINDOWS and "FORCE kill" or "FORCE kill (SIGKILL)"
+
+-- Kills each process in `targets` with `kill_process(pid, force)`.
+-- Returns the list of PIDs that were signalled and a list of failures, each
+-- { pid, name, reason }, so no individual error is lost in a batch.
+local function kill_targets(targets, force, kill_process)
+    local killed_pids = {}
+    local failures = {}
+
+    for _, target in ipairs(targets) do
+        local ok, err = kill_process(target.pid, force)
+        if ok then
+            killed_pids[#killed_pids + 1] = target.pid
+        else
+            failures[#failures + 1] = {
+                pid = target.pid,
+                name = target.name,
+                reason = err or "unknown error",
+            }
+        end
+    end
+
+    return killed_pids, failures
+end
+
+-- Builds the confirmation question for killing `targets`.
+local function describe_kill_prompt(targets, force)
+    local verb = force and FORCE_KILL_LABEL or "Kill"
+    if #targets == 1 then
+        return string.format("%s %s (PID: %d)?", verb, targets[1].name, targets[1].pid)
+    end
+
+    return string.format("%s %d selected process(es)?", verb, #targets)
+end
+
+-- Builds the status line after a kill. Returns the message and its status type
+-- ("ok" or "error"). The first failure is always named with its system error.
+local function describe_kill_result(killed_count, failures, force)
+    local done_verb = force and "Force-killed" or "Terminated"
+    if #failures == 0 then
+        return string.format("%s %d process(es).", done_verb, killed_count), "ok"
+    end
+
+    local first = failures[1]
+    local detail = string.format("PID %d (%s): %s", first.pid, first.name, first.reason)
+    if #failures > 1 then
+        detail = detail .. string.format(" (+%d more failed)", #failures - 1)
+    end
+
+    if killed_count == 0 and #failures == 1 then
+        return "Failed to kill " .. detail, "error"
+    end
+
+    return string.format("%s %d, failed %d: %s", done_verb, killed_count, #failures, detail), "error"
+end
+
+-- Returns true when `key` answers "yes" to the kill prompt. A force kill needs
+-- y or Enter; repeating the kill key (dd) only confirms a normal kill, so a
+-- doubled K or D can never SIGKILL by accident.
+local function is_confirm_key(key, is_force)
+    if key == "y" or key == "Y" or key == "ENTER" then
+        return true
+    end
+
+    return not is_force and (key == "d" or key == "D")
+end
+
 local function run_tui(init_opts)
     init_opts = init_opts or {}
-    Term.init()
+
+    local terminal_ready, terminal_error = Term.init()
+    if not terminal_ready then
+        io.stderr:write("fkill: " .. terminal_error .. "\n")
+        os.exit(EXIT_FAILURE)
+    end
 
     local hostname = os.getenv("COMPUTERNAME") or os.getenv("HOSTNAME") or "Host"
     local state = {
@@ -763,6 +957,7 @@ local function run_tui(init_opts)
         status_type = "ok",
         confirm_callback = nil,
         confirm_msg = "",
+        confirm_is_force = false,
     }
 
     local function refresh_data()
@@ -946,7 +1141,7 @@ local function run_tui(init_opts)
                 table.insert(r_lines, C.b_yellow .. C.bold .. "  SELECTION & PROCESS ACTIONS" .. C.reset)
                 table.insert(r_lines, string.format("   %s%-18s%s Toggle selection checkbox [x]", C.b_cyan, "v / Tab / Space", C.reset))
                 table.insert(r_lines, string.format("   %s%-18s%s Terminate process (prompt)", C.b_cyan, "d / Enter", C.reset))
-                table.insert(r_lines, string.format("   %s%-18s%s Force kill immediately (SIGKILL)", C.b_cyan, "D / K", C.reset))
+                table.insert(r_lines, string.format("   %s%-18s%s Force kill (SIGKILL), asks y / Enter", C.b_cyan, "D / K", C.reset))
                 table.insert(r_lines, string.format("   %s%-18s%s Cycle sort mode (RAM/PID/Name)", C.b_cyan, "s / S", C.reset))
                 table.insert(r_lines, string.format("   %s%-18s%s Switch tab: All / User / Heavy", C.b_cyan, "h / l, 1 / 2 / 3", C.reset))
                 table.insert(r_lines, string.format("   %s%-18s%s Refresh process list & memory", C.b_cyan, "r / Ctrl-r", C.reset))
@@ -1100,13 +1295,19 @@ local function run_tui(init_opts)
             os.exit(0)
         end
 
+        if key == "EOF" then
+            Term.restore()
+            io.stderr:write("fkill: terminal input closed; exiting.\n")
+            os.exit(EXIT_FAILURE)
+        end
+
         -- Dismiss Help Mode on any key
         if state.mode == "help" then
             state.mode = "normal"
 
         -- A. Confirm Kill Mode
         elseif state.mode == "confirm_kill" then
-            if key == "y" or key == "Y" or key == "ENTER" or key == "d" or key == "D" then
+            if is_confirm_key(key, state.confirm_is_force) then
                 if state.confirm_callback then
                     state.confirm_callback(true)
                 end
@@ -1283,56 +1484,17 @@ local function run_tui(init_opts)
                 if #targets == 0 then
                     state.status_msg = "No process selected."
                     state.status_type = "warn"
-                elseif force then
-                    -- Immediate force kill
-                    local killed = 0
-                    local failed_msg = ""
-                    for _, t in ipairs(targets) do
-                        local ok, err = Backend.kill_process(t.pid, true)
-                        if ok then
-                            killed = killed + 1
-                            state.selected_set[t.pid] = nil
-                        else
-                            failed_msg = err or "Access Denied"
-                        end
-                    end
-                    if killed > 0 then
-                        state.status_msg = string.format("Force-killed %d process(es).", killed)
-                        state.status_type = "ok"
-                    else
-                        state.status_msg = string.format("Failed to kill: %s", failed_msg)
-                        state.status_type = "error"
-                    end
-                    refresh_data()
-                    apply_filter_and_sort()
                 else
-                    -- Confirmation prompt
-                    local desc = ""
-                    if #targets == 1 then
-                        desc = string.format("Kill %s (PID: %d)?", targets[1].name, targets[1].pid)
-                    else
-                        desc = string.format("Kill %d selected process(es)?", #targets)
-                    end
-                    state.confirm_msg = desc
+                    state.confirm_msg = describe_kill_prompt(targets, force)
+                    state.confirm_is_force = force
                     state.confirm_callback = function()
-                        local killed = 0
-                        local failed_msg = ""
-                        for _, t in ipairs(targets) do
-                            local ok, err = Backend.kill_process(t.pid, false)
-                            if ok then
-                                killed = killed + 1
-                                state.selected_set[t.pid] = nil
-                            else
-                                failed_msg = err or "Access Denied"
-                            end
+                        local killed_pids, failures = kill_targets(targets, force, Backend.kill_process)
+                        for _, killed_pid in ipairs(killed_pids) do
+                            state.selected_set[killed_pid] = nil
                         end
-                        if killed > 0 then
-                            state.status_msg = string.format("Terminated %d process(es).", killed)
-                            state.status_type = "ok"
-                        else
-                            state.status_msg = string.format("Failed: %s", failed_msg)
-                            state.status_type = "error"
-                        end
+
+                        state.status_msg, state.status_type =
+                            describe_kill_result(#killed_pids, failures, force)
                     end
                     state.mode = "confirm_kill"
                 end
@@ -1407,7 +1569,6 @@ local function render_preview(pid)
 end
 
 local EXIT_OK = 0
-local EXIT_FAILURE = 1
 local EXIT_USAGE = 2
 
 -- Largest PID any supported kernel hands out (signed 32-bit pid_t / DWORD range).
@@ -1890,6 +2051,58 @@ local function run_tests()
     assert_eq("find by name is exact", find_processes_by_name(fake_procs, "lua", 10)[1].pid, 12)
     assert_eq("suggestions list distinct names", #suggest_similar_names(fake_procs, "lu", 10), 2)
 
+    -- Test 11: key decoding keeps every key from one read()
+    local function decoded(bytes)
+        return table.concat(decode_keys(bytes), ",")
+    end
+    assert_eq("keys repeated j all kept", decoded("jjj"), "j,j,j")
+    assert_eq("keys pasted text all kept", decoded("bash"), "b,a,s,h")
+    assert_eq("keys two arrows in one read", decoded("\27[A\27[B"), "UP,DOWN")
+    assert_eq("keys arrow then letter", decoded("\27OAj"), "UP,j")
+    assert_eq("keys four-byte sequence", decoded("\27[5~\27[6~"), "PGUP,PGDN")
+    assert_eq("keys lone ESC", decoded("\27"), "ESC")
+    assert_eq("keys double ESC", decoded("\27\27"), "ESC,ESC")
+    assert_eq("keys Alt chord is not ESC", decoded("\27q"), "UNKNOWN")
+    assert_eq("keys unknown CSI swallowed whole", decoded("\27[1;5Aj"), "UNKNOWN,j")
+    assert_eq("keys control bytes named", decoded("\r\t \127\4"), "ENTER,TAB,SPACE,BACKSPACE,CTRL_D")
+    assert_eq("keys UTF-8 char stays one key", #decode_keys("é/"), 2)
+    assert_eq("keys empty input", #decode_keys(""), 0)
+
+    -- Test 12: kill result reporting keeps every failure
+    local function fake_kill(pid)
+        if pid == 1 then
+            return false, "Operation not permitted"
+        end
+        return true
+    end
+    local kill_list = {
+        { pid = 100, name = "sleep" },
+        { pid = 1, name = "systemd" },
+        { pid = 101, name = "sleep" },
+    }
+    local killed_pids, kill_failures = kill_targets(kill_list, false, fake_kill)
+    assert_eq("kill_targets counts successes", #killed_pids, 2)
+    assert_eq("kill_targets records failure PID", kill_failures[1].pid, 1)
+    assert_eq("kill_targets records failure reason", kill_failures[1].reason, "Operation not permitted")
+
+    assert_eq("result mixed names the failure",
+        (describe_kill_result(2, kill_failures, false)),
+        "Terminated 2, failed 1: PID 1 (systemd): Operation not permitted")
+    assert_eq("result all failed names the failure",
+        (describe_kill_result(0, kill_failures, true)),
+        "Failed to kill PID 1 (systemd): Operation not permitted")
+    assert_eq("result failure is an error", select(2, describe_kill_result(2, kill_failures, false)), "error")
+    assert_eq("result success", (describe_kill_result(3, {}, true)), "Force-killed 3 process(es).")
+
+    -- Test 13: kill confirmation
+    assert_eq("prompt normal single", describe_kill_prompt({ kill_list[1] }, false), "Kill sleep (PID: 100)?")
+    assert_eq("prompt force says FORCE", describe_kill_prompt(kill_list, true):find("FORCE kill", 1, true), 1)
+    assert_eq("confirm y accepts force", is_confirm_key("y", true), true)
+    assert_eq("confirm Enter accepts force", is_confirm_key("ENTER", true), true)
+    assert_eq("confirm doubled K rejected", is_confirm_key("K", true), false)
+    assert_eq("confirm doubled D rejected for force", is_confirm_key("D", true), false)
+    assert_eq("confirm dd accepts normal kill", is_confirm_key("d", false), true)
+
     print(string.format("\nSelf-test summary: %d passed, %d failed.", passed, failed))
     if failed > 0 then os.exit(1) end
 end
@@ -1931,7 +2144,7 @@ Interactive Vim & Navigation Controls:
   Ctrl-e / Ctrl-y           Scroll right inspector card down / up
   v / Tab / Space           Toggle multi-select checkbox [x]
   d / Enter                 Terminate process(es) with confirmation
-  D / K                     Immediate force kill (SIGKILL)
+  D / K                     Force kill (SIGKILL), confirmed with y / Enter
   h / l, 1 / 2 / 3          Switch context tab (All / User / Heavy)
   s / S                     Cycle sort mode (Memory / PID / Name / Threads)
   /                         Enter search filter mode (Ctrl-w to delete word)
@@ -1972,4 +2185,14 @@ local opts = {
     start_tab = 2, -- Default to User Apps
     filter = "",
 }
-run_tui(opts)
+-- Restores the terminal before reporting a crash, so the traceback is readable
+-- and the shell is not left in raw mode on the alternate screen.
+local function report_tui_crash(err)
+    Term.restore()
+    io.stderr:write("fkill: internal error; terminal restored.\n")
+    io.stderr:write(debug.traceback(tostring(err), 2) .. "\n")
+end
+
+if not xpcall(run_tui, report_tui_crash, opts) then
+    os.exit(EXIT_FAILURE)
+end
