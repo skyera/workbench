@@ -1075,7 +1075,7 @@ local HELP_SECTIONS = {
             { "s / S", "Cycle sort mode (RAM/PID/Name)" },
             { "h / l, 1 / 2 / 3", "Switch tab: All / User / Heavy" },
             { "r / Ctrl-r", "Refresh process list & memory" },
-            { "/", "Real-time fuzzy filter (/)" },
+            { "/", "Filter by name, PID or command" },
             { "?, q / Esc", "Close help / exit fkill" },
         },
     },
@@ -1161,6 +1161,26 @@ local function is_confirm_key(key, is_force)
     end
 
     return not is_force and (key == "d" or key == "D")
+end
+
+-- Score for a filter found literally in the command line. It sits below a name
+-- substring match (about 1000) and above any realistic fuzzy name match.
+local COMMAND_LINE_MATCH_SCORE = 700
+
+-- Returns how well `proc` matches the filter text; 0 means no match. The name
+-- and PID match fuzzily; the command line must contain the text literally,
+-- because a fuzzy match against a long command line matches almost anything.
+local function filter_match_score(filter, proc)
+    local name_score = fuzzy_score(filter, proc.name) or 0
+    local pid_score = fuzzy_score(filter, tostring(proc.pid)) or 0
+
+    local command_score = 0
+    local command_line = proc.cmd or ""
+    if command_line:lower():find(filter:lower(), 1, true) then
+        command_score = COMMAND_LINE_MATCH_SCORE
+    end
+
+    return math.max(name_score, pid_score, command_score)
 end
 
 -- Cells around the filter field on line 2: one leading space and one space
@@ -1349,11 +1369,9 @@ local function run_tui(init_opts)
 
             if pass_tab then
                 if #state.filter > 0 then
-                    local s1 = fuzzy_score(state.filter, p.name)
-                    local s2 = fuzzy_score(state.filter, tostring(p.pid))
-                    local s = math.max(s1 or 0, s2 or 0)
-                    if s > 0 then
-                        table.insert(list, { proc = p, score = s })
+                    local score = filter_match_score(state.filter, p)
+                    if score > 0 then
+                        table.insert(list, { proc = p, score = score })
                     end
                 else
                     table.insert(list, { proc = p, score = 0 })
@@ -2498,6 +2516,23 @@ local function run_tests()
         restore_signal_mask(previous_mask)
     end
 
+    -- Test 18: filter matches name, PID and command line, in that priority
+    local script_proc = { pid = 4321, name = "python3", cmd = "python3 /opt/jobs/Report_Job.py --fast" }
+    local named_proc = { pid = 77, name = "report_job", cmd = "/usr/bin/report_job" }
+    local fuzzy_proc = { pid = 88, name = "rxexpxoxrxt", cmd = "/usr/bin/other" }
+    assert_eq("filter finds script name in command line", filter_match_score("report_job", script_proc) > 0, true)
+    assert_eq("filter command line match ignores case", filter_match_score("REPORT_job", script_proc) > 0, true)
+    assert_eq("filter name match outranks command line match",
+        filter_match_score("report_job", named_proc) > filter_match_score("report_job", script_proc), true)
+    assert_eq("filter command line match outranks fuzzy name match",
+        filter_match_score("report", script_proc) > filter_match_score("report", fuzzy_proc), true)
+    assert_eq("filter fuzzy name match still works", filter_match_score("report", fuzzy_proc) > 0, true)
+    assert_eq("filter rejects scattered letters in command line", filter_match_score("pjfx", script_proc), 0)
+    assert_eq("filter treats pattern characters literally", filter_match_score("jobs/Rep.rt", script_proc), 0)
+    assert_eq("filter still matches PID", filter_match_score("4321", script_proc) > 0, true)
+    assert_eq("filter no match is zero", filter_match_score("zzzz", script_proc), 0)
+    assert_eq("filter tolerates missing command line", filter_match_score("zz", { pid = 1, name = "init" }), 0)
+
     -- Test 11: key decoding keeps every key from one read()
     local function decoded(bytes)
         return table.concat(decode_keys(bytes), ",")
@@ -2594,7 +2629,7 @@ Interactive Vim & Navigation Controls:
   D / K                     Force kill (SIGKILL), confirmed with y / Enter
   h / l, 1 / 2 / 3          Switch context tab (All / User / Heavy)
   s / S                     Cycle sort mode (Memory / PID / Name / Threads)
-  /                         Enter search filter mode (Ctrl-w to delete word)
+  /                         Filter by name, PID or command line (Ctrl-w deletes a word)
   r / Ctrl-r                Refresh processes and memory
   ?                         Toggle built-in Vim Cheatsheet modal
   q / Esc                   Exit fkill]])
