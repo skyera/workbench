@@ -19,9 +19,10 @@
     - Multi-Column Sorting:
       * s: Cycle sorting order (Memory -> PID -> Name -> Threads)
     - Preserved CLI Modes:
-      * fkill <PID>: Directly kill process by PID
-      * fkill <NAME>: Directly kill all processes matching name
+      * fkill <PID>...: Directly kill processes by PID (positive decimal only)
+      * fkill <NAME>: Kill processes whose name matches exactly, after confirmation
       * fkill -9 <PID|NAME>: Force kill by PID or name
+      * fkill -y <NAME>: Skip the kill-by-name confirmation (for scripts)
       * fkill -l, --list: Print formatted process table for shell pipelines
       * fkill -p, --preview <PID>: Print rich process diagnostic card
       * fkill --test: Run automated self-test suite
@@ -38,11 +39,18 @@
 
   Options:
     -9, -f, --force      Force terminate process (SIGKILL / TerminateProcess)
+    -y, --yes            Kill by name without asking for confirmation
     -l, --list           Print formatted process table to stdout and exit
     -p, --preview <PID>  Print rich process details card to stdout and exit
     --fzf                Launch legacy fzf pipeline mode
     --test               Run built-in automated self-test suite and exit
     -h, --help           Show this help message
+    --                   Treat every following argument as a PID or name
+
+  Exit status:
+    0  every requested process was killed
+    1  a kill failed, nothing matched, or the confirmation was declined
+    2  invalid command line (nothing was killed)
 ]]
 
 local ffi = require("ffi")
@@ -146,6 +154,7 @@ if IS_WINDOWS then
         BOOL CloseHandle(HANDLE hObject);
         DWORD QueryFullProcessImageNameA(HANDLE hProcess, DWORD dwFlags, char* lpExeName, DWORD* lpdwSize);
         DWORD GetLastError(void);
+        DWORD GetCurrentProcessId(void);
         BOOL GetProcessMemoryInfo(HANDLE Process, PROCESS_MEMORY_COUNTERS* ppsmpi, DWORD cb);
 
         HANDLE GetStdHandle(DWORD nStdHandle);
@@ -171,6 +180,7 @@ else
         struct dirent *readdir(DIR *dirp);
         int closedir(DIR *dirp);
         int kill(int pid, int sig);
+        int getpid(void);
         int readlink(const char *pathname, char *buf, size_t bufsiz);
         char *strerror(int errnum);
 
@@ -1396,37 +1406,206 @@ local function render_preview(pid)
     io.write(string.format("%s└%s┘%s\n", C.b_cyan, border, C.reset))
 end
 
+local EXIT_OK = 0
+local EXIT_FAILURE = 1
+local EXIT_USAGE = 2
+
+-- Largest PID any supported kernel hands out (signed 32-bit pid_t / DWORD range).
+local MAX_PID = 2147483647
+
+-- Linux truncates the "Name:" field of /proc/<pid>/status to this many characters.
+local LINUX_NAME_MAX_LENGTH = 15
+
+-- How many near-miss names to suggest when an exact name match finds nothing.
+local MAX_NAME_SUGGESTIONS = 5
+
+-- Returns the PID of this fkill process, so name matching can skip it.
+local function current_pid()
+    if IS_WINDOWS then
+        return tonumber(ffi.C.GetCurrentProcessId())
+    end
+
+    return ffi.C.getpid()
+end
+
+-- Classifies one positional CLI argument.
+-- Returns { kind = "pid", pid = n } or { kind = "name", name = s }, or nil plus an
+-- error message. Only plain positive decimals count as PIDs: kill() gives 0 and
+-- negative values group-wide and system-wide meanings that must never be reachable.
+local function classify_target(text)
+    if text == "" then
+        return nil, "empty PID or process name"
+    end
+
+    if not text:match("^%d+$") then
+        return { kind = "name", name = text }
+    end
+
+    local pid = tonumber(text)
+    if pid < 1 then
+        return nil, string.format("invalid PID '%s': PIDs start at 1", text)
+    end
+
+    if pid > MAX_PID then
+        return nil, string.format("invalid PID '%s': larger than the maximum PID %d", text, MAX_PID)
+    end
+
+    return { kind = "pid", pid = pid }
+end
+
+-- Returns true when `process_name` is the process the user named. The match is
+-- exact and case-insensitive; a substring match would kill unrelated processes.
+local function process_name_matches(process_name, wanted_name)
+    local actual = process_name:lower()
+    local wanted = wanted_name:lower()
+    if actual == wanted then
+        return true
+    end
+
+    if IS_WINDOWS then
+        return actual == wanted .. ".exe"
+    end
+
+    local is_truncated_by_kernel = #wanted > LINUX_NAME_MAX_LENGTH
+    return is_truncated_by_kernel and actual == wanted:sub(1, LINUX_NAME_MAX_LENGTH)
+end
+
+-- Returns the processes in `procs` named `name`, never including `own_pid`.
+local function find_processes_by_name(procs, name, own_pid)
+    local matched = {}
+
+    for _, proc in ipairs(procs) do
+        if proc.pid ~= own_pid and process_name_matches(proc.name, name) then
+            table.insert(matched, proc)
+        end
+    end
+
+    return matched
+end
+
+-- Returns up to MAX_NAME_SUGGESTIONS distinct process names containing `name`,
+-- used to guide the user after an exact match found nothing.
+local function suggest_similar_names(procs, name, own_pid)
+    local wanted = name:lower()
+    local seen = {}
+    local suggestions = {}
+
+    for _, proc in ipairs(procs) do
+        local is_candidate = proc.pid ~= own_pid and not seen[proc.name]
+        if is_candidate and proc.name:lower():find(wanted, 1, true) then
+            seen[proc.name] = true
+            table.insert(suggestions, proc.name)
+        end
+
+        if #suggestions >= MAX_NAME_SUGGESTIONS then break end
+    end
+
+    return suggestions
+end
+
+-- Asks a yes/no question on stdin. Returns true or false, or nil when stdin is
+-- closed (non-interactive use), so the caller can explain how to proceed.
+local function confirm_on_stdin(question)
+    io.write(question .. " [y/N]: ")
+    io.flush()
+
+    local answer = io.read("*line")
+    if answer == nil then
+        io.write("\n")
+        io.flush()
+        return nil
+    end
+
+    answer = trim(answer):lower()
+    return answer == "y" or answer == "yes"
+end
+
+-- Kills one PID. Reports success on stdout and the system error on stderr.
+-- Returns true when the process was signalled.
 local function kill_pid_cli(pid, force)
     local ok, err = Backend.kill_process(pid, force)
     if ok then
         io.write(string.format("%s✔ Successfully killed PID %d%s\n", C.green, pid, C.reset))
         return true
-    else
-        io.write(string.format("%s✘ Failed to kill PID %d: %s%s\n", C.red, pid, err or "error", C.reset))
-        return false
+    end
+
+    io.stderr:write(string.format(
+        "%s✘ Failed to kill PID %d: %s%s\n",
+        C.red, pid, err or "unknown error", C.reset
+    ))
+    return false
+end
+
+-- Explains on stderr that no process is named exactly `name`.
+local function report_no_name_match(procs, name, own_pid)
+    io.stderr:write(string.format("fkill: no running process is named exactly '%s'\n", name))
+
+    local suggestions = suggest_similar_names(procs, name, own_pid)
+    if #suggestions > 0 then
+        io.stderr:write("Similar names: " .. table.concat(suggestions, ", ") .. "\n")
     end
 end
 
-local function kill_by_name_cli(name, force)
+-- Kills every process named exactly `name` after listing them and, unless
+-- `assume_yes` is set, asking for confirmation. Returns a process exit code.
+local function kill_by_name_cli(name, force, assume_yes)
+    local own_pid = current_pid()
     local procs = Backend.get_process_list()
-    local target_name = name:lower()
-    local matched = {}
+    local matched = find_processes_by_name(procs, name, own_pid)
 
-    for _, p in ipairs(procs) do
-        if p.name:lower():find(target_name, 1, true) then
-            table.insert(matched, p)
+    if #matched == 0 then
+        report_no_name_match(procs, name, own_pid)
+        return EXIT_FAILURE
+    end
+
+    io.write(string.format("%sFound %d process(es) named '%s':%s\n", C.cyan, #matched, name, C.reset))
+    for _, proc in ipairs(matched) do
+        io.write(string.format("  %-8d %s\n", proc.pid, truncate(proc.cmd or proc.name, 70)))
+    end
+
+    if not assume_yes then
+        local confirmed = confirm_on_stdin(string.format("Kill %d process(es)?", #matched))
+        if confirmed == nil then
+            io.stderr:write("fkill: no confirmation available on stdin; nothing was killed. "
+                .. "Use -y to kill by name without a prompt.\n")
+            return EXIT_FAILURE
+        end
+
+        if not confirmed then
+            io.stderr:write("fkill: cancelled; nothing was killed.\n")
+            return EXIT_FAILURE
         end
     end
 
-    if #matched == 0 then
-        io.write(string.format("%sNo running processes matched '%s'%s\n", C.yellow, name, C.reset))
-        return
+    local exit_code = EXIT_OK
+    for _, proc in ipairs(matched) do
+        if not kill_pid_cli(proc.pid, force) then
+            exit_code = EXIT_FAILURE
+        end
     end
 
-    io.write(string.format("%sFound %d matching process(es) for '%s':%s\n", C.cyan, #matched, name, C.reset))
-    for _, p in ipairs(matched) do
-        kill_pid_cli(p.pid, force)
+    return exit_code
+end
+
+-- Kills every validated target from the command line. Keeps going after a
+-- failure so one dead PID does not hide the others. Returns a process exit code.
+local function kill_targets_cli(targets, force, assume_yes)
+    local exit_code = EXIT_OK
+
+    for _, target in ipairs(targets) do
+        local target_exit_code = EXIT_OK
+        if target.kind == "pid" then
+            if not kill_pid_cli(target.pid, force) then
+                target_exit_code = EXIT_FAILURE
+            end
+        else
+            target_exit_code = kill_by_name_cli(target.name, force, assume_yes)
+        end
+
+        exit_code = math.max(exit_code, target_exit_code)
     end
+
+    return exit_code
 end
 
 local function legacy_fzf()
@@ -1474,6 +1653,103 @@ local function legacy_fzf()
             kill_pid_cli(item.pid, false)
         end
     end
+end
+
+-- Explains why a dash-prefixed argument was rejected. Signal numbers and
+-- negative PIDs get their own message because `kill -15 <pid>` is a common habit.
+local function describe_unknown_option(option)
+    if option:match("^%-%d+$") then
+        return string.format(
+            "unsupported option '%s': fkill takes no signal numbers or negative PIDs "
+                .. "(use -9 to force kill)",
+            option
+        )
+    end
+
+    return string.format("unknown option '%s' (use -- before a process name that starts with '-')", option)
+end
+
+-- Validates `text` as a kill target and appends it to `targets`.
+-- Returns true, or nil plus an error message.
+local function add_target(targets, text)
+    local target, err = classify_target(text)
+    if not target then
+        return nil, err
+    end
+
+    table.insert(targets, target)
+    return true
+end
+
+-- Parses the command line without side effects, so nothing is killed unless
+-- every argument is valid. Returns an options table:
+--   { action = "tui"|"help"|"test"|"list"|"preview"|"fzf"|"kill",
+--     force, assume_yes, targets, preview_pid }
+-- or nil plus an error message.
+local function parse_cli(args)
+    local opts = {
+        action = "tui",
+        force = false,
+        assume_yes = false,
+        targets = {},
+    }
+    local only_targets_remain = false
+    local index = 1
+
+    while index <= #args do
+        local arg = args[index]
+        local ok, err = true, nil
+
+        -- Kill targets
+        if only_targets_remain or arg:sub(1, 1) ~= "-" then
+            ok, err = add_target(opts.targets, arg)
+        elseif arg == "--" then
+            only_targets_remain = true
+
+        -- Modifiers
+        elseif arg == "-9" or arg == "-f" or arg == "--force" then
+            opts.force = true
+        elseif arg == "-y" or arg == "--yes" then
+            opts.assume_yes = true
+
+        -- Standalone actions: the first one wins, as before
+        elseif arg == "-h" or arg == "--help" then
+            opts.action = "help"
+            return opts
+        elseif arg == "--test" then
+            opts.action = "test"
+            return opts
+        elseif arg == "-l" or arg == "--list" then
+            opts.action = "list"
+            return opts
+        elseif arg == "--fzf" then
+            opts.action = "fzf"
+            return opts
+        elseif arg == "-p" or arg == "--preview" then
+            local preview = classify_target(args[index + 1] or "")
+            if not preview or preview.kind ~= "pid" then
+                return nil, string.format("%s requires a numeric PID argument", arg)
+            end
+            opts.action = "preview"
+            opts.preview_pid = preview.pid
+            return opts
+        else
+            ok, err = nil, describe_unknown_option(arg)
+        end
+
+        if not ok then
+            return nil, err
+        end
+        index = index + 1
+    end
+
+    if #opts.targets > 0 then
+        opts.action = "kill"
+    elseif opts.force or opts.assume_yes then
+        return nil, "-9/--force and -y/--yes need a PID or process name to kill"
+    end
+
+    return opts
 end
 
 --------------------------------------------------------------------------------
@@ -1565,6 +1841,55 @@ local function run_tests()
     local zz_scroll = math.max(1, math.min(test_total - test_body_h + 1, cur - math.floor(test_body_h / 2)))
     assert_eq("zz centers cursor in viewport", zz_scroll, 20)
 
+    -- Test 8: CLI target validation (nothing here may ever reach kill())
+    assert_eq("target plain PID accepted", classify_target("1234").pid, 1234)
+    assert_eq("target name classified as name", classify_target("bash").kind, "name")
+    assert_eq("target PID 0 rejected", classify_target("0"), nil)
+    assert_eq("target PID 000 rejected", classify_target("000"), nil)
+    assert_eq("target oversized PID rejected", classify_target("99999999999"), nil)
+    assert_eq("target empty rejected", classify_target(""), nil)
+    assert_eq("target hex is a name, not a PID", classify_target("0x10").kind, "name")
+    assert_eq("target exponent is a name, not a PID", classify_target("1e3").kind, "name")
+    assert_eq("target fraction is a name, not a PID", classify_target("1.9").kind, "name")
+
+    -- Test 9: CLI parser
+    assert_eq("parse no args opens TUI", parse_cli({}).action, "tui")
+    assert_eq("parse -1 rejected", parse_cli({ "-1" }), nil)
+    assert_eq("parse -15 PID rejected", parse_cli({ "-15", "1234" }), nil)
+    assert_eq("parse unknown option rejected", parse_cli({ "--bogus" }), nil)
+    assert_eq("parse PID 0 rejected", parse_cli({ "0" }), nil)
+    assert_eq("parse bad target rejects whole line", parse_cli({ "1234", "0" }), nil)
+    assert_eq("parse lone -9 rejected", parse_cli({ "-9" }), nil)
+    assert_eq("parse lone -y rejected", parse_cli({ "-y" }), nil)
+    assert_eq("parse --preview without PID rejected", parse_cli({ "--preview", "abc" }), nil)
+    assert_eq("parse --preview PID", parse_cli({ "-p", "42" }).preview_pid, 42)
+    assert_eq("parse --list", parse_cli({ "--list" }).action, "list")
+
+    local kill_opts = parse_cli({ "1234", "bash", "-9", "-y" })
+    assert_eq("parse kill action", kill_opts.action, "kill")
+    assert_eq("parse force after target honored", kill_opts.force, true)
+    assert_eq("parse yes after target honored", kill_opts.assume_yes, true)
+    assert_eq("parse collects every target", #kill_opts.targets, 2)
+
+    local dash_opts = parse_cli({ "--", "-odd-name" })
+    assert_eq("parse -- allows dash-prefixed name", dash_opts.targets[1].name, "-odd-name")
+    assert_eq("parse -- never yields negative PID", parse_cli({ "--", "-1" }).targets[1].kind, "name")
+
+    -- Test 10: exact process-name matching
+    assert_eq("name match exact", process_name_matches("bash", "bash"), true)
+    assert_eq("name match ignores case", process_name_matches("Bash", "bASH"), true)
+    assert_eq("name match rejects substring", process_name_matches("bash", "a"), false)
+    assert_eq("name match rejects prefix", process_name_matches("luajit", "lua"), false)
+
+    local fake_procs = {
+        { pid = 10, name = "luajit" },
+        { pid = 11, name = "luajit" },
+        { pid = 12, name = "lua" },
+    }
+    assert_eq("find by name excludes own PID", #find_processes_by_name(fake_procs, "luajit", 10), 1)
+    assert_eq("find by name is exact", find_processes_by_name(fake_procs, "lua", 10)[1].pid, 12)
+    assert_eq("suggestions list distinct names", #suggest_similar_names(fake_procs, "lu", 10), 2)
+
     print(string.format("\nSelf-test summary: %d passed, %d failed.", passed, failed))
     if failed > 0 then os.exit(1) end
 end
@@ -1579,11 +1904,22 @@ Usage:
 
 Options:
   -9, -f, --force      Force terminate process (SIGKILL / TerminateProcess)
+  -y, --yes            Kill by name without asking for confirmation
   -l, --list           Print formatted process table to stdout and exit
   -p, --preview <PID>  Print rich process details card to stdout and exit
   --fzf                Launch legacy fzf pipeline mode
   --test               Run built-in automated self-tests and exit
   -h, --help           Show this help message
+  --                   Treat every following argument as a PID or name
+
+Direct kill:
+  fkill 1234 5678      Kill by PID (positive decimal numbers only)
+  fkill firefox        Kill processes named exactly 'firefox', after confirmation
+  fkill -9 -y firefox  Force kill by name without a prompt (for scripts)
+
+Exit status:
+  0 killed everything requested; 1 a kill failed, nothing matched, or the
+  confirmation was declined; 2 invalid command line (nothing was killed).
 
 Interactive Vim & Navigation Controls:
   j / k, ^n / ^p, Up / Down Move cursor down / up
@@ -1607,52 +1943,33 @@ end
 --------------------------------------------------------------------------------
 -- 9. Entry Point & CLI Parser
 --------------------------------------------------------------------------------
-local args = { ... }
-local force = false
+local cli_opts, cli_error = parse_cli({ ... })
+if not cli_opts then
+    io.stderr:write(string.format("fkill: %s\nTry 'fkill --help' for usage.\n", cli_error))
+    os.exit(EXIT_USAGE)
+end
+
+if cli_opts.action == "help" then
+    show_help()
+    os.exit(EXIT_OK)
+elseif cli_opts.action == "test" then
+    run_tests()
+    os.exit(EXIT_OK)
+elseif cli_opts.action == "list" then
+    print_list()
+    os.exit(EXIT_OK)
+elseif cli_opts.action == "preview" then
+    render_preview(cli_opts.preview_pid)
+    os.exit(EXIT_OK)
+elseif cli_opts.action == "fzf" then
+    legacy_fzf()
+    os.exit(EXIT_OK)
+elseif cli_opts.action == "kill" then
+    os.exit(kill_targets_cli(cli_opts.targets, cli_opts.force, cli_opts.assume_yes))
+end
+
 local opts = {
-    mode = "tui",
     start_tab = 2, -- Default to User Apps
     filter = "",
 }
-
-local i = 1
-while i <= #args do
-    local a = args[i]
-    if a == "-h" or a == "--help" then
-        show_help()
-        os.exit(0)
-    elseif a == "--test" then
-        run_tests()
-        os.exit(0)
-    elseif a == "-l" or a == "--list" then
-        print_list()
-        os.exit(0)
-    elseif a == "-p" or a == "--preview" then
-        local pid = tonumber(args[i + 1])
-        if pid then
-            render_preview(pid)
-        else
-            io.stderr:write("Error: --preview requires a numeric PID argument.\n")
-            os.exit(1)
-        end
-        os.exit(0)
-    elseif a == "--fzf" then
-        legacy_fzf()
-        os.exit(0)
-    elseif a == "-9" or a == "-f" or a == "--force" then
-        force = true
-    else
-        -- Check if argument is a numeric PID or process name to kill directly
-        local pid = tonumber(a)
-        if pid then
-            kill_pid_cli(pid, force)
-            os.exit(0)
-        else
-            kill_by_name_cli(a, force)
-            os.exit(0)
-        end
-    end
-    i = i + 1
-end
-
 run_tui(opts)
