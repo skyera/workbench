@@ -950,6 +950,13 @@ local TAB_LABELS = {
     heavy = "Heavy / RAM",
 }
 
+-- Used when the terminal is too narrow for the full labels and a filter field.
+local TAB_SHORT_LABELS = {
+    all = "All",
+    user = "User",
+    heavy = "Heavy",
+}
+
 local SORT_MODES = { "mem", "pid", "name", "threads" }
 local SORT_LABELS = {
     mem = "Memory (Desc)",
@@ -1074,6 +1081,138 @@ local function is_confirm_key(key, is_force)
     end
 
     return not is_force and (key == "d" or key == "D")
+end
+
+-- Cells around the filter field on line 2: one leading space and one space
+-- before the tab strip.
+local SUBHEADER_MARGIN_WIDTH = 2
+
+-- Narrowest filter field that still shows the "/ to filter" hint. Below this the
+-- tab strip switches to short labels.
+local MIN_FILTER_FIELD_WIDTH = 11
+
+-- Narrowest field in which typing is still usable ("/", three characters and
+-- the cursor). Below this the filter takes the whole line while typing.
+local MIN_TYPING_FIELD_WIDTH = 5
+
+local FILTER_CURSOR = "█"
+
+-- Returns the styled tab strip, e.g. "[All Procs (328)] [User Apps (205)] ...",
+-- with the active tab highlighted. `labels` maps tab ids to their captions.
+local function build_tab_strip(tab_counts, active_index, labels)
+    local tabs = {}
+
+    for index, tab_id in ipairs(TABS) do
+        local caption = string.format("[%s (%d)]", labels[tab_id], tab_counts[tab_id])
+        local style = C.gray
+        if index == active_index then
+            style = C.inverse .. C.b_red
+        end
+
+        tabs[#tabs + 1] = style .. caption .. C.reset
+    end
+
+    return table.concat(tabs, " ")
+end
+
+-- Shortens `filter` to `cells` by keeping its end behind a leading ellipsis, so
+-- the characters being typed stay visible. The filter is ASCII-only (the input
+-- handler accepts printable ASCII), so bytes and cells are the same here.
+local function fit_filter_tail(filter, cells)
+    if #filter <= cells then
+        return filter
+    end
+
+    if cells <= 0 then
+        return ""
+    end
+
+    return "…" .. filter:sub(#filter - cells + 2)
+end
+
+-- Returns the filter text while the user is typing, always ending in the cursor.
+local function build_typing_filter(filter, available_cells)
+    local prompt = "Filter (/): "
+    if available_cells < #prompt + 4 then
+        prompt = "/"
+    end
+
+    local text_cells = available_cells - #prompt - 1
+    if text_cells < 0 then
+        return ""
+    end
+
+    local shown = fit_filter_tail(filter, text_cells)
+    return C.b_yellow .. C.bold .. prompt .. C.b_white .. shown .. FILTER_CURSOR .. C.reset
+end
+
+-- Returns the filter text for an applied (non-empty) filter outside typing mode.
+local function build_applied_filter(filter, available_cells)
+    local prompt = "Filter: "
+    local hint = " (Esc to clear)"
+    if #prompt + #filter + #hint <= available_cells then
+        return C.bold .. prompt .. C.b_white .. filter .. C.reset .. C.gray .. hint .. C.reset
+    end
+
+    local text_cells = available_cells - #prompt
+    if text_cells < 1 then
+        return ""
+    end
+
+    return C.bold .. prompt .. C.b_white .. fit_filter_tail(filter, text_cells) .. C.reset
+end
+
+-- Returns the hint shown when no filter is set: the longest variant that fits.
+local function build_idle_filter(available_cells)
+    local prompt = "Filter (/): "
+    local hint = "(press / to filter)"
+    if #prompt + #hint <= available_cells then
+        return C.bold .. prompt .. C.gray .. hint .. C.reset
+    end
+
+    local short_hint = "/ to filter"
+    if #short_hint <= available_cells then
+        return C.gray .. short_hint .. C.reset
+    end
+
+    return ""
+end
+
+-- Returns the styled filter text that fits `available_cells` for the given
+-- input mode ("filter" while typing) and filter string.
+local function build_filter_display(mode, filter, available_cells)
+    if mode == "filter" then
+        return build_typing_filter(filter, available_cells)
+    end
+
+    if #filter > 0 then
+        return build_applied_filter(filter, available_cells)
+    end
+
+    return build_idle_filter(available_cells)
+end
+
+-- Builds line 2: filter text on the left, tab strip right-aligned. The tabs are
+-- shown whole and the filter text shrinks to the cells that remain. The one
+-- exception is typing on a terminal too narrow for both: the tabs are hidden
+-- until typing ends, because the text being typed must stay visible.
+local function build_subheader_line(cols, state, tab_counts)
+    local line_width = math.max(1, cols - 1)
+    local tabs = build_tab_strip(tab_counts, state.tab_idx, TAB_LABELS)
+    local needed_width = display_width(tabs) + SUBHEADER_MARGIN_WIDTH + MIN_FILTER_FIELD_WIDTH
+    if needed_width > line_width then
+        tabs = build_tab_strip(tab_counts, state.tab_idx, TAB_SHORT_LABELS)
+    end
+
+    local filter_width = math.max(0, line_width - display_width(tabs) - SUBHEADER_MARGIN_WIDTH)
+    if state.mode == "filter" and filter_width < MIN_TYPING_FIELD_WIDTH then
+        return " " .. build_typing_filter(state.filter, line_width - 1)
+    end
+
+    local filter_text = build_filter_display(state.mode, state.filter, filter_width)
+    local gap_width = filter_width - display_width(filter_text)
+
+    return " " .. filter_text .. string.rep(" ", gap_width) .. " " .. tabs
 end
 
 local function run_tui(init_opts)
@@ -1209,34 +1348,8 @@ local function run_tui(init_opts)
         add_line(C.bg_header .. pad_right(head_str, math.max(1, cols - 1)) .. C.reset)
 
         -- 2. Subheader Tabs & Filter
-        local tabs_str = ""
-        for i, t in ipairs(TABS) do
-            local cnt = (t == "all") and cnt_all or ((t == "user") and cnt_user or cnt_heavy)
-            local label = string.format("%s (%d)", TAB_LABELS[t], cnt)
-
-            if i == state.tab_idx then
-                tabs_str = tabs_str .. C.inverse .. C.b_red .. "[" .. label .. "]" .. C.reset .. " "
-            else
-                tabs_str = tabs_str .. C.gray .. "[" .. label .. "]" .. C.reset .. " "
-            end
-        end
-
-        local filter_disp
-        if state.mode == "filter" then
-            filter_disp = C.b_yellow .. C.bold .. "Filter (/): " .. C.b_white .. state.filter .. "█" .. C.reset
-        else
-            if #state.filter > 0 then
-                filter_disp = C.bold .. "Filter: " .. C.b_white .. state.filter .. C.reset .. C.gray .. " (Esc to clear)" .. C.reset
-            else
-                filter_disp = C.bold .. "Filter (/): " .. C.gray .. "(press / to filter)" .. C.reset
-            end
-        end
-
-        local sub_l = " " .. filter_disp
-        local sub_r = tabs_str .. " "
-        local sub_space = cols - (display_width(filter_disp) + display_width(tabs_str) + 4)
-        if sub_space < 1 then sub_space = 1 end
-        add_line(sub_l .. string.rep(" ", sub_space) .. sub_r)
+        local tab_counts = { all = cnt_all, user = cnt_user, heavy = cnt_heavy }
+        add_line(build_subheader_line(cols, state, tab_counts))
 
         -- 3. Pane Geometry
         local body_h = math.max(4, rows - 5)
@@ -2225,6 +2338,57 @@ local function run_tests()
     assert_eq("kthreadd is a kernel thread", is_kernel_thread(2, 0), true)
     assert_eq("child of kthreadd is a kernel thread", is_kernel_thread(57, 2), true)
     assert_eq("init child is not a kernel thread", is_kernel_thread(900, 1), false)
+
+    -- Test 16: line 2 always fits and always shows every tab whole
+    local sub_counts = { all = 328, user = 205, heavy = 22 }
+    local sub_states = {
+        { mode = "normal", filter = "", tab_idx = 2 },
+        { mode = "normal", filter = "claude", tab_idx = 1 },
+        { mode = "normal", filter = string.rep("x", 100), tab_idx = 3 },
+        { mode = "filter", filter = "", tab_idx = 2 },
+        { mode = "filter", filter = string.rep("y", 95) .. "_tail", tab_idx = 2 },
+    }
+    local overflow_count = 0
+    local clipped_tab_count = 0
+    local lost_cursor_count = 0
+    for sub_cols = 40, 200 do
+        for _, sub_state in ipairs(sub_states) do
+            local line = build_subheader_line(sub_cols, sub_state, sub_counts)
+            local plain = line:gsub("\27%[[%d;]*m", "")
+            if display_width(line) > sub_cols - 1 then
+                overflow_count = overflow_count + 1
+            end
+            local shows_first_tab = plain:find("[All", 1, true) ~= nil
+            local shows_last_tab = plain:find("(22)]", 1, true) ~= nil
+            local tabs_hidden_for_typing = sub_state.mode == "filter" and not shows_first_tab
+            if not tabs_hidden_for_typing and not (shows_first_tab and shows_last_tab) then
+                clipped_tab_count = clipped_tab_count + 1
+            end
+            if sub_state.mode == "filter" and not plain:find("█", 1, true) then
+                lost_cursor_count = lost_cursor_count + 1
+            end
+        end
+    end
+    assert_eq("subheader never exceeds cols - 1 (40..200)", overflow_count, 0)
+    assert_eq("subheader never shows a clipped tab strip", clipped_tab_count, 0)
+    assert_eq("subheader 40 cols typing hides tabs for the filter",
+        (build_subheader_line(40, sub_states[4], sub_counts):gsub("\27%[[%d;]*m", "")), " Filter (/): █")
+    assert_eq("subheader keeps the typing cursor visible", lost_cursor_count, 0)
+
+    local function plain_subheader(sub_cols, sub_state)
+        return (build_subheader_line(sub_cols, sub_state, sub_counts):gsub("\27%[[%d;]*m", ""))
+    end
+    assert_eq("subheader 120 cols keeps full hint",
+        plain_subheader(120, sub_states[1]):find("Filter (/): (press / to filter)", 1, true), 2)
+    assert_eq("subheader 80 cols uses short hint",
+        plain_subheader(80, sub_states[1]):find("/ to filter", 1, true), 2)
+    assert_eq("subheader 80 cols keeps full tab labels",
+        plain_subheader(80, sub_states[1]):find("[Heavy / RAM (22)]", 1, true) ~= nil, true)
+    assert_eq("subheader 60 cols uses short tab labels",
+        plain_subheader(60, sub_states[1]):find("[Heavy (22)]", 1, true) ~= nil, true)
+    assert_eq("subheader long typed filter keeps its tail",
+        plain_subheader(80, sub_states[5]):find("_tail█", 1, true) ~= nil, true)
+    assert_eq("fit_filter_tail exact width", display_width(fit_filter_tail("abcdefghij", 5)), 5)
 
     -- Test 11: key decoding keeps every key from one read()
     local function decoded(bytes)
