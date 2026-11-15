@@ -1163,6 +1163,25 @@ local function is_confirm_key(key, is_force)
     return not is_force and (key == "d" or key == "D")
 end
 
+-- Limits a pane scroll offset so the last page of `line_count` lines stays in
+-- view. Returns 0 when everything fits in `visible_rows`.
+local function clamp_pane_scroll(scroll, line_count, visible_rows)
+    local max_scroll = math.max(0, line_count - visible_rows)
+    return math.max(0, math.min(scroll, max_scroll))
+end
+
+-- Returns a title suffix such as "  [6-14 of 14]" naming the visible lines of a
+-- scrolled pane, or "" when all `line_count` lines fit in `visible_rows`.
+local function describe_scroll_position(scroll, line_count, visible_rows)
+    if line_count <= visible_rows then
+        return ""
+    end
+
+    local first_line = scroll + 1
+    local last_line = math.min(scroll + visible_rows, line_count)
+    return string.format("  [%d-%d of %d]", first_line, last_line, line_count)
+end
+
 -- Score for a filter found literally in the command line. It sits below a name
 -- substring match (about 1000) and above any realistic fuzzy name match.
 local COMMAND_LINE_MATCH_SCORE = 700
@@ -1473,24 +1492,6 @@ local function run_tui(init_opts)
         local show_help_in_list = (state.mode == "help" and cols < 90)
         local list_help_lines = show_help_in_list and build_help_lines() or {}
 
-        local raw_hdr = string.format("  %-3s %7s %-10s %4s  %s", "SEL", "PID", "MEM", "THR", "PROCESS NAME")
-        if show_help_in_list then
-            raw_hdr = "  VIM KEYBINDINGS CHEATSHEET"
-        end
-        raw_hdr = pad_right(raw_hdr, left_w)
-        local list_hdr = C.b_blue .. C.bold .. raw_hdr .. C.reset
-        local right_title
-        if state.mode == "help" then
-            right_title = " VIM KEYBINDINGS CHEATSHEET"
-        elseif cur_item then
-            right_title = truncate(" PROCESS: " .. cur_item.name .. " (" .. cur_item.pid .. ")", math.max(10, right_w - 2))
-        else
-            right_title = " PROCESS INSPECTOR"
-        end
-        local right_hdr = (cols >= 90) and (C.b_white .. C.bold .. right_title .. C.reset) or ""
-        local hdr_sep = (cols >= 90) and (C.gray .. "│" .. C.reset) or ""
-        add_line(list_hdr .. " " .. hdr_sep .. " " .. right_hdr)
-
         -- Pre-load inspector content for right pane
         local r_lines = {}
         if cols >= 90 then
@@ -1536,6 +1537,33 @@ local function run_tui(init_opts)
             end
         end
 
+        -- Column header. Built after the pane content so it can show which lines
+        -- of a scrolled inspector or cheatsheet are visible.
+        local pane_lines = show_help_in_list and list_help_lines or r_lines
+        state.preview_scroll = clamp_pane_scroll(state.preview_scroll, #pane_lines, body_h)
+        local scroll_hint = describe_scroll_position(state.preview_scroll, #pane_lines, body_h)
+
+        local raw_hdr = string.format("  %-3s %7s %-10s %4s  %s", "SEL", "PID", "MEM", "THR", "PROCESS NAME")
+        if show_help_in_list then
+            raw_hdr = "  VIM KEYBINDINGS CHEATSHEET" .. scroll_hint
+        end
+        local list_hdr = C.b_blue .. C.bold .. pad_right(raw_hdr, left_w) .. C.reset
+
+        local right_title
+        if state.mode == "help" then
+            right_title = " VIM KEYBINDINGS CHEATSHEET"
+        elseif cur_item then
+            right_title = " PROCESS: " .. cur_item.name .. " (" .. cur_item.pid .. ")"
+        else
+            right_title = " PROCESS INSPECTOR"
+        end
+        local title_width = math.max(10, right_w - 2 - #scroll_hint)
+        right_title = truncate(right_title, title_width) .. scroll_hint
+
+        local right_hdr = (cols >= 90) and (C.b_white .. C.bold .. right_title .. C.reset) or ""
+        local hdr_sep = (cols >= 90) and (C.gray .. "│" .. C.reset) or ""
+        add_line(list_hdr .. " " .. hdr_sep .. " " .. right_hdr)
+
         -- 4. Body Rows
         for row = 1, body_h do
             local idx = state.scroll + row - 1
@@ -1543,7 +1571,7 @@ local function run_tui(init_opts)
             local l_str
 
             if show_help_in_list then
-                l_str = pad_right(list_help_lines[row] or "", left_w)
+                l_str = pad_right(list_help_lines[row + state.preview_scroll] or "", left_w)
             elseif item then
                 local is_cur = (idx == state.cursor)
                 local bg = is_cur and C.bg_select or ""
@@ -1580,7 +1608,7 @@ local function run_tui(init_opts)
                 l_str = string.rep(" ", left_w)
             end
 
-            local r_idx = row + (state.preview_scroll or 0)
+            local r_idx = row + state.preview_scroll
             local r_str = r_lines[r_idx] or ""
             local sep_char = (cols >= 90) and (C.gray .. "│" .. C.reset) or ""
             add_line(l_str .. " " .. sep_char .. " " .. r_str)
@@ -1592,7 +1620,7 @@ local function run_tui(init_opts)
 
         local status_disp
         if state.mode == "help" then
-            status_disp = C.b_yellow .. C.bold .. " [Help Mode] Press any key or ? to return to process list..." .. C.reset
+            status_disp = C.b_yellow .. C.bold .. " [Help Mode] j/k or Ctrl-e/Ctrl-y scroll, any other key returns..." .. C.reset
         elseif state.mode == "confirm_kill" then
             status_disp = C.bg_red .. C.b_white .. C.bold .. " " .. state.confirm_msg .. " (y/n): " .. C.reset
         elseif #state.status_msg > 0 then
@@ -1663,9 +1691,17 @@ local function run_tui(init_opts)
             os.exit(EXIT_FAILURE)
         end
 
-        -- Dismiss Help Mode on any key
+        -- Help Mode: scroll keys move the cheatsheet, any other key closes it.
+        -- The renderer clamps the offset to the cheatsheet's length.
         if state.mode == "help" then
-            state.mode = "normal"
+            if key == "CTRL_E" or key == "j" or key == "DOWN" then
+                state.preview_scroll = state.preview_scroll + 1
+            elseif key == "CTRL_Y" or key == "k" or key == "UP" then
+                state.preview_scroll = math.max(0, state.preview_scroll - 1)
+            else
+                state.mode = "normal"
+                state.preview_scroll = 0
+            end
 
         -- A. Confirm Kill Mode
         elseif state.mode == "confirm_kill" then
@@ -1740,6 +1776,7 @@ local function run_tui(init_opts)
                 end
             elseif key == "?" then
                 state.mode = "help"
+                state.preview_scroll = 0
             elseif key == "/" then
                 state.prev_filter = state.filter
                 state.mode = "filter"
@@ -2532,6 +2569,16 @@ local function run_tests()
     assert_eq("filter still matches PID", filter_match_score("4321", script_proc) > 0, true)
     assert_eq("filter no match is zero", filter_match_score("zzzz", script_proc), 0)
     assert_eq("filter tolerates missing command line", filter_match_score("zz", { pid = 1, name = "init" }), 0)
+
+    -- Test 19: pane scroll clamping and position hint
+    assert_eq("scroll clamps to 0 when content fits", clamp_pane_scroll(30, 8, 10), 0)
+    assert_eq("scroll clamps to the last page", clamp_pane_scroll(30, 14, 9), 5)
+    assert_eq("scroll keeps an in-range offset", clamp_pane_scroll(3, 14, 9), 3)
+    assert_eq("scroll never goes negative", clamp_pane_scroll(-4, 14, 9), 0)
+    assert_eq("scroll with empty pane", clamp_pane_scroll(2, 0, 9), 0)
+    assert_eq("scroll hint empty when content fits", describe_scroll_position(0, 9, 9), "")
+    assert_eq("scroll hint at the top", describe_scroll_position(0, 14, 9), "  [1-9 of 14]")
+    assert_eq("scroll hint at the bottom", describe_scroll_position(5, 14, 9), "  [6-14 of 14]")
 
     -- Test 11: key decoding keeps every key from one read()
     local function decoded(bytes)
