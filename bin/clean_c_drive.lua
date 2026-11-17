@@ -1,10 +1,12 @@
 #!/usr/bin/env luajit
 --[[
-  clean_c_drive.lua - High-speed Windows C: Drive & Cache Cleaner powered by LuaJIT & FFI.
-  Scans and cleans temporary files, Windows update cache, crash logs, and empties the Recycle Bin.
+  clean_c_drive.lua - High-speed Windows C: Drive & Cache Cleaner powered by
+  LuaJIT & FFI. Scans and cleans temporary files, Windows update cache, crash
+  logs, and empties the Recycle Bin.
 
-  Uses direct Win32 APIs (FindFirstFileW/FindNextFileW, SHEmptyRecycleBinW) via FFI for
-  near-instant directory traversal (100x faster than PowerShell Get-ChildItem).
+  Uses direct Win32 APIs (FindFirstFileW/FindNextFileW, SHEmptyRecycleBinW)
+  via FFI for near-instant directory traversal (100x faster than PowerShell
+  Get-ChildItem).
 
   Usage:
     clean_c_drive.lua [OPTIONS]
@@ -71,7 +73,10 @@ if IS_WINDOWS then
             wchar_t cAlternateFileName[14];
         } WIN32_FIND_DATAW;
 
-        HANDLE FindFirstFileW(LPCWSTR lpFileName, WIN32_FIND_DATAW* lpFindFileData);
+        HANDLE FindFirstFileW(
+            LPCWSTR lpFileName,
+            WIN32_FIND_DATAW* lpFindFileData
+        );
         BOOL FindNextFileW(HANDLE hFindFile, WIN32_FIND_DATAW* lpFindFileData);
         BOOL FindClose(HANDLE hFindFile);
         BOOL DeleteFileW(LPCWSTR lpFileName);
@@ -80,12 +85,48 @@ if IS_WINDOWS then
         DWORD GetLastError(void);
         BOOL SetFileAttributesW(LPCWSTR lpFileName, DWORD dwFileAttributes);
 
-        int MultiByteToWideChar(unsigned int CodePage, DWORD dwFlags, const char* lpMultiByteStr, int cbMultiByte, wchar_t* lpWideCharStr, int cchWideChar);
-        int WideCharToMultiByte(unsigned int CodePage, DWORD dwFlags, LPCWSTR lpWideCharStr, int cchWideChar, char* lpMultiByteStr, int cbMultiByte, const char* lpDefaultChar, BOOL* lpUsedDefaultChar);
+        int MultiByteToWideChar(
+            unsigned int CodePage,
+            DWORD dwFlags,
+            const char* lpMultiByteStr,
+            int cbMultiByte,
+            wchar_t* lpWideCharStr,
+            int cchWideChar
+        );
+        int WideCharToMultiByte(
+            unsigned int CodePage,
+            DWORD dwFlags,
+            LPCWSTR lpWideCharStr,
+            int cchWideChar,
+            char* lpMultiByteStr,
+            int cbMultiByte,
+            const char* lpDefaultChar,
+            BOOL* lpUsedDefaultChar
+        );
 
-        BOOL OpenProcessToken(HANDLE ProcessHandle, DWORD DesiredAccess, HANDLE* TokenHandle);
-        BOOL CheckTokenMembership(HANDLE TokenHandle, void* SidToCheck, BOOL* IsMember);
-        BOOL AllocateAndInitializeSid(void* pIdentifierAuthority, unsigned char nSubAuthorityCount, DWORD nSubAuthority0, DWORD nSubAuthority1, DWORD nSubAuthority2, DWORD nSubAuthority3, DWORD nSubAuthority4, DWORD nSubAuthority5, DWORD nSubAuthority6, DWORD nSubAuthority7, void** pSid);
+        BOOL OpenProcessToken(
+            HANDLE ProcessHandle,
+            DWORD DesiredAccess,
+            HANDLE* TokenHandle
+        );
+        BOOL CheckTokenMembership(
+            HANDLE TokenHandle,
+            void* SidToCheck,
+            BOOL* IsMember
+        );
+        BOOL AllocateAndInitializeSid(
+            void* pIdentifierAuthority,
+            unsigned char nSubAuthorityCount,
+            DWORD nSubAuthority0,
+            DWORD nSubAuthority1,
+            DWORD nSubAuthority2,
+            DWORD nSubAuthority3,
+            DWORD nSubAuthority4,
+            DWORD nSubAuthority5,
+            DWORD nSubAuthority6,
+            DWORD nSubAuthority7,
+            void** pSid
+        );
         void* FreeSid(void* pSid);
         HANDLE GetCurrentProcess(void);
         BOOL CloseHandle(HANDLE hObject);
@@ -167,12 +208,22 @@ local function is_admin()
     local ok, adv = pcall(ffi.load, "advapi32")
     if not ok then return false end
 
-    local ntAuthority = ffi.new("unsigned char[6]", {0, 0, 0, 0, 0, 5}) -- SECURITY_NT_AUTHORITY
+    -- SECURITY_NT_AUTHORITY
+    local ntAuthority = ffi.new("unsigned char[6]", {0, 0, 0, 0, 0, 5})
     local pAdminSid = ffi.new("void*[1]")
     local isAdmin = ffi.new("BOOL[1]", 0)
 
-    -- SECURITY_BUILTIN_DOMAIN_RID = 0x00000020, DOMAIN_ALIAS_RID_ADMINS = 0x00000220
-    if adv.AllocateAndInitializeSid(ntAuthority, 2, 0x20, 0x220, 0, 0, 0, 0, 0, 0, pAdminSid) ~= 0 then
+    -- SECURITY_BUILTIN_DOMAIN_RID = 0x00000020,
+    -- DOMAIN_ALIAS_RID_ADMINS = 0x00000220
+    local sid_allocated = adv.AllocateAndInitializeSid(
+        ntAuthority,
+        2,
+        0x20,
+        0x220,
+        0, 0, 0, 0, 0, 0,
+        pAdminSid
+    )
+    if sid_allocated ~= 0 then
         adv.CheckTokenMembership(nil, pAdminSid[0], isAdmin)
         adv.FreeSid(pAdminSid[0])
     end
@@ -185,16 +236,31 @@ end
 local FILE_ATTRIBUTE_DIRECTORY = 0x10
 local FILE_ATTRIBUTE_READONLY  = 0x01
 local FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+local WIN32_SIZE_HIGH_MULTIPLIER = 4294967296 -- 2^32: high DWORD of a size
+
+-- Combines the two 32-bit halves of a Win32 file size into one number.
+local function win32_file_size(find_data)
+    local high = tonumber(find_data.nFileSizeHigh)
+    local low = tonumber(find_data.nFileSizeLow)
+    return high * WIN32_SIZE_HIGH_MULTIPLIER + low
+end
 
 local function report_skipped_reparse(path)
-    io.stderr:write("Skipped reparse point: " .. path .. " (junctions and symbolic links are not followed).\n")
+    io.stderr:write(
+        "Skipped reparse point: " .. path
+            .. " (junctions and symbolic links are not followed).\n"
+    )
 end
 
 local function can_traverse_win32(path)
     local attributes = ffi.C.GetFileAttributesW(to_wide(path))
     if attributes == 0xFFFFFFFF then
-        io.stderr:write(string.format("Cannot inspect directory '%s' (Windows error %d). Skipping it; check that it exists and is accessible.\n",
-            path, ffi.C.GetLastError()))
+        io.stderr:write(string.format(
+            "Cannot inspect directory '%s' (Windows error %d). Skipping it; "
+                .. "check that it exists and is accessible.\n",
+            path,
+            ffi.C.GetLastError()
+        ))
         return false
     end
     if bit.band(attributes, FILE_ATTRIBUTE_REPARSE_POINT) ~= 0 then
@@ -223,13 +289,17 @@ local function scan_folder_win32(dir_path)
             local fname = from_wide(find_data.cFileName)
             if fname ~= "." and fname ~= ".." then
                 local full_child = current_path .. "\\" .. fname
-                local is_dir = (bit.band(find_data.dwFileAttributes, FILE_ATTRIBUTE_DIRECTORY) ~= 0)
-                if bit.band(find_data.dwFileAttributes, FILE_ATTRIBUTE_REPARSE_POINT) ~= 0 then
+                local attributes = find_data.dwFileAttributes
+                local is_dir =
+                    bit.band(attributes, FILE_ATTRIBUTE_DIRECTORY) ~= 0
+                local is_reparse =
+                    bit.band(attributes, FILE_ATTRIBUTE_REPARSE_POINT) ~= 0
+                if is_reparse then
                     report_skipped_reparse(full_child)
                 elseif is_dir then
                     recurse(full_child)
                 else
-                    local size = (tonumber(find_data.nFileSizeHigh) * 4294967296) + tonumber(find_data.nFileSizeLow)
+                    local size = win32_file_size(find_data)
                     total_bytes = total_bytes + size
                     file_count = file_count + 1
                 end
@@ -259,7 +329,8 @@ local function scan_folder_posix(dir_path)
             local d_name = ffi.string(ent.d_name)
             if d_name ~= "." and d_name ~= ".." then
                 local full_child = current_path .. "/" .. d_name
-                -- ent.d_type == 4 is DT_DIR, avoid following symlinks (DT_LNK == 10)
+                -- ent.d_type == 4 is DT_DIR; symlinks (DT_LNK == 10)
+                -- are not followed.
                 if ent.d_type == 4 then
                     recurse(full_child, depth + 1)
                 elseif ent.d_type == 8 or ent.d_type == 0 then
@@ -286,7 +357,6 @@ local scan_folder = IS_WINDOWS and scan_folder_win32 or scan_folder_posix
 -- Delete Failure Tracking
 --------------------------------------------------------------------------------
 local FILE_ATTRIBUTE_NORMAL = 0x80
-local WIN32_SIZE_HIGH_MULTIPLIER = 4294967296 -- 2^32: high DWORD of a size
 local ERROR_DIR_NOT_EMPTY = 145
 local POSIX_ENOTEMPTY = 39 -- Linux value of ENOTEMPTY
 local POSIX_DT_DIR = 4
@@ -374,13 +444,6 @@ end
 -- Returns true when a Win32 find handle is NULL or INVALID_HANDLE_VALUE.
 local function is_invalid_handle(handle)
     return handle == nil or handle == ffi.cast("HANDLE", -1)
-end
-
--- Combines the two 32-bit halves of a Win32 file size into one number.
-local function win32_file_size(find_data)
-    local high = tonumber(find_data.nFileSizeHigh)
-    local low = tonumber(find_data.nFileSizeLow)
-    return high * WIN32_SIZE_HIGH_MULTIPLIER + low
 end
 
 -- Deletes one file. Returns true, or false plus the OS error reason.
@@ -589,7 +652,11 @@ local function empty_recycle_bin(dry_run)
 
     -- pcall: declaring the same function twice raises an error.
     pcall(ffi.cdef, [[
-        HRESULT SHEmptyRecycleBinW(HWND hwnd, LPCWSTR pszRootPath, DWORD dwFlags);
+        HRESULT SHEmptyRecycleBinW(
+            HWND hwnd,
+            LPCWSTR pszRootPath,
+            DWORD dwFlags
+        );
     ]])
 
     local flags = bit.bor(
@@ -683,21 +750,42 @@ local function get_targets()
     local targets = {}
 
     if IS_WINDOWS then
-        local localappdata = os.getenv("LOCALAPPDATA") or "C:\\Users\\Default\\AppData\\Local"
+        local localappdata = os.getenv("LOCALAPPDATA")
+            or "C:\\Users\\Default\\AppData\\Local"
         local systemroot   = os.getenv("SystemRoot") or "C:\\Windows"
 
-        table.insert(targets, { name = "User Temp Cache", path = localappdata .. "\\Temp" })
-        table.insert(targets, { name = "System Temp Cache", path = systemroot .. "\\Temp" })
-        table.insert(targets, { name = "Windows Update Cache", path = systemroot .. "\\SoftwareDistribution\\Download", service_stop = true })
-        table.insert(targets, { name = "Windows WER Crash Logs", path = localappdata .. "\\Microsoft\\Windows\\WER" })
-        table.insert(targets, { name = "Recycle Bin", path = "C:\\$Recycle.Bin", is_recycle_bin = true })
+        table.insert(targets, {
+            name = "User Temp Cache",
+            path = localappdata .. "\\Temp",
+        })
+        table.insert(targets, {
+            name = "System Temp Cache",
+            path = systemroot .. "\\Temp",
+        })
+        table.insert(targets, {
+            name = "Windows Update Cache",
+            path = systemroot .. "\\SoftwareDistribution\\Download",
+            service_stop = true,
+        })
+        table.insert(targets, {
+            name = "Windows WER Crash Logs",
+            path = localappdata .. "\\Microsoft\\Windows\\WER",
+        })
+        table.insert(targets, {
+            name = "Recycle Bin",
+            path = "C:\\$Recycle.Bin",
+            is_recycle_bin = true,
+        })
     else
         -- Linux / WSL environment fallback targets
         local home = os.getenv("HOME") or "."
         table.insert(targets, { name = "System Temp", path = "/tmp" })
         table.insert(targets, { name = "User Cache", path = home .. "/.cache" })
         if io.open("/mnt/c", "r") then
-            table.insert(targets, { name = "WSL C: Drive Temp", path = "/mnt/c/Windows/Temp" })
+            table.insert(targets, {
+                name = "WSL C: Drive Temp",
+                path = "/mnt/c/Windows/Temp",
+            })
         end
     end
 
@@ -710,6 +798,18 @@ end
 -- Converts a byte count to megabytes rounded down to two decimals.
 local function bytes_to_mb(bytes)
     return math.floor((bytes / (1024 * 1024)) * 100) / 100
+end
+
+-- Converts a byte count to gigabytes rounded down to two decimals.
+local function bytes_to_gb(bytes)
+    return math.floor((bytes / (1024 * 1024 * 1024)) * 100) / 100
+end
+
+local RULE_WIDTH = 56
+
+-- Writes a horizontal rule of `rule_char` in `color`, then a newline.
+local function write_rule(color, rule_char)
+    io.write(color, string.rep(rule_char, RULE_WIDTH), C.reset, "\n")
 end
 
 -- Cleans one target folder, stopping its services first when needed.
@@ -784,7 +884,12 @@ Options:
 ]])
             return
         elseif a == "--test" then
-            print(C.b_cyan .. "[TEST] Running clean_c_drive.lua Automated Verification Suite..." .. C.reset)
+            print(
+                C.b_cyan
+                    .. "[TEST] Running clean_c_drive.lua Automated "
+                    .. "Verification Suite..."
+                    .. C.reset
+            )
 
             -- 1. Test Unicode conversion (round-trip)
             if IS_WINDOWS then
@@ -792,7 +897,11 @@ Options:
                 local w = to_wide(orig_str)
                 assert(w ~= nil, "to_wide should return non-nil")
                 local back = from_wide(w)
-                assert(back == orig_str, string.format("Unicode conversion failed: expected '%s', got '%s'", orig_str, back))
+                assert(back == orig_str, string.format(
+                    "Unicode conversion failed: expected '%s', got '%s'",
+                    orig_str,
+                    back
+                ))
                 print("  [PASS] to_wide and from_wide round-trip conversion")
             end
 
@@ -804,18 +913,32 @@ Options:
                 assert(t.name and t.name ~= "", "Target must have a name")
                 assert(t.path and t.path ~= "", "Target must have a path")
             end
-            print(string.format("  [PASS] get_targets(): discovered %d valid cleanup targets", #targets))
+            print(string.format(
+                "  [PASS] get_targets(): discovered %d valid cleanup targets",
+                #targets
+            ))
 
             -- 3. Test folder scanning on current repository
             local scanned_bytes, scanned_files = scan_folder(".")
-            assert(scanned_files > 0, "scan_folder on '.' should discover files")
-            assert(scanned_bytes > 0, "scan_folder on '.' should discover positive bytes")
-            print(string.format("  [PASS] scan_folder('.'): found %d files (%d bytes)", scanned_files, scanned_bytes))
+            assert(
+                scanned_files > 0,
+                "scan_folder on '.' should discover files"
+            )
+            assert(
+                scanned_bytes > 0,
+                "scan_folder on '.' should discover positive bytes"
+            )
+            print(string.format(
+                "  [PASS] scan_folder('.'): found %d files (%d bytes)",
+                scanned_files,
+                scanned_bytes
+            ))
 
             -- 4. Test dry-run folder cleaning on temporary test directory
+            local separator = IS_WINDOWS and "\\" or "/"
             local tmp_dir = os.getenv("TEMP") or "/tmp"
-            local test_folder = tmp_dir .. "\\clean_c_test_" .. tostring(os.time())
-            if not IS_WINDOWS then test_folder = tmp_dir .. "/clean_c_test_" .. tostring(os.time()) end
+            local test_folder = tmp_dir .. separator
+                .. "clean_c_test_" .. tostring(os.time())
 
             -- `>nul` is Windows-only: on POSIX it creates a file named "nul".
             local mkdir_command
@@ -826,17 +949,29 @@ Options:
             end
             os.execute(mkdir_command)
 
-            local f1 = io.open(test_folder .. (IS_WINDOWS and "\\file1.tmp" or "/file1.tmp"), "w")
-            if f1 then f1:write("test content 1"); f1:close() end
-            local f2 = io.open(test_folder .. (IS_WINDOWS and "\\file2.tmp" or "/file2.tmp"), "w")
-            if f2 then f2:write("test content 2"); f2:close() end
+            local file1_path = test_folder .. separator .. "file1.tmp"
+            local file2_path = test_folder .. separator .. "file2.tmp"
+            local f1 = io.open(file1_path, "w")
+            if f1 then
+                f1:write("test content 1")
+                f1:close()
+            end
+            local f2 = io.open(file2_path, "w")
+            if f2 then
+                f2:write("test content 2")
+                f2:close()
+            end
 
-            local freed, del_f = clean_folder(test_folder, true) -- dry_run = true
-            assert(del_f == 2, string.format("Dry run should report 2 files, got %d", del_f))
+            local dry_run_enabled = true
+            local freed, del_f = clean_folder(test_folder, dry_run_enabled)
+            assert(del_f == 2, string.format(
+                "Dry run should report 2 files, got %d",
+                del_f
+            ))
             assert(freed > 0, "Dry run should report positive freed bytes")
 
             -- Verify files were NOT actually deleted in dry run
-            local check_f = io.open(test_folder .. (IS_WINDOWS and "\\file1.tmp" or "/file1.tmp"), "r")
+            local check_f = io.open(file1_path, "r")
             assert(check_f ~= nil, "File should still exist after dry-run")
             if check_f then check_f:close() end
 
@@ -896,21 +1031,34 @@ Options:
         end
     end
 
-    io.write(string.format("%s========================================================%s\n", C.b_cyan, C.reset))
-    io.write(string.format("%s  CLEAN C DRIVE - High-Speed Drive Cleaner%s\n", C.b_yellow, C.reset))
-    io.write(string.format("%s  * Engine: %s (%s FFI)%s\n", C.green, (jit and jit.version or "LuaJIT"), ffi.os, C.reset))
-    io.write(string.format("%s========================================================%s\n", C.b_cyan, C.reset))
+    write_rule(C.b_cyan, "=")
+    io.write(string.format(
+        "%s  CLEAN C DRIVE - High-Speed Drive Cleaner%s\n",
+        C.b_yellow, C.reset
+    ))
+    io.write(string.format(
+        "%s  * Engine: %s (%s FFI)%s\n",
+        C.green, (jit and jit.version or "LuaJIT"), ffi.os, C.reset
+    ))
+    write_rule(C.b_cyan, "=")
 
     -- 1. Check Administrator Rights
     local admin = is_admin()
     if admin then
-        io.write(string.format("%s[OK]%s Running with Administrator privileges.\n\n", C.green, C.reset))
+        io.write(string.format(
+            "%s[OK]%s Running with Administrator privileges.\n\n",
+            C.green, C.reset
+        ))
     else
-        io.write(string.format("%s[WARNING]%s Not running as Administrator. Some system folders may be protected.\n\n", C.yellow, C.reset))
+        io.write(string.format(
+            "%s[WARNING]%s Not running as Administrator. "
+                .. "Some system folders may be protected.\n\n",
+            C.yellow, C.reset
+        ))
     end
 
     -- 2. Scan Targets
-    io.write(string.format("%sSCANNING TARGET FOLDERS...%s\n", C.b_cyan, C.reset))
+    io.write(C.b_cyan, "SCANNING TARGET FOLDERS...", C.reset, "\n")
     local targets = get_targets()
     local grand_total_bytes = 0
     local grand_total_files = 0
@@ -928,18 +1076,26 @@ Options:
             io.write(string.format("  %-26s %s%7.2f MB%s (%s%d files%s)\n",
                 t.name .. ":", C.b_white, mb, C.reset, C.gray, files, C.reset))
         else
-            io.write(string.format("  %-26s %s   0.00 MB%s\n", t.name .. ":", C.gray, C.reset))
+            io.write(string.format(
+                "  %-26s %s   0.00 MB%s\n",
+                t.name .. ":", C.gray, C.reset
+            ))
         end
     end
     local scan_elapsed = math.floor((os.clock() - scan_start) * 1000)
 
-    local total_mb = math.floor((grand_total_bytes / (1024 * 1024)) * 100) / 100
-    local total_gb = math.floor((grand_total_bytes / (1024 * 1024 * 1024)) * 100) / 100
+    local total_mb = bytes_to_mb(grand_total_bytes)
+    local total_gb = bytes_to_gb(grand_total_bytes)
 
-    io.write(string.format("%s--------------------------------------------------------%s\n", C.b_cyan, C.reset))
-    io.write(string.format("%sPotential space to recover: %s%.2f MB (%.2f GB)%s across %d files [%d ms]\n",
-        C.b_cyan, C.b_yellow, total_mb, total_gb, C.b_cyan, grand_total_files, scan_elapsed))
-    io.write(string.format("%s========================================================%s\n\n", C.b_cyan, C.reset))
+    write_rule(C.b_cyan, "-")
+    io.write(string.format(
+        "%sPotential space to recover: %s%.2f MB (%.2f GB)%s "
+            .. "across %d files [%d ms]\n",
+        C.b_cyan, C.b_yellow, total_mb, total_gb, C.b_cyan,
+        grand_total_files, scan_elapsed
+    ))
+    write_rule(C.b_cyan, "=")
+    io.write("\n")
 
     if scan_only then
         return
@@ -958,13 +1114,20 @@ Options:
     end
 
     if grand_total_files == 0 and grand_total_bytes == 0 then
-        io.write(string.format("%s[OK] Drive already clean! No temporary files found.%s\n", C.b_green, C.reset))
+        io.write(string.format(
+            "%s[OK] Drive already clean! No temporary files found.%s\n",
+            C.b_green, C.reset
+        ))
         return
     end
 
     -- 3. Confirm Prompt (unless --yes)
     if not auto_yes then
-        io.write(string.format("%sPress [ENTER] to clean these folders, or [Ctrl+C] to cancel...%s", C.b_yellow, C.reset))
+        io.write(string.format(
+            "%sPress [ENTER] to clean these folders, "
+                .. "or [Ctrl+C] to cancel...%s",
+            C.b_yellow, C.reset
+        ))
         io.flush()
         local resp = io.read("*line")
         if not resp then return end
@@ -978,7 +1141,10 @@ Options:
 
     for idx, t in ipairs(targets) do
         if t.files > 0 then
-            io.write(string.format("[%d/%d] Cleaning %s... ", idx, #targets, t.name))
+            io.write(string.format(
+                "[%d/%d] Cleaning %s... ",
+                idx, #targets, t.name
+            ))
             io.flush()
 
             local freed, del_f, stats = clean_target(t, dry_run)
@@ -990,9 +1156,10 @@ Options:
     end
 
     local freed_mb = bytes_to_mb(clean_freed_bytes)
-    local freed_gb = math.floor((clean_freed_bytes / (1024 * 1024 * 1024)) * 100) / 100
+    local freed_gb = bytes_to_gb(clean_freed_bytes)
 
-    io.write(string.format("\n%s========================================================%s\n", C.b_green, C.reset))
+    io.write("\n")
+    write_rule(C.b_green, "=")
     io.write(string.format(
         "%sCLEANUP FINISHED! Freed ~%.2f MB (%.2f GB) across %d files.%s\n",
         C.b_green, freed_mb, freed_gb, clean_deleted_files, C.reset
@@ -1006,7 +1173,7 @@ Options:
             C.yellow, C.reset, clean_failures
         ))
     end
-    io.write(string.format("%s========================================================%s\n", C.b_green, C.reset))
+    write_rule(C.b_green, "=")
 end
 
 main({...})
