@@ -39,9 +39,54 @@ well-organized code over compact code.
 *   **Lua / LuaJIT**:
     *   Use four spaces for indentation in new files. The Neovim config (`.config/nvim`) is the exception: it uses two spaces, the Neovim convention. `.editorconfig` files set both widths.
     *   **No single-line blocks**, with two exceptions: (1) a callback whose whole body is one call or one `return` expression (e.g. `function() Snacks.zen() end`); (2) a short guard (`if cond then return end`, `break`, `goto continue`) with no `else`, within 80 columns. Everything else is expanded: never put the body of an `if`, `for`, `while`, `repeat` or multi-statement `function` on the same line as its header, and `elseif` and `else` each start their own line.
-    *   **One statement per line**: Do not join statements with `;` or spaces (e.g., `step = 1; width = 1`).
-    *   **Small, focused functions**: Each function does one job and should usually fit on one screen (aim for under ~30–40 lines). Extract loop bodies, complex conditions, string building, and repeated logic into named `local` helpers. Prefer early returns (each in its own expanded block) over deep nesting.
-    *   **Comments where they help**: Add a short comment above each non-trivial function stating its purpose, inputs, and return values. Explain *why* for non-obvious logic, platform quirks, magic numbers, FFI struct layouts, and buffer or handle ownership. Do not comment what the code already says plainly.
+    *   **Maximum line length is 80 characters**: This is a hard limit for Lua,
+        not a target. Wrap long calls, argument lists, tables, conditions, and
+        string concatenations across lines, one item per line where that helps.
+        The only exceptions are literal FFI `cdef` declarations, URLs, and
+        string literals that cannot be split without changing their meaning.
+    *   **One statement per line, no semicolons**: Never use `;` in Lua. Do not
+        join statements with it (`step = 1; width = 1`), do not end statements
+        with it (`local count = 0;`), and do not use it as a table field
+        separator (write `{ a = 1, b = 2 }`, not `{ a = 1; b = 2 }`). FFI C
+        declarations inside `ffi.cdef[[ ... ]]` are C code and keep their `;`.
+    *   **Small functions**: Each function does one job that its name states.
+        *   Aim for 30 lines or fewer. Over 50 lines means split it.
+        *   Nest blocks at most 3 levels deep. Use early returns and named
+            helpers to flatten deeper logic.
+        *   Take at most 4 parameters. Pass an options table beyond that.
+        *   Keep one level of detail per function: a top-level function
+            calls named steps and doesn't mix them with low-level byte or
+            string handling.
+        *   Extract loop bodies, complex conditions, string building, and
+            repeated logic into named `local` helpers.
+    *   **Clean, easy-to-read code**: Write code a new reader can follow
+        top to bottom without jumping around.
+        *   Use names that read as plain English: verbs for functions
+            (`load_config`, `render_row`) and nouns for values. Name
+            booleans `is_`/`has_`/`should_`.
+        *   Give magic numbers and repeated strings named constants.
+        *   No globals. Declare everything `local`, as close to its first
+            use as possible.
+        *   Delete dead code, commented-out code, and unused variables
+            instead of leaving them.
+        *   Prefer a clear, slightly longer version over a clever one-liner
+            (for example, no chained `a and b or c` with complex operands).
+    *   **Comment code that does not explain itself**: First try to make the
+        code clear with better names and smaller helpers. Where it still is
+        not obvious, add a comment.
+        *   **What**: Above each non-trivial function, say in one or two lines
+            what it does, what it takes, and what it returns (including
+            `nil, err` on failure).
+        *   **What**: Above a dense block (a parsing step, an escape sequence,
+            bit flags, a tricky pattern), say what it produces.
+        *   **Why**: Explain reasons the code alone cannot show: platform
+            quirks, workarounds, magic numbers, ordering constraints, FFI
+            struct layouts, buffer or handle ownership, and rejected
+            simpler approaches.
+        *   **Skip** comments that only repeat the code
+            (`-- increment i` above `i = i + 1`).
+        *   **Keep them true**: Update or delete a comment whenever the code
+            it describes changes.
     *   Prefer `local` variables and named functions for substantial logic. Use multiline tables for complex records and state objects.
     *   Keep FFI declarations grouped by API or platform. Name constants instead of scattering unexplained flags and numeric values (e.g., `local O_RDWR = 2`, `local WNOHANG = 1`).
 
@@ -68,6 +113,47 @@ well-organized code over compact code.
 
     for _, item in ipairs(list) do
         item.enabled = true
+    end
+    ```
+
+    ```lua
+    -- Bad
+    local width = 80; local height = 24;
+    local function show(p) io.write(fmt(p):sub(1, 77) .. "...", "\n") end
+
+    -- Good
+    local MAX_ROW_WIDTH = 80
+    local ELLIPSIS = "..."
+
+    -- Truncates `text` to `max_width` columns, ending it with an ellipsis.
+    local function truncate(text, max_width)
+        if #text <= max_width then
+            return text
+        end
+
+        -- Reserve room for the ellipsis so the row never exceeds max_width.
+        return text:sub(1, max_width - #ELLIPSIS) .. ELLIPSIS
+    end
+
+    -- Formats one process record as a fixed-width table row.
+    local function format_process_row(process)
+        return string.format(
+            "%6d  %-20s %5.1f%%  %s",
+            process.pid,
+            process.name,
+            process.cpu_percent,
+            process.command
+        )
+    end
+
+    -- Writes one process row, truncated and with any old text erased.
+    local function print_process_row(process)
+        local row = format_process_row(process)
+        io.write(truncate(row, MAX_ROW_WIDTH))
+
+        -- Emit a color reset before erasing to end of line: Windows Console
+        -- fills erased cells with the active background color otherwise.
+        io.write("\27[0m\27[K\n")
     end
     ```
 *   **Python**:
