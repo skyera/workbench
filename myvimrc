@@ -139,6 +139,12 @@ set ruler
 set showcmd
 set cursorline
 set colorcolumn=80
+
+" JavaScript uses a 100-column limit; other filetypes keep the global 80.
+augroup javascript_colorcolumn
+    autocmd!
+    autocmd FileType javascript setlocal colorcolumn=100
+augroup END
 runtime macros/matchit.vim
 
 " --- Font Settings ---

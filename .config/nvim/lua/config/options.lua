@@ -207,6 +207,14 @@ vim.api.nvim_create_autocmd("FileType", {
   end,
 })
 
+-- JavaScript uses a 100-column limit; other filetypes keep the global 80.
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = "javascript",
+  callback = function()
+    vim.opt_local.colorcolumn = "100"
+  end,
+})
+
 vim.api.nvim_create_autocmd("FileType", {
   pattern = "terra",
   callback = function()
