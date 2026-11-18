@@ -27,6 +27,21 @@ well-organized code over compact code.
 *   **Consistent Formatting & Vertical Paragraphing**: Use consistent indentation, spacing around operators, and blank lines between logical steps. Expanding compact code must not create unbroken vertical walls of code. Break functions longer than 15–20 lines into readable logical paragraphs (e.g., argument validation, data transformation, loops, state updates, resource acquisition/release). Group long branching ladders (such as key event handlers or CLI parsers) into logical clusters separated by blank lines and concise category comments.
 *   **Section Dividers**: For substantial single-file tools or modules (>300 lines), use clear 80-column section divider banners (e.g., `--------------------------------------------------------------------------------`) to delineate major layers: constants & FFI, utility helpers, domain/state logic, UI/rendering, host/CLI management, and entry points.
 *   **Descriptive Names**: Choose names that explain purpose and units, such as `refresh_interval_seconds` or `process_start_ticks`. Avoid cryptic abbreviations and single-letter names except for small loop indices or conventional local values.
+*   **Self-Explaining Function Names**: A function's name should tell a reader what it does without opening it.
+    *   Use a verb plus an object that states the action and its target: `load_config`, `parse_git_status`, `render_log_panel`. Name predicates `is_`/`has_`/`should_` (`is_valid_handle`).
+    *   Avoid vague names such as `handle`, `process`, `do_work`, `helper`, `run2`, `misc`, or names that only state the type (`get_data`, `do_string`).
+    *   Name side effects in the verb: `delete_`, `write_`, `kill_`, `stop_` for changes; `get_`, `find_`, `count_`, `format_` must not modify state.
+    *   If a function does more than its name says, rename or split it rather than hiding the extra work.
+    *   Add a comment above the function when the name cannot carry it all: units, what it returns on failure (`nil, err`), side effects, or why it exists.
+
+    ```lua
+    -- Bad
+    local function handle(p)        -- handle what? returns what?
+
+    -- Good
+    -- Stops the given Windows services; returns the names it actually stopped.
+    local function stop_update_services(service_names)
+    ```
 *   **Focused Functions**: Keep functions responsible for one coherent task. Extract complex conditions and repeated operations into named helpers. Prefer early returns to deeply nested branches while keeping each return in a readable block.
 *   **Logical File Structure**: Organize files into a short purpose/usage description, imports or dependencies, constants and types, supporting functions, application logic, and a clear entry point, as appropriate. Group related functionality together and keep platform-specific logic easy to locate.
 *   **Clear Boundaries**: Separate argument parsing, process or filesystem operations, data transformations, rendering, and input handling. Split modules when this clarifies responsibilities; avoid unnecessary abstraction and tiny forwarding modules.
